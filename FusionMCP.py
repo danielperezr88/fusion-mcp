@@ -473,6 +473,100 @@ def _get_oriented_bounding_box(root, p: dict) -> dict:
     }
 
 
+def _class_short_name(obj) -> str:
+    try:
+        full = obj.classType()
+    except Exception:
+        full = type(obj).__name__
+    return full.split("::")[-1]
+
+
+def _face_normal(face):
+    try:
+        ev = face.evaluator
+        okp, param = ev.getParameterAtPoint(face.pointOnFace)
+        if not okp:
+            return None
+        okn, normal = ev.getNormalAtParameter(param)
+        if not okn:
+            return None
+        return _round_xyz(normal)
+    except Exception:
+        return None
+
+
+def _inspect_body(root, p: dict) -> dict:
+    body = _require_body(root, p.get("body", 0))
+    detail = str(p.get("detail", "summary")).lower()
+    max_items = int(p.get("max_items", 100))
+
+    bb = body.boundingBox
+    result = {
+        "body": body.name,
+        "bounding_box": {
+            "min": _round_xyz(bb.minPoint),
+            "max": _round_xyz(bb.maxPoint),
+            "size_cm": {
+                "x": round(bb.maxPoint.x - bb.minPoint.x, 6),
+                "y": round(bb.maxPoint.y - bb.minPoint.y, 6),
+                "z": round(bb.maxPoint.z - bb.minPoint.z, 6),
+            },
+        },
+        "physical_properties": _physical_properties_dict(body),
+        "total_faces": body.faces.count,
+        "total_edges": body.edges.count,
+        "total_vertices": body.vertices.count,
+    }
+    if detail != "full":
+        return result
+
+    faces, edges, vertices = [], [], []
+    truncated = False
+    for i in range(body.faces.count):
+        if i >= max_items:
+            truncated = True
+            break
+        f = body.faces.item(i)
+        stype = _class_short_name(f.geometry)
+        entry = {"index": i, "area_cm2": round(f.area, 6), "surface_type": stype}
+        normal = _face_normal(f)
+        if normal is not None:
+            entry["normal"] = normal
+        if "Cylinder" in stype:
+            try:
+                entry["geometry_params"] = {"radius_cm": round(f.geometry.radius, 6)}
+            except Exception:
+                pass
+        faces.append(entry)
+
+    for i in range(body.edges.count):
+        if i >= max_items:
+            truncated = True
+            break
+        e = body.edges.item(i)
+        ctype = _class_short_name(e.geometry)
+        entry = {"index": i, "length_cm": round(e.length, 6), "curve_type": ctype}
+        if "Circle" in ctype:
+            try:
+                entry["radius_cm"] = round(e.geometry.radius, 6)
+            except Exception:
+                pass
+        edges.append(entry)
+
+    for i in range(body.vertices.count):
+        if i >= max_items:
+            truncated = True
+            break
+        v = body.vertices.item(i)
+        vertices.append({"index": i, "point": _round_xyz(v.geometry)})
+
+    result["faces"] = faces
+    result["edges"] = edges
+    result["vertices"] = vertices
+    result["truncated"] = truncated
+    return result
+
+
 # ---- Execute Script ----
 
 def _execute_script(p):
@@ -1634,6 +1728,7 @@ def _process_command(data: dict) -> dict:
             "measure_angle":              lambda: _measure_angle(root, p),
             "get_physical_properties":    lambda: _get_physical_properties(root, p),
             "get_oriented_bounding_box":  lambda: _get_oriented_bounding_box(root, p),
+            "inspect_body":               lambda: _inspect_body(root, p),
             "execute_script":             lambda: _execute_script(p),
             "create_new_document":        lambda: _create_new_document(p),
             "clear_design":               lambda: _clear_design(),

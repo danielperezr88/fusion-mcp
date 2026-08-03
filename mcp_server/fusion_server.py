@@ -146,6 +146,18 @@ def get_oriented_bounding_box(body: str = "0", length_axis: str = "X", width_axi
     """
     return _call("get_oriented_bounding_box", {"body": body, "length_axis": length_axis, "width_axis": width_axis})
 
+@mcp.tool()
+def inspect_body(body: str = "0", detail: str = "summary", max_items: int = 100) -> str:
+    """
+    Get a comprehensive geometry report for a body: bounding box, physical properties, faces, edges, and vertices.
+
+    Args:
+        body:      Body name or index number.
+        detail:    'summary' (counts + bounding box + physical properties) or 'full' (face/edge/vertex details).
+        max_items: Maximum number of faces/edges/vertices to include when detail='full'.
+    """
+    return _call("inspect_body", {"body": body, "detail": detail, "max_items": max_items})
+
 
 # ---- Execute Script ----
 
