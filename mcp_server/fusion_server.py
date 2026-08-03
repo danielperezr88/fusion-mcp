@@ -15,12 +15,12 @@ FUSION_URL = "http://127.0.0.1:7432"
 mcp = FastMCP("Fusion 360")
 
 
-def _call(command: str, params: dict = None) -> str:
+def _call(command: str, params: dict = None, timeout: int = 30) -> str:
     if params is None:
         params = {}
     try:
         r = requests.post(f"{FUSION_URL}/command",
-                          json={"command": command, "params": params}, timeout=30)
+                          json={"command": command, "params": params}, timeout=timeout)
         data = r.json()
         if "error" in data:
             return f"Error: {data['error']}"
@@ -1106,6 +1106,28 @@ def import_sketch_file(path: str, format: str = "", plane: str = "XY") -> str:
         plane:  Construction plane for DXF import: XY, XZ, or YZ.
     """
     return _call("import_sketch_file", {"path": path, "format": format, "plane": plane})
+
+
+# ---- OpenSCAD Pipeline ----
+
+@mcp.tool()
+def run_scad(code: str, params: str = "", quality: int = 100, units: str = "mm") -> str:
+    """
+    Render OpenSCAD code to a mesh body using the bundled OpenSCAD + BOSL2.
+
+    Writes the code to a temp .scad file, renders it to STL with the bundled
+    OpenSCAD (BOSL2 available via include <BOSL2/std.scad>), imports the STL
+    as a mesh body, and stores the source in the body's 'scad_source'
+    attribute so it can be re-run later with update_scad_body.
+
+    Args:
+        code:    Raw OpenSCAD source, e.g. 'cube([10, 10, 10]);' or
+                 'include <BOSL2/std.scad>\\ncuboid([10,10,10]);'.
+        params:  Optional '-D' variable overrides, e.g. 'Grid_Pitch=50;Frame_Depth=12'.
+        quality: Sets '$fn' (facet count) prepended to the code. 0 = leave code unchanged.
+        units:   Units of the OpenSCAD model: mm, cm, or in.
+    """
+    return _call("run_scad", {"code": code, "params": params, "quality": quality, "units": units}, timeout=330)
 
 
 # ---- History & File ----

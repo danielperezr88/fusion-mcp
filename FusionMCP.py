@@ -15,6 +15,9 @@ import queue
 import uuid
 import os
 import math
+import subprocess
+import tempfile
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 app: adsk.core.Application = None
@@ -1809,6 +1812,129 @@ def _import_sketch_file(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+# ---- Wave 3: OpenSCAD Mesh Pipeline ----
+
+def _get_bundle_functions():
+    """Return (get_openscad_path, get_bosl2_path) from mcp_server.bundle."""
+    import importlib.util
+
+    try:
+        from mcp_server import bundle
+        return bundle.get_openscad_path, bundle.get_bosl2_path
+    except ImportError:
+        pass
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(here, "mcp_server", "bundle.py"),
+        os.path.join(here, os.pardir, "mcp_server", "bundle.py"),
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        spec = importlib.util.spec_from_file_location("fusionmcp_bundle", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.get_openscad_path, module.get_bosl2_path
+    raise FileNotFoundError(
+        "mcp_server/bundle.py could not be found. Keep the fusion-mcp "
+        "repository (or its mcp_server/ folder) importable from FusionMCP.py "
+        "so the bundled OpenSCAD + BOSL2 can be located.")
+
+
+def _run_scad(root, p: dict) -> dict:
+    try:
+        code = p.get("code", "")
+        if not code:
+            return {"error": "No OpenSCAD code provided. Set 'code' to the .scad source to render."}
+        params = str(p.get("params", "") or "")
+        quality = int(p.get("quality", 100) or 100)
+        units = str(p.get("units", "mm") or "mm").lower()
+        unit_map = {
+            "mm": adsk.fusion.MeshUnits.MillimeterMeshUnit,
+            "cm": adsk.fusion.MeshUnits.CentimeterMeshUnit,
+            "in": adsk.fusion.MeshUnits.InchMeshUnit,
+        }
+        unit = unit_map.get(units)
+        if unit is None:
+            return {"error": f"Unsupported units '{units}'. Use 'mm', 'cm', or 'in'."}
+
+        get_openscad_path, get_bosl2_path = _get_bundle_functions()
+        openscad_path = get_openscad_path()
+        bosl2_path = get_bosl2_path()
+
+        if quality > 0:
+            code = f"$fn={quality};\n{code}"
+
+        token = uuid.uuid4().hex[:8]
+        scad_file = os.path.join(tempfile.gettempdir(), f"fusionmcp_render_{token}.scad")
+        stl_file = os.path.join(tempfile.gettempdir(), f"fusionmcp_render_{token}.stl")
+        start = time.time()
+        try:
+            with open(scad_file, "w", encoding="utf-8") as f:
+                f.write(code)
+            cmd = [openscad_path, "-o", stl_file, scad_file]
+            for assignment in params.split(";"):
+                assignment = assignment.strip()
+                if assignment:
+                    cmd.extend(["-D", assignment])
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    env={**os.environ, "OPENSCADPATH": bosl2_path},
+                    timeout=300,
+                    capture_output=True,
+                )
+            except subprocess.TimeoutExpired:
+                return {"error": "OpenSCAD render timed out after 300s. Model may be too complex."}
+            render_time_s = round(time.time() - start, 3)
+            if proc.returncode != 0:
+                err = (proc.stderr or b"").decode("utf-8", errors="replace")
+                out = (proc.stdout or b"").decode("utf-8", errors="replace")
+                detail = "\n".join(part for part in (err, out) if part.strip()).strip()
+                return {"error": f"OpenSCAD render failed (exit {proc.returncode}): {detail}"}
+            if not os.path.isfile(stl_file) or os.path.getsize(stl_file) == 0:
+                return {"error": "OpenSCAD completed but produced no output STL file."}
+
+            base_feature = None
+            if _design().designType == adsk.fusion.DesignTypes.ParametricDesignType:
+                base_features = root.features.baseFeatures
+                base_feature = base_features.item(0) if base_features.count > 0 else base_features.add()
+            before = root.meshBodies.count
+            if base_feature is not None:
+                base_feature.startEdit()
+                try:
+                    mesh_result = root.meshBodies.add(stl_file, unit, base_feature)
+                finally:
+                    base_feature.finishEdit()
+            else:
+                mesh_result = root.meshBodies.add(stl_file, unit, None)
+            after = root.meshBodies.count
+            if mesh_result is not None and mesh_result.count > 0:
+                body = mesh_result.item(mesh_result.count - 1)
+            else:
+                delta = after - before
+                if delta <= 0:
+                    return {"error": "OpenSCAD render produced no mesh body."}
+                body = root.meshBodies.item(after - 1)
+            body.attributes.add("FusionMCP", "scad_source", code)
+            return {
+                "rendered": True,
+                "mesh_body": body.name,
+                "scad_source_stored": True,
+                "render_time_s": render_time_s,
+            }
+        finally:
+            for path in (scad_file, stl_file):
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---- Export & Capture ----
 
 def _export_stl(p):
@@ -1982,6 +2108,7 @@ def _process_command(data: dict) -> dict:
             "import_cad_file":            lambda: _import_cad_file(root, p),
             "import_mesh_file":           lambda: _import_mesh_file(root, p),
             "import_sketch_file":         lambda: _import_sketch_file(root, p),
+            "run_scad":                   lambda: _run_scad(root, p),
         }
 
         if cmd in dispatch:
