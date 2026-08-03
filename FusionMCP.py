@@ -1764,6 +1764,51 @@ def _import_mesh_file(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _import_sketch_file(root, p: dict) -> dict:
+    try:
+        path = p.get("path", "")
+        if not path:
+            return {"error": "No file path provided. Set 'path' to an SVG or DXF file."}
+        if not os.path.exists(path):
+            return {"error": f"File not found: {path}"}
+        fmt = str(p.get("format", "") or "").strip().lower()
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        if not fmt:
+            fmt = ext
+        imp = app.importManager
+        before = root.sketches.count
+        if fmt == "svg":
+            options = imp.createSVGImportOptions(path)
+            sketch = root.sketches.add(root.xYConstructionPlane)
+            try:
+                imp.importToTarget(options, sketch)
+            except Exception:
+                if sketch.sketchCurves.count == 0:
+                    raise
+        elif fmt == "dxf":
+            plane_name = str(p.get("plane", "XY") or "XY").upper()
+            if plane_name == "XZ":
+                plane_entity = root.xZConstructionPlane
+            elif plane_name == "YZ":
+                plane_entity = root.yZConstructionPlane
+            else:
+                plane_entity = root.xYConstructionPlane
+            options = imp.createDXF2DImportOptions(path, plane_entity)
+            try:
+                imp.importToTarget(options, root)
+            except Exception:
+                if root.sketches.count == before:
+                    raise
+        else:
+            return {"error": f"Unsupported format '{fmt}'. Supported: SVG (.svg), DXF (.dxf)."}
+        after = root.sketches.count
+        delta = after - before
+        return {"imported": os.path.basename(path), "format": fmt,
+                "sketches_added": delta if delta > 0 else after, "path": path}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---- Export & Capture ----
 
 def _export_stl(p):
@@ -1936,6 +1981,7 @@ def _process_command(data: dict) -> dict:
             "export_obj":                 lambda: {"error": "OBJ export is not supported by the Fusion 360 API. Use STL, STEP, or 3MF instead."},
             "import_cad_file":            lambda: _import_cad_file(root, p),
             "import_mesh_file":           lambda: _import_mesh_file(root, p),
+            "import_sketch_file":         lambda: _import_sketch_file(root, p),
         }
 
         if cmd in dispatch:

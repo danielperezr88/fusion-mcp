@@ -1093,6 +1093,21 @@ def import_mesh_file(path: str, units: str = "mm", as_component: bool = False) -
     return _call("import_mesh_file", {"path": path, "units": units, "as_component": as_component})
 
 
+@mcp.tool()
+def import_sketch_file(path: str, format: str = "", plane: str = "XY") -> str:
+    """
+    Import a 2D drawing file (SVG or DXF) as a sketch.
+
+    Auto-detects the format from the file extension when `format` is empty.
+
+    Args:
+        path:   Absolute path to the 2D file (.svg or .dxf).
+        format: Optional format override: svg or dxf. Empty = auto-detect.
+        plane:  Construction plane for DXF import: XY, XZ, or YZ.
+    """
+    return _call("import_sketch_file", {"path": path, "format": format, "plane": plane})
+
+
 # ---- History & File ----
 
 @mcp.tool()
