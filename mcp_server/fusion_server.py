@@ -113,6 +113,18 @@ def measure_between(entity1: str = "", entity2: str = "") -> str:
     return _call("measure_between", {"entity1": entity1, "entity2": entity2})
 
 @mcp.tool()
+def measure_angle(entity1: str = "", entity2: str = "") -> str:
+    """
+    Measure the angle between two faces or edges.
+    Entities are specified as 'body:0:face:1', 'body:0:edge:2', etc.
+
+    Args:
+        entity1: First entity specifier (face or edge).
+        entity2: Second entity specifier (face or edge).
+    """
+    return _call("measure_angle", {"entity1": entity1, "entity2": entity2})
+
+@mcp.tool()
 def get_physical_properties(body: str = "0") -> str:
     """
     Get full physical properties of a body: volume, surface area, mass, density, center of mass, moments of inertia, and principal axes.

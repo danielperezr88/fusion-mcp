@@ -411,6 +411,36 @@ def _get_physical_properties(root, p: dict) -> dict:
     return result
 
 
+def _parse_entity_spec(root, spec: str):
+    parts = spec.split(":")
+    if len(parts) >= 2 and parts[0] == "body":
+        body = _require_body(root, parts[1])
+        if len(parts) >= 4 and parts[2] == "face":
+            return body.faces.item(int(parts[3]))
+        if len(parts) >= 4 and parts[2] == "edge":
+            return body.edges.item(int(parts[3]))
+        return body
+    raise Exception(f"Cannot parse entity: {spec}")
+
+
+def _measure_angle(root, p: dict) -> dict:
+    e1 = p.get("entity1", "")
+    e2 = p.get("entity2", "")
+    try:
+        ent1 = _parse_entity_spec(root, e1)
+        ent2 = _parse_entity_spec(root, e2)
+    except Exception as e:
+        return {"error": str(e)}
+    if e1.count(":") < 3 or e2.count(":") < 3:
+        return {"error": "measure_angle requires face or edge entities. Use 'body:0:face:N' or 'body:0:edge:N' specifiers."}
+    try:
+        result = app.measureManager.measureAngle(ent1, ent2)
+    except Exception as e:
+        return {"error": f"Could not measure angle: {e}"}
+    rad = result.value
+    return {"angle_deg": round(math.degrees(rad), 6), "angle_rad": round(rad, 6)}
+
+
 # ---- Execute Script ----
 
 def _execute_script(p):
@@ -1569,6 +1599,7 @@ def _process_command(data: dict) -> dict:
             "get_timeline_info":          lambda: _get_timeline_info(),
             "measure_body":               lambda: _measure_body(root, p),
             "measure_between":            lambda: _measure_between(root, p),
+            "measure_angle":              lambda: _measure_angle(root, p),
             "get_physical_properties":    lambda: _get_physical_properties(root, p),
             "execute_script":             lambda: _execute_script(p),
             "create_new_document":        lambda: _create_new_document(p),
