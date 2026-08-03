@@ -441,6 +441,38 @@ def _measure_angle(root, p: dict) -> dict:
     return {"angle_deg": round(math.degrees(rad), 6), "angle_rad": round(rad, 6)}
 
 
+def _strict_axis_vector(name) -> "adsk.core.Vector3D":
+    n = str(name).upper()
+    if n == "X":
+        return adsk.core.Vector3D.create(1, 0, 0)
+    if n == "Y":
+        return adsk.core.Vector3D.create(0, 1, 0)
+    if n == "Z":
+        return adsk.core.Vector3D.create(0, 0, 1)
+    raise Exception(f"Axis must be X, Y, or Z (got '{name}')")
+
+
+def _get_oriented_bounding_box(root, p: dict) -> dict:
+    body = _require_body(root, p.get("body", 0))
+    try:
+        length_vec = _strict_axis_vector(p.get("length_axis", "X"))
+        width_vec = _strict_axis_vector(p.get("width_axis", "Y"))
+    except Exception as e:
+        return {"error": str(e)}
+    try:
+        obb = app.measureManager.getOrientedBoundingBox(body, length_vec, width_vec)
+    except Exception as e:
+        return {"error": f"Could not compute oriented bounding box: {e}"}
+    center = obb.centerPoint
+    return {
+        "body": body.name,
+        "center": [round(center.x, 6), round(center.y, 6), round(center.z, 6)],
+        "length_cm": round(obb.length, 6),
+        "width_cm": round(obb.width, 6),
+        "height_cm": round(obb.height, 6),
+    }
+
+
 # ---- Execute Script ----
 
 def _execute_script(p):
@@ -1601,6 +1633,7 @@ def _process_command(data: dict) -> dict:
             "measure_between":            lambda: _measure_between(root, p),
             "measure_angle":              lambda: _measure_angle(root, p),
             "get_physical_properties":    lambda: _get_physical_properties(root, p),
+            "get_oriented_bounding_box":  lambda: _get_oriented_bounding_box(root, p),
             "execute_script":             lambda: _execute_script(p),
             "create_new_document":        lambda: _create_new_document(p),
             "clear_design":               lambda: _clear_design(),

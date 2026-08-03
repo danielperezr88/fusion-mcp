@@ -134,6 +134,18 @@ def get_physical_properties(body: str = "0") -> str:
     """
     return _call("get_physical_properties", {"body": body})
 
+@mcp.tool()
+def get_oriented_bounding_box(body: str = "0", length_axis: str = "X", width_axis: str = "Y") -> str:
+    """
+    Get the oriented bounding box of a body along the specified axes.
+
+    Args:
+        body:        Body name or index number.
+        length_axis: Axis for the box length: X, Y, or Z.
+        width_axis:  Axis for the box width: X, Y, or Z.
+    """
+    return _call("get_oriented_bounding_box", {"body": body, "length_axis": length_axis, "width_axis": width_axis})
+
 
 # ---- Execute Script ----
 
