@@ -60,6 +60,13 @@ Claude Desktop  ──stdio──▶  MCP Server (Python)  ──HTTP──▶  
 - `import_mesh_file` — STL/3MF mesh import as mesh bodies (mm/cm/in units)
 - `import_sketch_file` — SVG/DXF 2D imports as sketches (DXF lands on a chosen construction plane)
 
+### OpenSCAD Pipeline
+- `run_scad` — render OpenSCAD code to a mesh body using the bundled OpenSCAD + BOSL2 (via `include <BOSL2/std.scad>`); supports `-D` param overrides and `$fn` quality; stores the source as a `scad_source` body attribute for later re-runs
+- `update_scad_body` — re-run a stored .scad source on a mesh body with new parameters or replacement code; the new body is renamed to keep name references valid
+- `import_mesh_data` — create a mesh body directly from raw triangle data (flat coordinate/index lists; auto-generates face normals if omitted)
+
+*`create_from_scad` is in the CSG-to-timeline translation:* it will translate `.scad` into native parametric Fusion features (extrude/revolve/combine/move...), falling back to mesh import for unsupported constructs (hull, surface, text, import, arbitrary polyhedra).
+
 ### Other
 - Execute arbitrary Python scripts inside Fusion 360
 - Create/clear documents
