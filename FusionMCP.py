@@ -1629,6 +1629,87 @@ def _set_body_color(root, p):
         return {"error": f"Could not set color: {e}"}
 
 
+# ---- Import Commands ----
+
+def _import_cad_file(root, p: dict) -> dict:
+    try:
+        path = p.get("path", "")
+        if not path:
+            return {"error": "No file path provided. Set 'path' to a STEP/SAT/SMT/IGES/F3D file."}
+        if not os.path.exists(path):
+            return {"error": f"File not found: {path}"}
+
+        fmt = str(p.get("format", "") or "").strip().lower()
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        if not fmt:
+            fmt = ext
+        option_creators = {
+            "step": "createSTEPImportOptions", "stp": "createSTEPImportOptions",
+            "sat": "createSATImportOptions",
+            "smt": "createSMTImportOptions",
+            "igs": "createIGESImportOptions", "iges": "createIGESImportOptions",
+            "f3d": "createFusionArchiveImportOptions",
+        }
+        creator = option_creators.get(fmt)
+        if creator is None:
+            return {"error": f"Unsupported CAD format '{fmt}'. Supported: .step/.stp, .sat, .smt, .igs/.iges, .f3d."}
+        options = getattr(app.importManager, creator)(path)
+
+        as_component = p.get("as_component", False)
+        if isinstance(as_component, str):
+            as_component = as_component.lower() in ("1", "true", "yes")
+
+        def _import_into(target, before_count: int) -> None:
+            try:
+                app.importManager.importToTarget(options, target)
+            except Exception as exc:
+                # Some Fusion builds raise InternalValidationError after a successful
+                # import; the reliable success signal is geometry appearing in the target.
+                if target.bRepBodies.count > before_count:
+                    return
+                if "save" not in str(exc).lower():
+                    raise
+                # Never-saved documents can block some imports: save first, then retry.
+                try:
+                    doc = app.activeDocument
+                    if doc is not None and not doc.isSaved:
+                        data_mgr = app.data
+                        hub = data_mgr.activeHub
+                        root_folder = hub.dataProjects.item(0).rootFolder
+                        doc.saveAs(f"FusionMCP_Import_{os.path.splitext(os.path.basename(path))[0]}",
+                                   root_folder, "Imported via FusionMCP", "")
+                    app.importManager.importToTarget(options, target)
+                except Exception as save_exc:
+                    if target.bRepBodies.count > before_count:
+                        return
+                    raise RuntimeError(
+                        f"Import failed ({exc}) and auto-save+retry also failed ({save_exc}). "
+                        "Save the document manually and retry.") from exc
+                else:
+                    if target.bRepBodies.count == before_count:
+                        raise RuntimeError(f"Import of '{path}' added no bodies after save+retry.")
+            else:
+                if target.bRepBodies.count == before_count:
+                    raise RuntimeError(f"Import of '{path}' completed without adding any bodies.")
+
+        if as_component:
+            occ = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+            target = occ.component
+            _import_into(target, 0)
+            bodies_added = target.bRepBodies.count
+        else:
+            before = root.bRepBodies.count
+            _import_into(root, before)
+            after = root.bRepBodies.count
+            delta = after - before
+            bodies_added = delta if delta > 0 else after
+
+        return {"imported": os.path.basename(path), "format": fmt,
+                "bodies_added": bodies_added, "path": path}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---- Export & Capture ----
 
 def _export_stl(p):
@@ -1799,6 +1880,7 @@ def _process_command(data: dict) -> dict:
             "save":                       lambda: _save_design(p),
             "save_as":                    lambda: _save_as(p),
             "export_obj":                 lambda: {"error": "OBJ export is not supported by the Fusion 360 API. Use STL, STEP, or 3MF instead."},
+            "import_cad_file":            lambda: _import_cad_file(root, p),
         }
 
         if cmd in dispatch:

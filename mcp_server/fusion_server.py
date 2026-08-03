@@ -1063,6 +1063,23 @@ def capture_screenshot(path: str = "", width: int = 1920, height: int = 1080) ->
         return f"Unexpected error: {e}"
 
 
+# ---- Import Tools ----
+
+@mcp.tool()
+def import_cad_file(path: str, format: str = "", as_component: bool = False) -> str:
+    """
+    Import a CAD file (STEP/SAT/SMT/IGES/F3D) into the current design.
+
+    Auto-detects the format from the file extension when `format` is empty.
+
+    Args:
+        path:         Absolute path to the CAD file (.step/.stp, .sat, .smt, .igs/.iges, .f3d).
+        format:       Optional format override: step, sat, smt, iges, f3d. Empty = auto-detect.
+        as_component: If True, import into a new component instead of the root component.
+    """
+    return _call("import_cad_file", {"path": path, "format": format, "as_component": as_component})
+
+
 # ---- History & File ----
 
 @mcp.tool()
