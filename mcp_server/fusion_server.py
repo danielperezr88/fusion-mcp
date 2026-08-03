@@ -112,6 +112,16 @@ def measure_between(entity1: str = "", entity2: str = "") -> str:
     """
     return _call("measure_between", {"entity1": entity1, "entity2": entity2})
 
+@mcp.tool()
+def get_physical_properties(body: str = "0") -> str:
+    """
+    Get full physical properties of a body: volume, surface area, mass, density, center of mass, moments of inertia, and principal axes.
+
+    Args:
+        body: Body name or index number.
+    """
+    return _call("get_physical_properties", {"body": body})
+
 
 # ---- Execute Script ----
 

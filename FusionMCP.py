@@ -347,6 +347,70 @@ def _measure_between(root, p):
     }
 
 
+# ---- Dimensioning & Inspection Tools ----
+
+def _require_body(root, ref) -> "adsk.fusion.BRepBody":
+    bodies = root.bRepBodies
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        idx = int(ref)
+        if 0 <= idx < bodies.count:
+            return bodies.item(idx)
+        raise Exception(f"Body '{ref}' not found.")
+    for i in range(bodies.count):
+        if bodies.item(i).name == ref:
+            return bodies.item(i)
+    raise Exception(f"Body '{ref}' not found.")
+
+
+def _round_xyz(pt) -> list:
+    return [round(pt.x, 6), round(pt.y, 6), round(pt.z, 6)]
+
+
+def _physical_properties_dict(body) -> dict:
+    props = body.physicalProperties
+    result = {
+        "volume_cm3": round(props.volume, 6),
+        "area_cm2": round(props.area, 6),
+        "mass_kg": round(props.mass, 6),
+        "density_kg_cm3": round(props.density, 6),
+    }
+    com = props.centerOfMass
+    result["center_of_mass"] = _round_xyz(com) if com else None
+
+    try:
+        vals = props.getXYZMomentsOfInertia()
+        vals = vals[1:] if len(vals) == 7 else vals  # strip leading success flag
+        xx, yy, zz, xy, yz, xz = vals
+        result["moments_of_inertia"] = {
+            "Ixx": round(xx, 6), "Iyy": round(yy, 6), "Izz": round(zz, 6),
+            "Ixy": round(xy, 6), "Iyz": round(yz, 6), "Ixz": round(xz, 6),
+        }
+    except Exception:
+        result["moments_of_inertia"] = None
+
+    try:
+        moms = props.getPrincipalMomentsOfInertia()
+        moms = moms[1:] if len(moms) == 4 else moms
+        i1, i2, i3 = moms
+        axes = props.getPrincipalAxes()
+        axes = axes[1:] if len(axes) == 4 else axes
+        axis1, axis2, axis3 = axes
+        result["principal_axes"] = {
+            "I1": round(i1, 6), "I2": round(i2, 6), "I3": round(i3, 6),
+            "axis1": _round_xyz(axis1), "axis2": _round_xyz(axis2), "axis3": _round_xyz(axis3),
+        }
+    except Exception:
+        result["principal_axes"] = None
+    return result
+
+
+def _get_physical_properties(root, p: dict) -> dict:
+    body = _require_body(root, p.get("body", 0))
+    result = _physical_properties_dict(body)
+    result["body"] = body.name
+    return result
+
+
 # ---- Execute Script ----
 
 def _execute_script(p):
@@ -1505,6 +1569,7 @@ def _process_command(data: dict) -> dict:
             "get_timeline_info":          lambda: _get_timeline_info(),
             "measure_body":               lambda: _measure_body(root, p),
             "measure_between":            lambda: _measure_between(root, p),
+            "get_physical_properties":    lambda: _get_physical_properties(root, p),
             "execute_script":             lambda: _execute_script(p),
             "create_new_document":        lambda: _create_new_document(p),
             "clear_design":               lambda: _clear_design(),
