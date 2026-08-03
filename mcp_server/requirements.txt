@@ -1,2 +1,5 @@
 mcp>=1.0.0
 requests>=2.31.0
+openscad-lalr-parser>=1.1.0
+openscad-evaluator>=1.1.0
+manifold3d>=3.5.2

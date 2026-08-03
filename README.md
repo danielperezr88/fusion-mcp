@@ -60,7 +60,7 @@ Claude Desktop  ──stdio──▶  MCP Server (Python)  ──HTTP──▶  
 ## Prerequisites
 
 - [Autodesk Fusion 360](https://www.autodesk.com/products/fusion-360) (any license tier)
-- [Python 3.10+](https://www.python.org/downloads/)
+- [Python 3.11+](https://www.python.org/downloads/)
 - [Claude Desktop](https://claude.ai/download)
 
 ## Installation
