@@ -1080,6 +1080,19 @@ def import_cad_file(path: str, format: str = "", as_component: bool = False) -> 
     return _call("import_cad_file", {"path": path, "format": format, "as_component": as_component})
 
 
+@mcp.tool()
+def import_mesh_file(path: str, units: str = "mm", as_component: bool = False) -> str:
+    """
+    Import a mesh file (STL or 3MF) as a mesh body.
+
+    Args:
+        path:         Absolute path to the mesh file (.stl or .3mf).
+        units:        Units of the mesh file: mm, cm, or in.
+        as_component: If True, import into a new component instead of the root component.
+    """
+    return _call("import_mesh_file", {"path": path, "units": units, "as_component": as_component})
+
+
 # ---- History & File ----
 
 @mcp.tool()

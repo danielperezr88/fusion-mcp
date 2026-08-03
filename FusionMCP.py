@@ -1710,6 +1710,60 @@ def _import_cad_file(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _import_mesh_file(root, p: dict) -> dict:
+    try:
+        path = p.get("path", "")
+        if not path:
+            return {"error": "No file path provided. Set 'path' to an STL or 3MF file."}
+        if not os.path.exists(path):
+            return {"error": f"File not found: {path}"}
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        if ext not in ("stl", "3mf"):
+            return {"error": f"{ext.upper()} format is not supported. Use STL or 3MF."}
+
+        units = str(p.get("units", "mm") or "mm").lower()
+        unit_map = {
+            "mm": adsk.fusion.MeshUnits.MillimeterMeshUnit,
+            "cm": adsk.fusion.MeshUnits.CentimeterMeshUnit,
+            "in": adsk.fusion.MeshUnits.InchMeshUnit,
+        }
+        unit = unit_map.get(units)
+        if unit is None:
+            return {"error": f"Unsupported units '{units}'. Use 'mm', 'cm', or 'in'."}
+
+        as_component = p.get("as_component", False)
+        if isinstance(as_component, str):
+            as_component = as_component.lower() in ("1", "true", "yes")
+        target = root
+        if as_component:
+            occ = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+            target = occ.component
+
+        base_feature = None
+        if _design().designType == adsk.fusion.DesignTypes.ParametricDesignType:
+            base_features = target.features.baseFeatures
+            base_feature = base_features.item(0) if base_features.count > 0 else base_features.add()
+
+        before = target.meshBodies.count
+        if base_feature is not None:
+            base_feature.startEdit()
+            try:
+                mesh_result = target.meshBodies.add(path, unit, base_feature)
+            finally:
+                base_feature.finishEdit()
+        else:
+            mesh_result = target.meshBodies.add(path, unit, None)
+        after = target.meshBodies.count
+        delta = after - before
+        imported_name = os.path.basename(path)
+        if mesh_result is not None and mesh_result.count > 0:
+            imported_name = mesh_result.item(mesh_result.count - 1).name
+        return {"imported_mesh": imported_name, "mesh_bodies": delta if delta > 0 else after,
+                "path": path}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---- Export & Capture ----
 
 def _export_stl(p):
@@ -1881,6 +1935,7 @@ def _process_command(data: dict) -> dict:
             "save_as":                    lambda: _save_as(p),
             "export_obj":                 lambda: {"error": "OBJ export is not supported by the Fusion 360 API. Use STL, STEP, or 3MF instead."},
             "import_cad_file":            lambda: _import_cad_file(root, p),
+            "import_mesh_file":           lambda: _import_mesh_file(root, p),
         }
 
         if cmd in dispatch:
