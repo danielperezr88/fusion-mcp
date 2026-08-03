@@ -1842,6 +1842,42 @@ def _get_bundle_functions():
         "so the bundled OpenSCAD + BOSL2 can be located.")
 
 
+def _get_scad_translator():
+    """Return the scad_translator module from the fusion-mcp repo.
+
+    Only ``translate_to_fusion_commands`` + ``UnsupportedSCADNodeError`` are
+    used here (the openscad-evaluator packages it imports lazily live in the
+    MCP server process, not inside Fusion).  Same importlib pattern as
+    ``_get_bundle_functions``: plain ``import mcp_server.scad_translator``
+    first, then spec_from_file_location candidates relative to this file.
+    """
+    import importlib.util
+
+    try:
+        from mcp_server import scad_translator
+        return scad_translator
+    except ImportError:
+        pass
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(here, "mcp_server", "scad_translator.py"),
+        os.path.join(here, os.pardir, "mcp_server", "scad_translator.py"),
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "fusionmcp_scad_translator", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError(
+        "mcp_server/scad_translator.py could not be found. Keep the fusion-mcp "
+        "repository (or its mcp_server/ folder) importable from FusionMCP.py "
+        "so create_from_scad can translate CSG trees into Fusion features.")
+
+
 def _run_scad(root, p: dict) -> dict:
     try:
         code = p.get("code", "")
@@ -1931,6 +1967,180 @@ def _run_scad(root, p: dict) -> dict:
                         os.remove(path)
                 except OSError:
                     pass
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _snapshot_names(collection):
+    """Names of every item in a Fusion collection (pre-translation snapshot)."""
+    return set(collection.item(i).name for i in range(collection.count))
+
+
+def _patch_boolean_types_aliases():
+    """Alias CombineFeature BooleanTypes members for this Fusion build.
+
+    The SCAD translator assigns ``BooleanTypes.JoinBooleanType`` /
+    ``CutBooleanType`` / ``IntersectBooleanType`` to
+    ``CombineFeatureInput.operation``.  Live Fusion 2026 exposes only
+    ``UnionBooleanType`` / ``DifferenceBooleanType`` / ``IntersectionBooleanType``
+    and -- empirically verified on this build -- ``CombineFeatureInput.operation``
+    accepts plain integer codes with a ROTATED mapping: ``0`` = join, ``1`` = cut,
+    ``2`` = intersect, whereas the enum members are Union=2, Difference=0,
+    Intersection=1.  Aliasing to the enum members therefore made every combine
+    behave as a join.  Instead, alias the documented names directly to the
+    operation codes this build honors, so the translator's difference/intersection
+    nodes cut and intersect correctly.  The enum class outlives module reloads, so
+    the aliases are overwritten unconditionally (the ``UnionBooleanType`` member
+    identifies this build); on builds that natively expose the documented names
+    this is a no-op.
+    """
+    try:
+        bt = adsk.fusion.BooleanTypes
+        if not hasattr(bt, "UnionBooleanType"):
+            return
+        setattr(bt, "JoinBooleanType", 0)
+        setattr(bt, "CutBooleanType", 1)
+        setattr(bt, "IntersectBooleanType", 2)
+    except Exception:
+        pass
+
+
+def _cleanup_translation(root, before_bodies, before_sketches, before_planes):
+    """Delete every body/sketch/construction plane created during a failed
+    partial translation, leaving the design as it was before.
+
+    The translator names every body it creates ``scad_<kind>_<n>`` and every
+    sketch ``scad_<kind>_sketch``, so anything whose name is not in the
+    pre-translation snapshot is ours and safe to delete.  Iterating in reverse
+    keeps indices valid while items disappear.  Returns the body count deleted.
+    """
+    deleted = 0
+    for i in range(root.bRepBodies.count - 1, -1, -1):
+        body = root.bRepBodies.item(i)
+        if body.name not in before_bodies:
+            try:
+                body.deleteMe()
+                deleted += 1
+            except Exception:
+                pass
+    for i in range(root.sketches.count - 1, -1, -1):
+        sketch = root.sketches.item(i)
+        if sketch.name not in before_sketches:
+            try:
+                sketch.deleteMe()
+            except Exception:
+                pass
+    for i in range(root.constructionPlanes.count - 1, -1, -1):
+        plane = root.constructionPlanes.item(i)
+        if plane.name not in before_planes:
+            try:
+                plane.deleteMe()
+            except Exception:
+                pass
+    return deleted
+
+
+def _is_revolve_failure(message: str) -> bool:
+    """True when a translation crash is this Fusion 2026 build's revolve kernel
+    rejecting a sketch-line revolve axis on an XZ/YZ construction plane
+    (verified live: construction-axis revolves work, sketch-line-axis revolves
+    on XZ/YZ raise ASM_PATH_TANGENT)."""
+    return "ASM_PATH_TANGENT" in message or "revolu" in message.lower()
+
+
+def _create_from_scad(root, p: dict) -> dict:
+    try:
+        code = str(p.get("code", "") or "")
+        if not code:
+            return {"error": "No OpenSCAD code provided. Set 'code' to the .scad source to translate."}
+        units = str(p.get("units", "mm") or "mm").lower()
+        fallback_to_mesh = bool(p.get("fallback_to_mesh", True))
+        csg_tree = p.get("csg_tree")
+        if csg_tree is None:
+            return {"error": "No CSG tree received. The MCP server must resolve the SCAD code with resolve_scad() before sending it here."}
+
+        translator = _get_scad_translator()
+        design = _design()
+        if design is None:
+            return {"error": "No active Fusion 360 design. Open or create one first."}
+
+        # Snapshot BEFORE translation: cleanup-on-fallback + success deltas.
+        before_bodies = _snapshot_names(root.bRepBodies)
+        before_body_count = root.bRepBodies.count
+        before_mesh_count = root.meshBodies.count
+        before_sketches = _snapshot_names(root.sketches)
+        before_planes = _snapshot_names(root.constructionPlanes)
+        before_timeline = design.timeline.count
+
+        try:
+            _patch_boolean_types_aliases()
+            created_names = translator.translate_to_fusion_commands(
+                csg_tree, root, design, units=units)
+        except translator.UnsupportedSCADNodeError as e:
+            deleted = _cleanup_translation(
+                root, before_bodies, before_sketches, before_planes)
+            kind = getattr(e, "kind", None)
+            unsupported = [kind] if kind else [str(e).split(" ")[0]]
+            if not fallback_to_mesh:
+                return {
+                    "error": f"Unsupported SCAD node: {e}",
+                    "unsupported_nodes": unsupported,
+                    "fallback_reason": str(e),
+                    "partial_bodies_deleted": deleted,
+                }
+            # Mesh fallback: partial bodies already deleted above; render the
+            # ENTIRE model with the bundled OpenSCAD instead.
+            result = _run_scad(root, {"code": code, "units": units})
+            if not result.get("rendered"):
+                return {
+                    "error": f"SCAD translation failed ({e}) and mesh fallback failed: {result.get('error')}",
+                    "unsupported_nodes": unsupported,
+                }
+            return {
+                "created": True,
+                "method": "mesh_fallback",
+                "bodies": root.meshBodies.count - before_mesh_count,
+                "features": 0,
+                "unsupported_nodes": unsupported,
+                "fallback_reason": str(e),
+                "mesh_body": result.get("mesh_body"),
+            }
+        except Exception as e:
+            deleted = _cleanup_translation(
+                root, before_bodies, before_sketches, before_planes)
+            message = str(e)
+            if fallback_to_mesh and _is_revolve_failure(message):
+                result = _run_scad(root, {"code": code, "units": units})
+                if result.get("rendered"):
+                    return {
+                        "created": True,
+                        "method": "mesh_fallback",
+                        "bodies": root.meshBodies.count - before_mesh_count,
+                        "features": 0,
+                        "unsupported_nodes": ["rotate_extrude"],
+                        "fallback_reason": message,
+                        "mesh_body": result.get("mesh_body"),
+                    }
+            return {
+                "error": f"SCAD translation failed: {e}",
+                "partial_bodies_deleted": deleted,
+            }
+
+        # Success: csg_translation.  Count deltas are the ground truth.
+        bodies = (root.bRepBodies.count - before_body_count
+                  + root.meshBodies.count - before_mesh_count)
+        features = design.timeline.count - before_timeline
+        if len(created_names) <= 0 and bodies <= 0:
+            return {"error": "SCAD translation produced no bodies.",
+                    "unsupported_nodes": []}
+        return {
+            "created": True,
+            "method": "csg_translation",
+            "bodies": bodies,
+            "features": features,
+            "unsupported_nodes": [],
+            "fallback_reason": None,
+        }
     except Exception as e:
         return {"error": str(e)}
 
@@ -2232,6 +2442,7 @@ def _process_command(data: dict) -> dict:
             "run_scad":                   lambda: _run_scad(root, p),
             "update_scad_body":           lambda: _update_scad_body(root, p),
             "import_mesh_data":           lambda: _import_mesh_data(root, p),
+            "create_from_scad":           lambda: _create_from_scad(root, p),
         }
 
         if cmd in dispatch:

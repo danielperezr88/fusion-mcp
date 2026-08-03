@@ -9,10 +9,74 @@ inside Fusion 360 via HTTP on localhost:7432.
 import requests
 import json
 import base64
+import importlib.util
+import os
 from mcp.server.fastmcp import FastMCP, Image
 
 FUSION_URL = "http://127.0.0.1:7432"
 mcp = FastMCP("Fusion 360")
+
+
+def _load_scad_translator():
+    """Import mcp_server.scad_translator from the repo, wherever it lives.
+
+    The MCP server process is the one with the openscad-evaluator packages, so
+    ``resolve_scad()`` runs HERE (process split: the add-in has adsk but no
+    openscad packages).  ``import mcp_server.scad_translator`` works when the
+    repo root is on sys.path; when this file is launched directly (e.g. by an
+    MCP client) the script dir is on sys.path instead, so fall back to loading
+    the module by file location.
+    """
+    try:
+        from mcp_server import scad_translator
+        return scad_translator
+    except ImportError:
+        pass
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(here, "scad_translator.py"),
+        os.path.join(here, os.pardir, "mcp_server", "scad_translator.py"),
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "fusionmcp_scad_translator", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError(
+        "mcp_server/scad_translator.py could not be found. Keep the fusion-mcp "
+        "repository importable so create_from_scad can resolve SCAD code.")
+
+
+def _get_bosl2_path():
+    """Resolve the bundled BOSL2 path, or None when the bundle is unavailable."""
+    try:
+        from mcp_server.bundle import get_bosl2_path
+        return get_bosl2_path()
+    except ImportError:
+        pass
+    try:
+        from bundle import get_bosl2_path
+        return get_bosl2_path()
+    except ImportError:
+        return None
+
+
+def _get_openscad_path():
+    """Resolve the bundled OpenSCAD binary path, or None when unavailable."""
+    try:
+        from mcp_server.bundle import get_openscad_path
+        return get_openscad_path()
+    except ImportError:
+        pass
+    try:
+        from bundle import get_openscad_path
+        return get_openscad_path()
+    except ImportError:
+        return None
 
 
 def _call(command: str, params: dict = None, timeout: int = 30) -> str:
@@ -1162,6 +1226,45 @@ def import_mesh_data(coordinates: list, triangle_indices: list, normals: list = 
     """
     return _call("import_mesh_data", {"coordinates": coordinates, "triangle_indices": triangle_indices,
                                        "normals": normals, "normal_indices": normal_indices, "name": name})
+
+
+@mcp.tool()
+def create_from_scad(code: str, units: str = "mm", fallback_to_mesh: bool = True) -> str:
+    """
+    Translate OpenSCAD/BOSL2 code into native parametric Fusion features.
+
+    Resolves the .scad source into a CSG tree (openscad-evaluator primary path,
+    OpenSCAD-binary CSG export fallback) in this server process, then sends the
+    tree to Fusion, where it becomes real BRep bodies via native sketch/extrude/
+    revolve/combine features (visible in the timeline). If a node cannot be
+    translated to native features and fallback_to_mesh is True, any partially
+    created bodies are deleted and the whole model is rendered as a mesh body
+    instead (same path as run_scad).
+
+    Args:
+        code:             Raw OpenSCAD source, e.g.
+                          'difference() { cube([20,20,20]); cylinder(r=5, h=30); }'
+                          or 'include <BOSL2/std.scad>\\ncuboid([10,10,10]);'.
+        units:            Units of the OpenSCAD model: mm, cm, or in.
+        fallback_to_mesh: If a CSG node is unsupported, delete partial bodies
+                          and fall back to a mesh render (True) or return an
+                          error listing the unsupported nodes (False).
+    """
+    try:
+        translator = _load_scad_translator()
+        bosl2_path = _get_bosl2_path()
+        openscad_path = _get_openscad_path()
+    except Exception as e:
+        return f"Error: {e}"
+    try:
+        csg_tree = translator.resolve_scad(
+            code, openscad_path=openscad_path, bosl2_path=bosl2_path)
+    except Exception as e:
+        return f"Error: SCAD resolution failed: {e}"
+    return _call("create_from_scad", {
+        "csg_tree": csg_tree, "code": code,
+        "units": units, "fallback_to_mesh": fallback_to_mesh,
+    }, timeout=330)
 
 
 # ---- History & File ----
