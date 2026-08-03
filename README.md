@@ -41,6 +41,10 @@ Claude Desktop  ──stdio──▶  MCP Server (Python)  ──HTTP──▶  
 - Body measurement (bounding box, volume, face/edge/vertex counts)
 - Distance measurement between entities
 - Feature timeline
+- `get_physical_properties` — mass, density, volume, surface area, center of mass, moments of inertia, and principal axes
+- `measure_angle` — angle between two faces or edges, in degrees
+- `get_oriented_bounding_box` — oriented bounding box along configurable length/width axes
+- `inspect_body` — full BRep report: faces/edges/vertices, cylindrical radii, and surface normals (summary or full detail)
 
 ### Parameters & Appearance
 - Create and update user parameters
@@ -50,6 +54,11 @@ Claude Desktop  ──stdio──▶  MCP Server (Python)  ──HTTP──▶  
 ### Export & Capture
 - STL, STEP, 3MF, F3D (Fusion archive)
 - Viewport screenshot capture
+
+### Import
+- `import_cad_file` — STEP, SAT, SMT, IGES, and F3D imports (format auto-detected from extension)
+- `import_mesh_file` — STL/3MF mesh import as mesh bodies (mm/cm/in units)
+- `import_sketch_file` — SVG/DXF 2D imports as sketches (DXF lands on a chosen construction plane)
 
 ### Other
 - Execute arbitrary Python scripts inside Fusion 360
@@ -62,6 +71,8 @@ Claude Desktop  ──stdio──▶  MCP Server (Python)  ──HTTP──▶  
 - [Autodesk Fusion 360](https://www.autodesk.com/products/fusion-360) (any license tier)
 - [Python 3.11+](https://www.python.org/downloads/)
 - [Claude Desktop](https://claude.ai/download)
+
+**OpenSCAD & BOSL2 bundling:** On first use, FusionMCP automatically downloads a portable OpenSCAD build and the BOSL2 library to `~/.fusion-mcp/bundle/` — no PATH configuration needed. Common BOSL2 modules (`cuboid`, `cyl`, `prismoid`, `torus`, `diff`, `edge_profile`, `xcopies`) resolve to native Fusion features via the openscad-evaluator.
 
 ## Installation
 
