@@ -1130,6 +1130,23 @@ def run_scad(code: str, params: str = "", quality: int = 100, units: str = "mm")
     return _call("run_scad", {"code": code, "params": params, "quality": quality, "units": units}, timeout=330)
 
 
+@mcp.tool()
+def update_scad_body(body: str = "0", params: str = "", code: str = "") -> str:
+    """
+    Re-run a stored .scad source on a mesh body with new parameters.
+
+    Reads the 'scad_source' attribute stored by run_scad, deletes the old mesh
+    body, re-renders, and creates a new mesh body. The new body is renamed to
+    the original body's name.
+
+    Args:
+        body:   Body name or index of a mesh body created by run_scad.
+        params: Optional '-D' variable overrides for the re-render.
+        code:   Optional replacement OpenSCAD source; overrides the stored source when provided.
+    """
+    return _call("update_scad_body", {"body": body, "params": params, "code": code}, timeout=330)
+
+
 # ---- History & File ----
 
 @mcp.tool()

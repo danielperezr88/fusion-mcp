@@ -1935,6 +1935,53 @@ def _run_scad(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _find_mesh_body(root, ref) -> "adsk.fusion.MeshBody":
+    bodies = root.meshBodies
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        idx = int(ref)
+        if 0 <= idx < bodies.count:
+            return bodies.item(idx)
+        raise Exception(f"Body '{ref}' not found.")
+    for i in range(bodies.count):
+        if bodies.item(i).name == ref:
+            return bodies.item(i)
+    raise Exception(f"Body '{ref}' not found.")
+
+
+def _update_scad_body(root, p: dict) -> dict:
+    try:
+        ref = p.get("body", 0)
+        body = _find_mesh_body(root, ref)
+        attr = body.attributes.itemByName("FusionMCP", "scad_source")
+        if attr is None:
+            return {"error": "Body does not have stored SCAD source."}
+        code = str(p.get("code", "") or "").strip()
+        if not code:
+            code = attr.value
+        params = str(p.get("params", "") or "")
+        old_name = body.name
+        body.deleteMe()
+        result = _run_scad(root, {"code": code, "params": params})
+        if not result.get("rendered"):
+            return result
+        new_name = result.get("mesh_body")
+        try:
+            new_body = _find_mesh_body(root, new_name)
+            new_body.name = old_name
+            new_name = old_name
+        except Exception:
+            pass
+        return {
+            "updated": True,
+            "mesh_body": new_name,
+            "mesh_body_name": new_name,
+            "params_used": params,
+            "index_shift_warning": "Body indices may have shifted after update. Use body name for future references.",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---- Export & Capture ----
 
 def _export_stl(p):
@@ -2109,6 +2156,7 @@ def _process_command(data: dict) -> dict:
             "import_mesh_file":           lambda: _import_mesh_file(root, p),
             "import_sketch_file":         lambda: _import_sketch_file(root, p),
             "run_scad":                   lambda: _run_scad(root, p),
+            "update_scad_body":           lambda: _update_scad_body(root, p),
         }
 
         if cmd in dispatch:
