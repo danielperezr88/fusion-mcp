@@ -1147,6 +1147,23 @@ def update_scad_body(body: str = "0", params: str = "", code: str = "") -> str:
     return _call("update_scad_body", {"body": body, "params": params, "code": code}, timeout=330)
 
 
+@mcp.tool()
+def import_mesh_data(coordinates: list, triangle_indices: list, normals: list = None,
+                     normal_indices: list = None, name: str = "") -> str:
+    """
+    Create a mesh body directly from triangle data.
+
+    Args:
+        coordinates:      Flat list [x0,y0,z0, x1,y1,z1, ...] of vertex coordinates.
+        triangle_indices: Flat list of vertex index triples [v0,v1,v2, v0,v1,v2, ...].
+        normals:          Optional flat list of normal vectors. Omit to auto-generate face normals.
+        normal_indices:   Optional flat index list for the normals. Omit to use triangle_indices.
+        name:             Optional name for the created mesh body.
+    """
+    return _call("import_mesh_data", {"coordinates": coordinates, "triangle_indices": triangle_indices,
+                                       "normals": normals, "normal_indices": normal_indices, "name": name})
+
+
 # ---- History & File ----
 
 @mcp.tool()

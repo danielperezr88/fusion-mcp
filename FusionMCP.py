@@ -1982,6 +1982,80 @@ def _update_scad_body(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _import_mesh_data(root, p: dict) -> dict:
+    try:
+        coordinates = p.get("coordinates", []) or []
+        triangle_indices = p.get("triangle_indices", []) or []
+        normals = p.get("normals", []) or []
+        normal_indices = p.get("normal_indices", []) or []
+        if not coordinates:
+            return {"error": "No coordinates provided. Provide a flat list [x0,y0,z0,x1,y1,z1,...]."}
+        if len(coordinates) % 3 != 0:
+            return {"error": "coordinates length must be divisible by 3 (x,y,z triples)."}
+        if not triangle_indices:
+            return {"error": "No triangle_indices provided. Provide a flat list of vertex index triples."}
+        if len(triangle_indices) % 3 != 0:
+            return {"error": "triangle_indices length must be divisible by 3 (each triangle is 3 vertex indices)."}
+        vertex_count = len(coordinates) // 3
+        if min(triangle_indices) < 0 or max(triangle_indices) >= vertex_count:
+            return {"error": "triangle_indices reference vertices out of range."}
+
+        if not normals:
+            normals = []
+            normal_indices = list(triangle_indices)
+            for t in range(len(triangle_indices) // 3):
+                i0, i1, i2 = triangle_indices[3 * t], triangle_indices[3 * t + 1], triangle_indices[3 * t + 2]
+                ax, ay, az = coordinates[3 * i0], coordinates[3 * i0 + 1], coordinates[3 * i0 + 2]
+                bx, by, bz = coordinates[3 * i1], coordinates[3 * i1 + 1], coordinates[3 * i1 + 2]
+                cx, cy, cz = coordinates[3 * i2], coordinates[3 * i2 + 1], coordinates[3 * i2 + 2]
+                ux, uy, uz = bx - ax, by - ay, bz - az
+                vx, vy, vz = cx - ax, cy - ay, cz - az
+                nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+                length = math.sqrt(nx * nx + ny * ny + nz * nz)
+                if length == 0:
+                    return {"error": f"Degenerate triangle at index {t}: zero-area triangle."}
+                nx, ny, nz = nx / length, ny / length, nz / length
+                normals.extend([nx, ny, nz, nx, ny, nz, nx, ny, nz])
+        else:
+            if len(normals) % 3 != 0:
+                return {"error": "normals length must be divisible by 3 (x,y,z triples)."}
+            if not normal_indices:
+                normal_indices = list(range(len(normals)))
+            if len(normal_indices) % 3 != 0:
+                return {"error": "normal_indices length must be divisible by 3 (3 indices per triangle)."}
+
+        mesh_body = None
+        if _design().designType == adsk.fusion.DesignTypes.ParametricDesignType:
+            base_features = root.features.baseFeatures
+            base_feature = base_features.item(0) if base_features.count > 0 else base_features.add()
+            try:
+                base_feature.startEdit()
+            except Exception:
+                base_feature = None
+            if base_feature is not None:
+                try:
+                    mesh_body = root.meshBodies.addByTriangleMeshData(
+                        coordinates, triangle_indices, normals, normal_indices)
+                finally:
+                    base_feature.finishEdit()
+        if mesh_body is None:
+            mesh_body = root.meshBodies.addByTriangleMeshData(
+                coordinates, triangle_indices, normals, normal_indices)
+        name = str(p.get("name", "") or "")
+        if name:
+            try:
+                mesh_body.name = name
+            except Exception:
+                pass
+        return {
+            "created_mesh": mesh_body.name,
+            "vertex_count": vertex_count,
+            "triangle_count": len(triangle_indices) // 3,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---- Export & Capture ----
 
 def _export_stl(p):
@@ -2157,6 +2231,7 @@ def _process_command(data: dict) -> dict:
             "import_sketch_file":         lambda: _import_sketch_file(root, p),
             "run_scad":                   lambda: _run_scad(root, p),
             "update_scad_body":           lambda: _update_scad_body(root, p),
+            "import_mesh_data":           lambda: _import_mesh_data(root, p),
         }
 
         if cmd in dispatch:
