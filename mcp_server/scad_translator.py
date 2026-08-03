@@ -87,14 +87,15 @@ _BOOLEAN_KINDS = frozenset({"union", "difference", "intersection",
 _PASSTHROUGH_KINDS = frozenset({"color", "render", "group"})
 
 #: 2D -> 3D extrusion operations.  The 2D profiles under them (polygon /
-#: square / circle) are Todo 15; the handlers here raise a clear "2D pass"
-#: message and leave clean extension points.
+#: square / circle) are drawn into a single sketch and extruded / revolved
+#: as native Fusion features.
 _EXTRUSION_KINDS = frozenset({"linear_extrude", "rotate_extrude"})
 
-#: 2D primitives -- Todo 15.  Kept OUT of the hard-unsupported set so that
-#: ``linear_extrude``/``rotate_extrude`` subtrees validate structurally; their
-#: handlers raise the "2D pass" error at execution time (before any adsk call).
-_SOFT_UNSUPPORTED_2D = frozenset({"polygon", "circle", "square"})
+#: 2D primitives.  Valid only as children of ``linear_extrude`` /
+#: ``rotate_extrude`` (possibly through transform / passthrough wrappers such
+#: as BOSL2's ``mask2d_*`` chains) -- enforced by the validation pass.  They
+#: are executed by drawing the profile(s) into the extrude's sketch.
+_2D_PRIMITIVE_KINDS = frozenset({"polygon", "circle", "square"})
 
 #: Kinds rejected during the validation pass, before any adsk call happens.
 #: These have no faithful native-Fusion parametric equivalent yet.
@@ -106,7 +107,7 @@ _SPECIAL_KINDS = frozenset({"minkowski"})
 
 _SUPPORTED_KINDS = (
     _PRIMITIVE_KINDS | _TRANSFORM_KINDS | _BOOLEAN_KINDS | _PASSTHROUGH_KINDS
-    | _EXTRUSION_KINDS | _SOFT_UNSUPPORTED_2D | _SPECIAL_KINDS
+    | _EXTRUSION_KINDS | _2D_PRIMITIVE_KINDS | _SPECIAL_KINDS
 )
 
 
@@ -573,6 +574,44 @@ def _matrix_near_identity(m, tol: float = 1e-6) -> bool:
     return True
 
 
+# --- pure 2D affine matrix helpers (no adsk, unit-testable headless) --------
+
+def _mat3_identity():
+    """3x3 2D affine identity matrix."""
+    return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+
+def _mat3_mul(a, b):
+    """3x3 matrix product ``a . b`` -- apply ``b`` first, then ``a``."""
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)]
+            for i in range(3)]
+
+
+def _mat3_apply(m, pt):
+    """Apply a 3x3 2D affine matrix to an (x, y) point."""
+    x, y = float(pt[0]), float(pt[1])
+    return [m[0][0] * x + m[0][1] * y + m[0][2],
+            m[1][0] * x + m[1][1] * y + m[1][2]]
+
+
+def _mat3_is_similarity(m) -> bool:
+    """True when the 2x2 linear part is a rotation + uniform scale (no shear
+    / non-uniform scale) -- the only case where a circle stays a circle."""
+    c0x, c0y = m[0][0], m[1][0]
+    c1x, c1y = m[0][1], m[1][1]
+    len0 = math.hypot(c0x, c0y)
+    len1 = math.hypot(c1x, c1y)
+    if len0 < 1e-12 or len1 < 1e-12:
+        return False
+    return (abs(c0x * c1x + c0y * c1y) < 1e-9
+            and abs(len0 - len1) < 1e-9)
+
+
+def _mat3_scale_factor(m) -> float:
+    """Uniform scale factor of a similarity matrix."""
+    return math.hypot(m[0][0], m[1][0])
+
+
 # --- Fusion-side executor ----------------------------------------------------
 
 class _FusionExecutor:
@@ -1001,27 +1040,300 @@ class _FusionExecutor:
         children = node["children"]
         if not children:
             return []  # empty ghost extrude (BOSL2 diff() artifacts)
-        raise UnsupportedSCADNodeError(
-            "linear_extrude",
-            "2D profile extrusion is handled in the 2D pass "
-            "(Todo 15) -- profile kinds: "
-            + ", ".join(sorted({c.get("kind", "?") for c in children})))
+        params = node["params"]
+        twist = float(_num(params, ("twist",), default=0.0))
+        if abs(twist) > 1e-9:
+            raise UnsupportedSCADNodeError(
+                "linear_extrude", "twist is not supported yet")
+        scale_top = params.get("scale_top")
+        if (isinstance(scale_top, list) and len(scale_top) == 2
+                and (abs(float(scale_top[0]) - 1.0) > 1e-9
+                     or abs(float(scale_top[1]) - 1.0) > 1e-9)):
+            raise UnsupportedSCADNodeError(
+                "linear_extrude", "tapering scale is not supported yet")
+        height = float(_num(params, ("height", "h"), default=100.0)) * self.scale
+        center = bool(params.get("center", False))
+        sketch = self._new_sketch(self.root.xYConstructionPlane,
+                                  self._next_name("linear_extrude_sketch"))
+        profiles = self._draw_2d_children(children, sketch)
+        if not profiles:
+            self._discard_sketch(sketch)
+            return []
+        feature = self._extrude_profiles(
+            profiles, height / 2 if center else height, symmetric=center)
+        return self._name_bodies(feature, "linear_extrude")
 
     def _eval_rotate_extrude(self, node):
         children = node["children"]
         if not children:
             return []
-        raise UnsupportedSCADNodeError(
-            "rotate_extrude",
-            "2D profile revolution is handled in the 2D pass "
-            "(Todo 15) -- profile kinds: "
-            + ", ".join(sorted({c.get("kind", "?") for c in children})))
+        params = node["params"]
+        angle = float(_num(params, ("angle",), default=360.0))
+        sketch = self._new_sketch(self.root.xZConstructionPlane,
+                                  self._next_name("rotate_extrude_sketch"))
+        # Revolve axis = the world Z axis, which lies along the sketch y-axis
+        # of the XZ construction plane: the line (0,0,0) -> (0,0,1).
+        axis_line = sketch.sketchCurves.sketchLines.addByTwoPoints(
+            self.adsk.core.Point3D.create(0, 0, 0),
+            self.adsk.core.Point3D.create(0, 0, 1))
+        profiles = self._draw_2d_children(children, sketch)
+        if not profiles:
+            self._discard_sketch(sketch)
+            return []
+        profiles = self._profiles_avoiding_axis(profiles, axis_line)
+        feature = self._revolve_profiles(profiles, axis_line, angle)
+        return self._name_bodies(feature, "rotate_extrude")
 
-    def _eval_2d_primitive(self, node):
+    def _discard_sketch(self, sketch) -> None:
+        """Best-effort cleanup of an empty ghost sketch (no bodies created)."""
+        try:
+            sketch.deleteMe()
+        except Exception:  # pragma: no cover - cosmetic, API differences
+            pass
+
+    def _draw_2d_children(self, children, sketch):
+        """Draw every 2D child of an extrude node into ONE sketch.
+
+        Returns the list of closed Profile objects to extrude/revolve.
+        """
+        sketch.isComputeDeferred = False
+        profiles = []
+        for child in children:
+            profiles.extend(self._draw_2d_node(child, sketch, None))
+        return profiles
+
+    def _draw_2d_node(self, node, sketch, matrix):
+        """Draw a 2D subtree (primitive / transform chain / passthrough).
+
+        Transforms compose a 2D affine matrix applied to the drawn geometry
+        (OpenSCAD order: the innermost transform applies first).  Returns the
+        closed Profile list this subtree contributes.
+        """
         kind = node["kind"]
+        if kind in _TRANSFORM_KINDS:
+            matrix = self._compose_2d_transform(matrix, node)
+            profiles = []
+            for child in node["children"]:
+                profiles.extend(self._draw_2d_node(child, sketch, matrix))
+            return profiles
+        if kind in _PASSTHROUGH_KINDS:
+            profiles = []
+            for child in node["children"]:
+                profiles.extend(self._draw_2d_node(child, sketch, matrix))
+            return profiles
+        if kind in _2D_PRIMITIVE_KINDS:
+            return self._eval_2d_primitive(node, sketch, matrix)
         raise UnsupportedSCADNodeError(
-            kind,
-            f"{kind} is a 2D primitive -- handled in the 2D pass (Todo 15)")
+            kind, f"{kind} is not supported inside a 2D extrude")
+
+    def _compose_2d_transform(self, matrix, node):
+        """Compose ``node``'s 2D transform onto ``matrix`` (None = identity).
+
+        Returns ``matrix . node_matrix`` so the accumulated (outer) transform
+        applies after the new (inner) one, matching OpenSCAD semantics where
+        the transform closest to the primitive applies first.
+        """
+        kind = node["kind"]
+        params = node["params"]
+        if matrix is None:
+            matrix = _mat3_identity()
+        m = _mat3_identity()
+        if kind == "translate":
+            vec = _transform_vector(params, default=[0.0, 0.0, 0.0])
+            tx, ty = _as3(vec)[0], _as3(vec)[1]
+            m[0][2] = float(tx) * self.scale
+            m[1][2] = float(ty) * self.scale
+        elif kind == "rotate":
+            angle = _transform_vector(params, default=[0.0, 0.0, 0.0])
+            if isinstance(angle, (int, float)):
+                a = float(angle)
+            else:
+                vec = [float(v) for v in angle]
+                # 2D rotate: scalar / 1-vector rotate about Z; a 3-vector
+                # contributes only its Z (out-of-plane) component.
+                a = vec[0] if len(vec) == 1 else vec[2]
+            rad = math.radians(a)
+            c, s = math.cos(rad), math.sin(rad)
+            m = [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+        elif kind == "scale":
+            vec = _transform_vector(params, default=[1.0, 1.0, 1.0])
+            sx, sy = _as3(vec)[0], _as3(vec)[1]
+            m = [[float(sx), 0.0, 0.0], [0.0, float(sy), 0.0],
+                 [0.0, 0.0, 1.0]]
+        elif kind == "mirror":
+            vec = _transform_vector(params, default=[1.0, 0.0, 0.0])
+            vx, vy = _as3(vec)[0], _as3(vec)[1]
+            norm2 = float(vx) ** 2 + float(vy) ** 2
+            if norm2 < 1e-12:
+                raise UnsupportedSCADNodeError(
+                    "mirror", "zero mirror vector inside a 2D extrude")
+            # Reflection across the line through the origin perpendicular to
+            # the mirror vector: p' = p - 2 (p.v)/|v|^2 v.
+            m = [[1.0 - 2.0 * float(vx) * float(vx) / norm2,
+                  -2.0 * float(vx) * float(vy) / norm2, 0.0],
+                 [-2.0 * float(vx) * float(vy) / norm2,
+                  1.0 - 2.0 * float(vy) * float(vy) / norm2, 0.0],
+                 [0.0, 0.0, 1.0]]
+        elif kind == "multmatrix":
+            mm = _transform_matrix(params)
+            if mm is None:
+                raise UnsupportedSCADNodeError(
+                    "multmatrix", "no matrix found in params")
+            # Keep the 2D affine part of the 4x4 matrix (x/y linear + x/y
+            # translation); z rows/columns only matter to 3D geometry.
+            m = [[float(mm[0][0]), float(mm[0][1]),
+                  float(mm[0][3]) * self.scale],
+                 [float(mm[1][0]), float(mm[1][1]),
+                  float(mm[1][3]) * self.scale],
+                 [0.0, 0.0, 1.0]]
+        elif kind == "resize":
+            raise UnsupportedSCADNodeError(
+                "resize", "resize inside a 2D extrude is not supported yet")
+        else:
+            raise UnsupportedSCADNodeError(
+                kind, f"{kind} inside a 2D extrude is not supported yet")
+        return _mat3_mul(matrix, m)
+
+    def _eval_2d_primitive(self, node, sketch, matrix=None):
+        """Draw one 2D primitive into ``sketch``, transformed by ``matrix``.
+
+        Returns the Profile objects this primitive contributes.  A polygon
+        with explicit inner paths (holes) contributes only its ring profile(s);
+        the inner disc profiles would fill the holes and are dropped.
+        """
+        kind = node["kind"]
+        params = node["params"]
+        before = sketch.profiles.count
+        has_holes = False
+
+        if kind == "circle":
+            radius = self._circle_radius(params)
+            if matrix is not None and not _mat3_is_similarity(matrix):
+                pts = [[radius * math.cos(2 * math.pi * i / 64),
+                        radius * math.sin(2 * math.pi * i / 64)]
+                       for i in range(64)]
+                self._sketch_polygon(
+                    sketch, [_mat3_apply(matrix, p) for p in pts])
+            else:
+                cx, cy, r = 0.0, 0.0, radius
+                if matrix is not None:
+                    cx, cy = _mat3_apply(matrix, (0.0, 0.0))
+                    r = radius * _mat3_scale_factor(matrix)
+                self._sketch_circle(sketch, cx, cy, r)
+        elif kind == "square":
+            size = _vec_or_num(params, "size", default=1.0)
+            if isinstance(size, (int, float)):
+                w = h = float(size)
+            else:
+                w, h = float(size[0]), float(size[1])
+            w *= self.scale
+            h *= self.scale
+            if bool(params.get("center", False)):
+                corners = [(-w / 2, -h / 2), (w / 2, -h / 2),
+                           (w / 2, h / 2), (-w / 2, h / 2)]
+            else:
+                corners = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
+            if matrix is not None:
+                corners = [_mat3_apply(matrix, c) for c in corners]
+            self._sketch_polygon(sketch, corners)
+        elif kind == "polygon":
+            points = params.get("pts")
+            if points is None:
+                points = params.get("points")  # .csg named-argument shape
+            if not isinstance(points, list) or len(points) < 3:
+                raise UnsupportedSCADNodeError(
+                    "polygon", "polygon requires points (list of [x,y])")
+            scaled = [[float(x) * self.scale, float(y) * self.scale]
+                      for x, y in points]
+            paths = params.get("paths")
+            has_holes = bool(paths) and len(paths) > 1
+            if not paths:
+                paths = [list(range(len(points)))]
+            for path in paths:
+                loop = [scaled[int(i)] for i in path]
+                if matrix is not None:
+                    loop = [_mat3_apply(matrix, p) for p in loop]
+                self._sketch_polygon(sketch, loop)
+        else:
+            raise UnsupportedSCADNodeError(kind)
+
+        sketch.isComputeDeferred = False
+        new_profiles = [sketch.profiles.item(i)
+                        for i in range(before, sketch.profiles.count)]
+        if has_holes:
+            # Outer + inner loops bound ONE ring profile (2+ loops); the inner
+            # discs are separate 1-loop profiles that would fill the holes.
+            rings = [p for p in new_profiles if p.profileLoops.count >= 2]
+            if rings:
+                return rings
+        return new_profiles
+
+    def _circle_radius(self, params):
+        """circle() radius in cm (r, d/2, or radius), applying self.scale."""
+        r = params.get("r")
+        if r is not None:
+            return float(r) * self.scale
+        d = params.get("d")
+        if d is not None:
+            return float(d) / 2.0 * self.scale
+        return float(_num(params, ("radius",), default=1.0)) * self.scale
+
+    def _extrude_profiles(self, profiles, distance, symmetric=False):
+        collection = self.adsk.core.ObjectCollection.create()
+        for profile in profiles:
+            collection.add(profile)
+        extent = self.adsk.core.ValueInput.createByReal(distance)
+        extrude_input = self.root.features.extrudeFeatures.createInput(
+            collection, self._new_body_op)
+        extrude_input.setDistanceExtent(symmetric, extent)
+        return self.root.features.extrudeFeatures.add(extrude_input)
+
+    def _revolve_profiles(self, profiles, axis_line, angle_deg):
+        collection = self.adsk.core.ObjectCollection.create()
+        for profile in profiles:
+            collection.add(profile)
+        revolve_input = self.root.features.revolveFeatures.createInput(
+            collection, axis_line, self._new_body_op)
+        revolve_input.setAngleExtent(
+            False,
+            self.adsk.core.ValueInput.createByReal(math.radians(angle_deg)))
+        return self.root.features.revolveFeatures.add(revolve_input)
+
+    def _name_bodies(self, feature, kind):
+        names = []
+        for i in range(feature.bodies.count):
+            body = feature.bodies.item(i)
+            name = self._next_name(kind)
+            body.name = name
+            self.created_names.append(name)
+            names.append(name)
+        return names
+
+    def _profile_touches_line(self, profile, line) -> bool:
+        """True when ``line`` is a boundary curve of ``profile`` (i.e. the
+        revolve axis splits the profile into pieces)."""
+        for li in range(profile.profileLoops.count):
+            loop = profile.profileLoops.item(li)
+            for ci in range(loop.profileCurves.count):
+                if loop.profileCurves.item(ci).sketchEntity == line:
+                    return True
+        return False
+
+    def _profiles_avoiding_axis(self, profiles, axis_line):
+        """Drop duplicate pieces of shapes split by the revolve axis.
+
+        When the axis line crosses a profile, Fusion reports one profile per
+        piece; revolving any one piece reproduces the full solid, so only the
+        first axis-split piece is kept (the rest would overlap it).  Profiles
+        that do not touch the axis are kept unchanged.
+        """
+        kept = []
+        for profile in profiles:
+            if self._profile_touches_line(profile, axis_line):
+                if any(self._profile_touches_line(p, axis_line) for p in kept):
+                    continue
+            kept.append(profile)
+        return kept
 
     def _eval_minkowski(self, node):
         children = node["children"]
@@ -1087,8 +1399,14 @@ class _FusionExecutor:
             return self._eval_linear_extrude(node)
         if kind == "rotate_extrude":
             return self._eval_rotate_extrude(node)
-        if kind in _SOFT_UNSUPPORTED_2D:
-            return self._eval_2d_primitive(node)
+        if kind in _2D_PRIMITIVE_KINDS:
+            # Unreachable after validation: 2D primitives are only valid under
+            # linear_extrude / rotate_extrude, which draw them into a sketch
+            # directly and never route through the generic dispatch.
+            raise UnsupportedSCADNodeError(
+                kind,
+                "2D primitive requires linear_extrude or rotate_extrude "
+                "parent.")
         if kind == "minkowski":
             return self._eval_minkowski(node)
         # Validation should already have rejected everything else.
@@ -1223,17 +1541,36 @@ def _is_loftable(verts) -> bool:
 
 # --- two-phase validation ----------------------------------------------------
 
-def _validate_tree(nodes) -> None:
+def _validate_tree(nodes, allow_2d: bool = False) -> None:
     """Phase 1: recursive validation of the ENTIRE tree.  Pure -- never touches
     adsk or root.  Unsupported kinds raise here, before any Fusion API call,
-    which is what makes the negative-path tests runnable headless."""
+    which is what makes the negative-path tests runnable headless.
+
+    ``allow_2d`` tracks whether a 2D primitive (polygon/circle/square) may
+    appear at the current depth: True only inside ``linear_extrude`` /
+    ``rotate_extrude`` sub-trees.  Transforms and passthrough wrappers
+    (color/render/group) keep the flag -- a 2D profile may be transformed
+    before it is extruded (e.g. BOSL2's ``mask2d_*`` chains).  Any 2D
+    primitive anywhere else is a structural error.
+    """
     for node in nodes:
         kind = node.get("kind")
         if kind in _HARD_UNSUPPORTED:
             _raise_hard_unsupported(kind)
         if kind not in _SUPPORTED_KINDS:
             raise UnsupportedSCADNodeError(kind)
-        _validate_tree(node.get("children", []))
+        children = node.get("children", [])
+        if kind in _EXTRUSION_KINDS:
+            _validate_tree(children, allow_2d=True)
+        elif kind in _TRANSFORM_KINDS or kind in _PASSTHROUGH_KINDS:
+            _validate_tree(children, allow_2d=allow_2d)
+        else:
+            if kind in _2D_PRIMITIVE_KINDS and not allow_2d:
+                raise UnsupportedSCADNodeError(
+                    kind,
+                    "2D primitive requires linear_extrude or rotate_extrude "
+                    "parent.")
+            _validate_tree(children, allow_2d=False)
 
 
 def _raise_hard_unsupported(kind: str) -> None:
