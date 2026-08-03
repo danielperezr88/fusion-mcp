@@ -916,12 +916,7 @@ class _FusionExecutor:
             self._free_move(bodies, matrix)
 
         elif kind == "rotate":
-            angle = _transform_vector(node["params"], default=[0.0, 0.0, 0.0])
-            if isinstance(angle, (int, float)):
-                angles = [0.0, 0.0, float(angle)]
-            else:
-                angles = [float(v) for v in _as3(angle)]
-            matrix = self._rotation_matrix(angles)
+            matrix = self._rotation_matrix(self._rotate_angles(node["params"]))
             if not _matrix_near_identity(_matrix_from_adsk(matrix), tol=1e-9):
                 self._free_move(bodies, matrix)
 
@@ -948,6 +943,21 @@ class _FusionExecutor:
             self._apply_multmatrix(bodies, matrix)
 
         return child_names
+
+    def _rotate_angles(self, params):
+        """Normalize rotate params to a ``[rx, ry, rz]`` degrees vector.
+
+        OpenSCAD semantics: a scalar angle rotates about Z; a 1-vector is
+        treated the same way; a 3-vector is ``[rx, ry, rz]``.  Numeric shape
+        was already enforced by ``_validate_rotate`` before execution.
+        """
+        angle = _transform_vector(params, default=[0.0, 0.0, 0.0])
+        if isinstance(angle, (int, float)):
+            return [0.0, 0.0, float(angle)]
+        vec = [float(v) for v in angle]
+        if len(vec) == 1:
+            return [0.0, 0.0, vec[0]]
+        return (vec + [0.0, 0.0, 0.0])[:3]
 
     def _rotation_matrix(self, angles):
         adsk = self.adsk
@@ -1451,7 +1461,9 @@ def _as3(value):
 
 def _transform_vector(params, default):
     """Transforms carry ``args: {"0": vec}`` (evaluator) or ``"0": vec``
-    (.csg walker)."""
+    (.csg walker).  Older OpenSCAD .csg files emit named arguments instead:
+    ``translate(v=...)``, ``scale(v=...)``, ``mirror(v=...)``, ``rotate(a=...)``
+    -- those named keys are accepted too."""
     args = params.get("args")
     if isinstance(args, dict):
         if "0" in args:
@@ -1460,6 +1472,10 @@ def _transform_vector(params, default):
             return args[0]
     if "0" in params:
         return params["0"]
+    if "v" in params:
+        return params["v"]
+    if "a" in params:
+        return params["a"]
     return list(default)
 
 
@@ -1472,6 +1488,8 @@ def _transform_matrix(params):
             return args[0]
     if "0" in params:
         return params["0"]
+    if "m" in params:  # .csg named-argument shape: multmatrix(m = [...])
+        return params["m"]
     return None
 
 
@@ -1541,6 +1559,51 @@ def _is_loftable(verts) -> bool:
 
 # --- two-phase validation ----------------------------------------------------
 
+def _rotate_angle_value(params):
+    """Raw rotate angle value from params (scalar or vector), or None when the
+    angle argument is absent.  Handles evaluator (``args`` int/str keys) and
+    .csg (``"0"`` / named ``a``) shapes."""
+    args = params.get("args")
+    if isinstance(args, dict):
+        if "0" in args:
+            return args["0"]
+        if 0 in args:
+            return args[0]
+    if "0" in params:
+        return params["0"]
+    return params.get("a")
+
+
+def _validate_rotate(node) -> None:
+    """Validate a rotate node's angle shape before execution.
+
+    OpenSCAD accepts a scalar (rotate about Z) or a 3-vector ``[rx, ry, rz]``.
+    Anything else -- non-numeric values, wrong-length vectors -- raises a clear
+    error instead of crashing later with a bare ``ValueError``.
+    """
+    angle = _rotate_angle_value(node.get("params", {}))
+    if angle is None:
+        return  # rotate() with no angle -> identity [0,0,0]
+    if isinstance(angle, (int, float)):
+        return
+    if isinstance(angle, (list, tuple)):
+        if len(angle) not in (1, 3):
+            raise UnsupportedSCADNodeError(
+                "rotate",
+                f"rotate angle vector must have 1 or 3 components, "
+                f"got {len(angle)}: {angle!r}")
+        for value in angle:
+            if not isinstance(value, (int, float)):
+                raise UnsupportedSCADNodeError(
+                    "rotate",
+                    f"rotate angle values must be numbers, got {angle!r}")
+        return
+    raise UnsupportedSCADNodeError(
+        "rotate",
+        f"rotate angle must be a number or a 3-vector, got "
+        f"{type(angle).__name__}: {angle!r}")
+
+
 def _validate_tree(nodes, allow_2d: bool = False) -> None:
     """Phase 1: recursive validation of the ENTIRE tree.  Pure -- never touches
     adsk or root.  Unsupported kinds raise here, before any Fusion API call,
@@ -1559,6 +1622,8 @@ def _validate_tree(nodes, allow_2d: bool = False) -> None:
             _raise_hard_unsupported(kind)
         if kind not in _SUPPORTED_KINDS:
             raise UnsupportedSCADNodeError(kind)
+        if kind == "rotate":
+            _validate_rotate(node)
         children = node.get("children", [])
         if kind in _EXTRUSION_KINDS:
             _validate_tree(children, allow_2d=True)
