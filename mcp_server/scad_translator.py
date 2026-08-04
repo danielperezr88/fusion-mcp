@@ -911,9 +911,12 @@ class _FusionExecutor:
         if kind == "translate":
             vec = _transform_vector(node["params"], default=[0.0, 0.0, 0.0])
             tx, ty, tz = [float(v) * self.scale for v in _as3(vec)]
-            matrix = self.adsk.core.Matrix3D.create()
-            matrix.translation = self.adsk.core.Vector3D.create(tx, ty, tz)
-            self._free_move(bodies, matrix)
+            # Fusion rejects defineAsFreeMove with an identity Matrix3D
+            # ("3 : invalid transform"), so sub-tolerance moves are no-ops.
+            if any(abs(t) > 1e-9 for t in (tx, ty, tz)):
+                matrix = self.adsk.core.Matrix3D.create()
+                matrix.translation = self.adsk.core.Vector3D.create(tx, ty, tz)
+                self._free_move(bodies, matrix)
 
         elif kind == "rotate":
             matrix = self._rotation_matrix(self._rotate_angles(node["params"]))
@@ -922,7 +925,9 @@ class _FusionExecutor:
 
         elif kind == "scale":
             vec = _transform_vector(node["params"], default=[1.0, 1.0, 1.0])
-            self._scale_bodies(bodies, [float(v) for v in _as3(vec)])
+            factors = [float(v) for v in _as3(vec)]
+            if any(abs(f - 1.0) > 1e-9 for f in factors):
+                self._scale_bodies(bodies, factors)
 
         elif kind == "mirror":
             vec = _transform_vector(node["params"], default=[1.0, 0.0, 0.0])
@@ -932,7 +937,8 @@ class _FusionExecutor:
             target = _transform_vector(node["params"], default=[0.0, 0.0, 0.0])
             for name in child_names:
                 factors = self._resize_factors(self._body_by_name(name), target)
-                if factors is not None:
+                if factors is not None and any(
+                        abs(f - 1.0) > 1e-9 for f in factors):
                     self._scale_bodies(self._bodies_collection([name]), factors)
 
         elif kind == "multmatrix":
