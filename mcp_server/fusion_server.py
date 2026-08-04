@@ -51,6 +51,36 @@ def _load_scad_translator():
         "repository importable so create_from_scad can resolve SCAD code.")
 
 
+def _load_mesh_analysis():
+    """Import mcp_server.mesh_analysis from the repo, wherever it lives.
+
+    Same fallback-by-file-location strategy as _load_scad_translator: works
+    both when the repo root is on sys.path and when fusion_server.py is
+    launched directly by an MCP client.
+    """
+    try:
+        from mcp_server import mesh_analysis
+        return mesh_analysis
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(here, "mesh_analysis.py"),
+        os.path.join(here, os.pardir, "mcp_server", "mesh_analysis.py"),
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "fusionmcp_mesh_analysis", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError(
+        "mcp_server/mesh_analysis.py could not be found. Keep the fusion-mcp "
+        "repository importable so analyze_mesh can run mesh analysis.")
+
+
 def _get_bosl2_path():
     """Resolve the bundled BOSL2 path, or None when the bundle is unavailable."""
     try:
@@ -1226,6 +1256,64 @@ def import_mesh_data(coordinates: list, triangle_indices: list, normals: list = 
     """
     return _call("import_mesh_data", {"coordinates": coordinates, "triangle_indices": triangle_indices,
                                        "normals": normals, "normal_indices": normal_indices, "name": name})
+
+
+def _cm_to_unit_factor(units: str) -> float:
+    """Multiplier converting cm-based measurements to the requested units."""
+    u = str(units or "cm").strip().lower()
+    if u == "cm":
+        return 1.0
+    if u == "mm":
+        return 10.0
+    if u == "in":
+        return 1.0 / 2.54
+    raise ValueError(f"Unsupported units '{units}'. Use 'mm', 'cm', or 'in'.")
+
+
+@mcp.tool()
+def analyze_mesh(mesh: str = "0", units: str = "cm") -> str:
+    """
+    Analyze a mesh body and report measured facts + a recommended strategy.
+
+    Fetches the mesh triangle data (nodes/indices/normals) from Fusion, then
+    runs pure-Python analysis: watertightness, manifoldness, vertex/triangle
+    counts, enclosed volume (divergence theorem), bounding box, mirror
+    symmetry, primitive hints (plane regions / box / cylinder), and a
+    recommended reconstruction strategy (prismatic | revolved |
+    csg_decompose | organic).
+
+    Stage 2 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:  Body name or index of a mesh body.
+        units: Units for the report: mm, cm, or in (default cm).
+    """
+    try:
+        factor = _cm_to_unit_factor(units)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    raw = _call("extract_mesh_data", {"mesh": mesh})
+    if raw.startswith("Error: "):
+        return json.dumps({"error": raw[len("Error: "):]}, indent=2)
+    if raw.startswith(("Cannot reach", "Unexpected error")):
+        return raw
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if "error" in data:
+        return json.dumps({"error": data["error"]}, indent=2)
+    try:
+        mesh_analysis = _load_mesh_analysis()
+        report = mesh_analysis.analyze_mesh_data(
+            data.get("nodes", []), data.get("indices", []),
+            data.get("normals", []))
+        report = mesh_analysis.scale_report(report, factor)
+    except Exception as e:
+        return json.dumps({"error": f"analysis failed: {e}"}, indent=2)
+    report["mesh"] = data.get("mesh", mesh)
+    report["units"] = units
+    return json.dumps(report, indent=2)
 
 
 @mcp.tool()

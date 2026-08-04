@@ -2267,6 +2267,32 @@ def _import_mesh_data(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _extract_mesh_data(root, p: dict) -> dict:
+    try:
+        ref = p.get("mesh", "0")
+        body = _find_mesh_body(root, ref)
+        mesh = body.displayMesh
+        nodes = []
+        for pt in mesh.nodeCoordinates:
+            nodes.extend([round(pt.x, 6), round(pt.y, 6), round(pt.z, 6)])
+        indices = [int(i) for i in mesh.nodeIndices]
+        normals = []
+        for vec in mesh.normalVectors:
+            normals.extend([round(vec.x, 6), round(vec.y, 6), round(vec.z, 6)])
+        return {
+            "mesh": body.name,
+            "vertex_count": int(mesh.nodeCount),
+            "triangle_count": int(mesh.triangleCount),
+            "nodes": nodes,
+            "indices": indices,
+            "normals": normals,
+        }
+    except Exception as e:
+        if "not found" in str(e):
+            return {"error": f"Mesh body '{ref}' not found."}
+        return {"error": str(e)}
+
+
 # ---- Export & Capture ----
 
 def _export_stl(p):
@@ -2449,6 +2475,7 @@ def _process_command(data: dict) -> dict:
             "run_scad":                   lambda: _run_scad(root, p),
             "update_scad_body":           lambda: _update_scad_body(root, p),
             "import_mesh_data":           lambda: _import_mesh_data(root, p),
+            "extract_mesh_data":          lambda: _extract_mesh_data(root, p),
             "create_from_scad":           lambda: _create_from_scad(root, p),
         }
 
