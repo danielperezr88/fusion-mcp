@@ -2724,6 +2724,55 @@ def _capture_mesh_views(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _capture_body_views(root, p: dict) -> dict:
+    """Capture viewport screenshots of a BRep body (body-targeted variant of
+    _capture_mesh_views) for vision QA review.
+
+    Identical shape to _capture_mesh_views: view names are validated FIRST
+    (before any viewport churn) with the same exact error string, the body is
+    resolved via _require_body (BRep), and the same viewport orientation /
+    capture loop runs (sharing _VIEW_ORIENTATIONS and the
+    saveAsImageFile -> read-bytes -> base64 mechanism of _capture_screenshot).
+    The isometric orientation is restored after the loop.  Returns
+    {"body": <resolved body name>, "views": [{"view", "image_base64"}, ...]}.
+    """
+    try:
+        view_names = p.get("views", ["isometric", "front", "top", "right"])
+        if isinstance(view_names, str):
+            view_names = [view_names]
+        for v in view_names:
+            if v not in _VIEW_ORIENTATIONS:
+                return {"error": f"Unknown view '{v}'. Use isometric, front, top, right"}
+        ref = p.get("body", "0")
+        body = _require_body(root, ref)
+        width = int(p.get("width", 1280))
+        height = int(p.get("height", 720))
+        viewport = app.activeViewport
+        captured = []
+        for v in view_names:
+            camera = viewport.camera
+            camera.viewOrientation = _VIEW_ORIENTATIONS[v]
+            camera.isFitView = True
+            viewport.camera = camera
+            path = os.path.join(tempfile.gettempdir(), f"fusion_body_view_{v}.png")
+            viewport.saveAsImageFile(path, width, height)
+            with open(path, "rb") as f:
+                png_bytes = f.read()
+            captured.append({
+                "view": v,
+                "image_base64": base64.b64encode(png_bytes).decode("ascii"),
+            })
+        camera = viewport.camera
+        camera.viewOrientation = _VIEW_ORIENTATIONS["isometric"]
+        camera.isFitView = True
+        viewport.camera = camera
+        return {"body": body.name, "views": captured}
+    except Exception as e:
+        if "not found" in str(e):
+            return {"error": f"Body '{ref}' not found."}
+        return {"error": str(e)}
+
+
 # ---- History ----
 
 def _undo(p):
@@ -2851,6 +2900,7 @@ def _process_command(data: dict) -> dict:
             "export_f3d":                 lambda: _export_f3d(p),
             "capture_screenshot":         lambda: _capture_screenshot(p),
             "capture_mesh_views":         lambda: _capture_mesh_views(root, p),
+            "capture_body_views":         lambda: _capture_body_views(root, p),
             "undo":                       lambda: _undo(p),
             "redo":                       lambda: _redo(p),
             "save":                       lambda: _save_design(p),

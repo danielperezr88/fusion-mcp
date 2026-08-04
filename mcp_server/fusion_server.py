@@ -1781,6 +1781,99 @@ def annotate_mesh_parameters(mesh: str = "0",
 
 
 @mcp.tool()
+def review_reconstruction(mesh: str = "0", body: str = "0",
+                          views: list = ["isometric", "front", "top"]) -> list:
+    """
+    Capture side-by-side mesh vs reconstructed BRep views for vision QA review.
+
+    Captures viewport screenshots of the ORIGINAL mesh and the RECONSTRUCTED
+    BRep body for each requested view (isometric / front / top / right) and
+    pairs them per view. Returns a text envelope with the per-view base64
+    image pairs, a local compare_mesh_to_brep geometry summary, and the
+    workflow pointer -- followed by the decoded PNG image blocks interleaved
+    per view (mesh image, then brep image).
+
+    The comparison happens on the MODEL side, not here: the model inspects
+    each mesh/brep pair + geometry summary, decides whether features are
+    missing, and either calls `reconstruct_mesh` again with feedback or
+    accepts with `select_parameter_schema`.
+
+    Stage 9 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:  Body name or index of the ORIGINAL mesh body.
+        body:  Body name or index of the RECONSTRUCTED BRep body.
+        views: View names to capture, e.g. ['isometric', 'front', 'top'].
+               Valid names: isometric, front, top, right.
+    """
+    # INLINE requests.post for BOTH captures (NOT _call): _call json.dumps the
+    # response into a text string, which would bury the base64 PNG payloads so
+    # MCP clients could not display them. Mirror annotate_mesh_parameters.
+    try:
+        r = requests.post(f"{FUSION_URL}/command",
+                          json={"command": "capture_mesh_views",
+                                "params": {"mesh": mesh, "views": views}},
+                          timeout=60)
+        mesh_cap = r.json()
+    except requests.exceptions.ConnectionError:
+        return "Cannot reach Fusion 360. Make sure Fusion is open and the FusionMCP add-in is running."
+    except Exception as e:
+        return f"Unexpected error: {e}"
+    if "error" in mesh_cap:
+        return json.dumps({"error": mesh_cap["error"]}, indent=2)
+    try:
+        r = requests.post(f"{FUSION_URL}/command",
+                          json={"command": "capture_body_views",
+                                "params": {"body": body, "views": views}},
+                          timeout=60)
+        brep_cap = r.json()
+    except requests.exceptions.ConnectionError:
+        return "Cannot reach Fusion 360. Make sure Fusion is open and the FusionMCP add-in is running."
+    except Exception as e:
+        return f"Unexpected error: {e}"
+    if "error" in brep_cap:
+        return json.dumps({"error": brep_cap["error"]}, indent=2)
+    # Geometry summary from the LOCAL compare_mesh_to_brep (plain call, same
+    # module). On error the images remain the primary payload -- "geometry"
+    # carries {"error": ...} instead of failing the whole tool.
+    try:
+        geometry = json.loads(compare_mesh_to_brep(mesh=mesh, body=body))
+    except Exception as e:
+        geometry = {"error": f"geometry comparison failed: {e}"}
+    mesh_views = {v.get("view"): v.get("image_base64", "")
+                  for v in mesh_cap.get("views", [])}
+    brep_views = {v.get("view"): v.get("image_base64", "")
+                  for v in brep_cap.get("views", [])}
+    pairs = []
+    for v in views:
+        pairs.append({
+            "view": v,
+            "mesh_image_base64": mesh_views.get(v, ""),
+            "brep_image_base64": brep_views.get(v, ""),
+        })
+    envelope = {
+        "pairs": pairs,
+        "geometry": geometry,
+        "workflow": {
+            "stage": "review",
+            "next": ("MODEL ACTION: compare each pair; if features are missing "
+                     "call reconstruct_mesh again with feedback or accept with "
+                     "select_parameter_schema"),
+        },
+    }
+    text_envelope = json.dumps(envelope, indent=2)
+    out = [text_envelope]
+    for v in views:
+        for cap in (mesh_cap, brep_cap):
+            for vv in cap.get("views", []):
+                if vv.get("view") == v and vv.get("image_base64"):
+                    out.append(
+                        Image(data=base64.b64decode(vv["image_base64"]),
+                              format="png"))
+    return out
+
+
+@mcp.tool()
 def create_from_scad(code: str, units: str = "mm", fallback_to_mesh: bool = True) -> str:
     """
     Translate OpenSCAD/BOSL2 code into native parametric Fusion features.
