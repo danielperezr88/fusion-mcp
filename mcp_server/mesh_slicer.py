@@ -50,7 +50,7 @@ from __future__ import annotations
 import copy
 import math
 from collections import defaultdict
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 Float3 = Tuple[float, float, float]
 
@@ -399,7 +399,7 @@ def _containment_depths(loops: Sequence[Sequence[Sequence[float]]]) -> List[int]
 # --------------------------------------------------------------------------
 
 def slice_mesh_at(nodes: Sequence, indices: Sequence,
-                  height_or_plane) -> Dict:
+                  height_or_plane: Union[float, Dict]) -> Dict:
     """Slice a triangle mesh with an axis-aligned plane.
 
     Returns {"loops": [{"pts": [[x, y], ...], "is_hole": bool}, ...],

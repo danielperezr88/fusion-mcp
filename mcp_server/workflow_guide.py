@@ -17,6 +17,7 @@ testable without a running Fusion bridge.
 """
 
 import json
+from typing import Dict, Optional
 
 # Ordered pipeline steps.  `tool` matches the actual server tool name
 # (import_mesh_file / import_mesh_data for the import step), so get_step()
@@ -145,7 +146,7 @@ GUIDE = [
 GUIDE_JSON = json.dumps(GUIDE, indent=2)
 
 
-def get_step(name):
+def get_step(name: str) -> Optional[Dict]:
     """Return a single workflow step dict, or None when the name is unknown.
 
     Lookup is by tool name (or the short step name, e.g. "reconstruct" for
