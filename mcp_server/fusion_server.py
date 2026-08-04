@@ -1472,6 +1472,93 @@ def select_parameter_schema(object_class: str = "generic",
 
 
 @mcp.tool()
+def annotate_mesh_parameters(mesh: str = "0",
+                             views: list = ["isometric", "front", "top", "right"],
+                             units: str = "cm") -> list:
+    """
+    Capture 4 viewport screenshots of a mesh + measured facts for vision
+    classification (stage 5 of the mesh-to-parametric workflow).
+
+    Fetches the mesh triangle data from Fusion and runs the pure-Python
+    analysis (watertightness, volume, bounding box, symmetry, primitive
+    hints, recommended strategy) as `measured_facts`, then orients the
+    viewport to each requested view (isometric / front / top / right),
+    fits the view, and captures a PNG.  Returns a text envelope with the
+    mesh name, the 4 base64 views, the measured facts, and the workflow
+    pointer -- followed by the 4 decoded PNG image blocks for the model.
+
+    Classification happens on the MODEL side, not here: the model inspects
+    the returned views + measured_facts, picks an object class, and calls
+    `select_parameter_schema` with that class and the facts. This tool never
+    invokes the matcher.
+
+    Stage 5 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:  Body name or index of a mesh body.
+        views: View names to capture, e.g. ['isometric', 'front', 'top',
+               'right']. Valid names: isometric, front, top, right.
+        units: Units for the measured facts: mm, cm, or in (default cm).
+    """
+    try:
+        factor = _cm_to_unit_factor(units)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    raw = _call("extract_mesh_data", {"mesh": mesh})
+    if raw.startswith("Error: "):
+        return json.dumps({"error": raw[len("Error: "):]}, indent=2)
+    if raw.startswith(("Cannot reach", "Unexpected error")):
+        return raw
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if "error" in data:
+        return json.dumps({"error": data["error"]}, indent=2)
+    try:
+        mesh_analysis = _load_mesh_analysis()
+        report = mesh_analysis.analyze_mesh_data(
+            data.get("nodes", []), data.get("indices", []),
+            data.get("normals", []))
+        report = mesh_analysis.scale_report(report, factor)
+    except Exception as e:
+        return json.dumps({"error": f"analysis failed: {e}"}, indent=2)
+    # INLINE requests.post (NOT _call): _call json.dumps the response into a
+    # text string, which would bury the base64 PNG payloads so MCP clients
+    # could not display them. Mirror capture_screenshot's pattern exactly.
+    try:
+        r = requests.post(f"{FUSION_URL}/command",
+                          json={"command": "capture_mesh_views",
+                                "params": {"mesh": mesh, "views": views}},
+                          timeout=60)
+        cap = r.json()
+    except requests.exceptions.ConnectionError:
+        return "Cannot reach Fusion 360. Make sure Fusion is open and the FusionMCP add-in is running."
+    except Exception as e:
+        return f"Unexpected error: {e}"
+    if "error" in cap:
+        return json.dumps({"error": cap["error"]}, indent=2)
+    envelope = {
+        "mesh": data.get("mesh", mesh),
+        "views": cap.get("views", []),
+        "measured_facts": report,
+        "workflow": {
+            "stage": "annotate",
+            "next": ("MODEL ACTION: classify the object from the views, then "
+                     "call select_parameter_schema with object_class and "
+                     "measured_facts"),
+        },
+    }
+    text_envelope = json.dumps(envelope, indent=2)
+    out = [text_envelope]
+    for v in cap.get("views", []):
+        b64 = v.get("image_base64", "")
+        if b64:
+            out.append(Image(data=base64.b64decode(b64), format="png"))
+    return out
+
+
+@mcp.tool()
 def create_from_scad(code: str, units: str = "mm", fallback_to_mesh: bool = True) -> str:
     """
     Translate OpenSCAD/BOSL2 code into native parametric Fusion features.

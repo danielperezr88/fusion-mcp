@@ -2338,6 +2338,61 @@ def _capture_screenshot(p):
     }
 
 
+_VIEW_ORIENTATIONS = {
+    "isometric": adsk.core.ViewOrientations.IsoTopRightViewOrientation,
+    "front": adsk.core.ViewOrientations.FrontViewOrientation,
+    "top": adsk.core.ViewOrientations.TopViewOrientation,
+    "right": adsk.core.ViewOrientations.RightViewOrientation,
+}
+
+def _capture_mesh_views(root, p: dict) -> dict:
+    """Capture 4 viewport screenshots of a mesh for vision-guided annotation.
+
+    For each view name (isometric / front / top / right) the viewport camera
+    is re-oriented and fit to the model, then saved as a PNG via the same
+    saveAsImageFile -> read-bytes -> base64 mechanism as _capture_screenshot.
+    The isometric orientation is restored after the loop.  View names are
+    validated FIRST (before any viewport churn); the mesh is resolved via
+    _find_mesh_body so a missing mesh errors before any capture.  Returns
+    {"mesh": <resolved mesh name>, "views": [{"view", "image_base64"}, ...]}.
+    """
+    try:
+        view_names = p.get("views", ["isometric", "front", "top", "right"])
+        if isinstance(view_names, str):
+            view_names = [view_names]
+        for v in view_names:
+            if v not in _VIEW_ORIENTATIONS:
+                return {"error": f"Unknown view '{v}'. Use isometric, front, top, right"}
+        ref = p.get("mesh", "0")
+        body = _find_mesh_body(root, ref)
+        width = int(p.get("width", 1280))
+        height = int(p.get("height", 720))
+        viewport = app.activeViewport
+        captured = []
+        for v in view_names:
+            camera = viewport.camera
+            camera.viewOrientation = _VIEW_ORIENTATIONS[v]
+            camera.isFitView = True
+            viewport.camera = camera
+            path = os.path.join(tempfile.gettempdir(), f"fusion_view_{v}.png")
+            viewport.saveAsImageFile(path, width, height)
+            with open(path, "rb") as f:
+                png_bytes = f.read()
+            captured.append({
+                "view": v,
+                "image_base64": base64.b64encode(png_bytes).decode("ascii"),
+            })
+        camera = viewport.camera
+        camera.viewOrientation = _VIEW_ORIENTATIONS["isometric"]
+        camera.isFitView = True
+        viewport.camera = camera
+        return {"mesh": body.name, "views": captured}
+    except Exception as e:
+        if "not found" in str(e):
+            return {"error": f"Mesh body '{ref}' not found."}
+        return {"error": str(e)}
+
+
 # ---- History ----
 
 def _undo(p):
@@ -2464,6 +2519,7 @@ def _process_command(data: dict) -> dict:
             "export_3mf":                 lambda: _export_3mf(p),
             "export_f3d":                 lambda: _export_f3d(p),
             "capture_screenshot":         lambda: _capture_screenshot(p),
+            "capture_mesh_views":         lambda: _capture_mesh_views(root, p),
             "undo":                       lambda: _undo(p),
             "redo":                       lambda: _redo(p),
             "save":                       lambda: _save_design(p),
