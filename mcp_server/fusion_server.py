@@ -111,6 +111,37 @@ def _load_mesh_slicer():
         "repository importable so slice_mesh can run plane intersection.")
 
 
+def _load_parameter_schemas():
+    """Import mcp_server.parameter_schemas from the repo, wherever it lives.
+
+    Same fallback-by-file-location strategy as _load_mesh_analysis: works
+    both when the repo root is on sys.path and when fusion_server.py is
+    launched directly by an MCP client.
+    """
+    try:
+        from mcp_server import parameter_schemas
+        return parameter_schemas
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(here, "parameter_schemas.py"),
+        os.path.join(here, os.pardir, "mcp_server", "parameter_schemas.py"),
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "fusionmcp_parameter_schemas", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError(
+        "mcp_server/parameter_schemas.py could not be found. Keep the "
+        "fusion-mcp repository importable so select_parameter_schema can "
+        "resolve class schemas.")
+
+
 def _get_bosl2_path():
     """Resolve the bundled BOSL2 path, or None when the bundle is unavailable."""
     try:
@@ -1397,6 +1428,46 @@ def slice_mesh(mesh: str = "0", axis: str = "Z", height_cm: float = 0.0,
         return json.dumps({"error": f"slice failed: {e}"}, indent=2)
     result["mesh"] = data.get("mesh", mesh)
     result["units"] = units
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def select_parameter_schema(object_class: str = "generic",
+                            measured_facts: dict = {},
+                            units: str = "cm") -> str:
+    """
+    Select a parameter schema for an object class and bind measured facts.
+
+    Pure-data tool: no Fusion round-trip. Resolves the class schema from the
+    local parameter library (falling back to 'generic' with a 'note' for
+    unknown classes), binds each role from the measured facts (bbox dims ->
+    width/depth/height, slice loop diameter -> diameter, fit params ->
+    radius/thickness), and returns stable named parameters with confidence
+    scores. Vision-sourced roles are returned as placeholders (value None,
+    confidence 0.3) for the model to fill in later.
+
+    Stage 4 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        object_class:   Object class name, e.g. 'bolt', 'gear', 'generic'.
+        measured_facts: Measured facts dict, e.g.
+                        {"bbox_cm": [4, 4, 3], "slice_diameter_cm": 4.0,
+                         "fit_radius_cm": 0.5}. 'bbox_cm' may be dims
+                        [w, d, h] or [[min], [max]]; the analyze_mesh report
+                        key 'bounding_box_cm' is accepted too.
+        units:          Units for the returned values: mm, cm, or in
+                        (default cm).
+    """
+    try:
+        _cm_to_unit_factor(units)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    try:
+        parameter_schemas = _load_parameter_schemas()
+        result = parameter_schemas.select_schema(
+            object_class, measured_facts, units=units)
+    except Exception as e:
+        return json.dumps({"error": f"schema selection failed: {e}"}, indent=2)
     return json.dumps(result, indent=2)
 
 

@@ -1,0 +1,242 @@
+[
+  {
+    "class": "generic",
+    "description": "Fallback class for unclassified objects; the matcher returns it for any unknown class so the parameterization pipeline always gets a useful result.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "width", "name": "width", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "depth", "name": "depth", "kind": "length", "source": "bbox", "axis": 1},
+      {"role": "height", "name": "height", "kind": "length", "source": "bbox", "axis": 2}
+    ]
+  },
+  {
+    "class": "knob",
+    "description": "Hand-operated rotary knob, usually revolved with a knurled or smooth grip and a center mounting hole.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "diameter", "name": "knob_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "height", "name": "knob_height", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "hole_diameter", "name": "knob_hole_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "knurl_count", "name": "knob_knurl_count", "kind": "count", "source": "vision"}
+    ]
+  },
+  {
+    "class": "bracket",
+    "description": "Supporting or mounting bracket, typically an extruded plate with mounting holes.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "length", "name": "bracket_length", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "width", "name": "bracket_width", "kind": "length", "source": "bbox", "axis": 1},
+      {"role": "height", "name": "bracket_height", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "thickness", "name": "bracket_thickness", "kind": "thickness", "source": "vision"},
+      {"role": "hole_diameter", "name": "bracket_hole_diameter", "kind": "diameter", "source": "vision"}
+    ]
+  },
+  {
+    "class": "housing",
+    "description": "Enclosure or casing with hollow interior and mounting provisions.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "length", "name": "housing_length", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "width", "name": "housing_width", "kind": "length", "source": "bbox", "axis": 1},
+      {"role": "height", "name": "housing_height", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "wall_thickness", "name": "housing_wall_thickness", "kind": "thickness", "source": "vision"},
+      {"role": "hole_diameter", "name": "housing_hole_diameter", "kind": "diameter", "source": "vision"}
+    ]
+  },
+  {
+    "class": "flange",
+    "description": "Disc-shaped connecting plate, revolved with a central bore and bolt holes on a circle.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "outer_diameter", "name": "flange_outer_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "inner_diameter", "name": "flange_inner_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "thickness", "name": "flange_thickness", "kind": "thickness", "source": "bbox", "axis": 2},
+      {"role": "hole_diameter", "name": "flange_hole_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "hole_count", "name": "flange_hole_count", "kind": "count", "source": "vision"},
+      {"role": "fillet_radius", "name": "flange_fillet_radius", "kind": "radius", "source": "fit"}
+    ]
+  },
+  {
+    "class": "pulley",
+    "description": "Grooved wheel for a belt or cable, revolved with a center bore.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "outer_diameter", "name": "pulley_outer_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "groove_diameter", "name": "pulley_groove_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "width", "name": "pulley_width", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "bore_diameter", "name": "pulley_bore_diameter", "kind": "diameter", "source": "vision"}
+    ]
+  },
+  {
+    "class": "gear",
+    "description": "Toothed wheel that transmits torque, revolved with teeth on the rim.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "outer_diameter", "name": "gear_outer_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "bore_diameter", "name": "gear_bore_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "width", "name": "gear_width", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "tooth_count", "name": "gear_tooth_count", "kind": "count", "source": "vision"},
+      {"role": "module", "name": "gear_module", "kind": "length", "source": "vision"},
+      {"role": "pressure_angle", "name": "gear_pressure_angle", "kind": "angle", "source": "vision"},
+      {"role": "root_fillet_radius", "name": "gear_root_fillet_radius", "kind": "radius", "source": "fit"}
+    ]
+  },
+  {
+    "class": "bearing_holder",
+    "description": "Housing block that seats a bearing, prismatic with a bore.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "length", "name": "bearing_holder_length", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "width", "name": "bearing_holder_width", "kind": "length", "source": "bbox", "axis": 1},
+      {"role": "height", "name": "bearing_holder_height", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "bore_diameter", "name": "bearing_holder_bore_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "fillet_radius", "name": "bearing_holder_fillet_radius", "kind": "radius", "source": "vision"}
+    ]
+  },
+  {
+    "class": "handle",
+    "description": "Grasping handle, often a bar with mounting ends.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "length", "name": "handle_length", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "diameter", "name": "handle_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "grip_diameter", "name": "handle_grip_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "mount_diameter", "name": "handle_mount_diameter", "kind": "diameter", "source": "vision"}
+    ]
+  },
+  {
+    "class": "latch",
+    "description": "Fastening catch with a hook or tongue, prismatic.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "length", "name": "latch_length", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "width", "name": "latch_width", "kind": "length", "source": "bbox", "axis": 1},
+      {"role": "height", "name": "latch_height", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "thickness", "name": "latch_thickness", "kind": "thickness", "source": "vision"},
+      {"role": "hook_depth", "name": "latch_hook_depth", "kind": "length", "source": "vision"}
+    ]
+  },
+  {
+    "class": "mount",
+    "description": "Flat mounting plate or foot with bolt holes.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "length", "name": "mount_length", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "width", "name": "mount_width", "kind": "length", "source": "bbox", "axis": 1},
+      {"role": "height", "name": "mount_height", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "hole_diameter", "name": "mount_hole_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "hole_count", "name": "mount_hole_count", "kind": "count", "source": "vision"}
+    ]
+  },
+  {
+    "class": "cover",
+    "description": "Lid or face plate enclosing a cavity, prismatic.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "length", "name": "cover_length", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "width", "name": "cover_width", "kind": "length", "source": "bbox", "axis": 1},
+      {"role": "height", "name": "cover_height", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "thickness", "name": "cover_thickness", "kind": "thickness", "source": "vision"},
+      {"role": "rim_thickness", "name": "cover_rim_thickness", "kind": "thickness", "source": "fit"},
+      {"role": "screw_diameter", "name": "cover_screw_diameter", "kind": "diameter", "source": "vision"}
+    ]
+  },
+  {
+    "class": "plate",
+    "description": "Flat rectangular stock, prismatic with optional holes.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "length", "name": "plate_length", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "width", "name": "plate_width", "kind": "length", "source": "bbox", "axis": 1},
+      {"role": "thickness", "name": "plate_thickness", "kind": "thickness", "source": "bbox", "axis": 2},
+      {"role": "hole_diameter", "name": "plate_hole_diameter", "kind": "diameter", "source": "vision"}
+    ]
+  },
+  {
+    "class": "shaft",
+    "description": "Cylindrical rotating axle, revolved, possibly with a keyway.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "diameter", "name": "shaft_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "length", "name": "shaft_length", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "keyway_depth", "name": "shaft_keyway_depth", "kind": "length", "source": "vision"},
+      {"role": "fillet_radius", "name": "shaft_fillet_radius", "kind": "radius", "source": "vision"}
+    ]
+  },
+  {
+    "class": "bushing",
+    "description": "Cylindrical liner that reduces friction between moving parts, revolved.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "outer_diameter", "name": "bushing_outer_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "inner_diameter", "name": "bushing_inner_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "length", "name": "bushing_length", "kind": "length", "source": "bbox", "axis": 2}
+    ]
+  },
+  {
+    "class": "spacer",
+    "description": "Cylindrical distance piece between two parts, revolved.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "outer_diameter", "name": "spacer_outer_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "inner_diameter", "name": "spacer_inner_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "length", "name": "spacer_length", "kind": "length", "source": "bbox", "axis": 2}
+    ]
+  },
+  {
+    "class": "washer",
+    "description": "Thin annular disc under a fastener head, revolved.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "outer_diameter", "name": "washer_outer_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "inner_diameter", "name": "washer_inner_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "thickness", "name": "washer_thickness", "kind": "thickness", "source": "bbox", "axis": 2}
+    ]
+  },
+  {
+    "class": "bolt",
+    "description": "Threaded fastener with a head and shank, revolved.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "head_diameter", "name": "bolt_head_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "head_thickness", "name": "bolt_head_thickness", "kind": "thickness", "source": "bbox", "axis": 2},
+      {"role": "length", "name": "bolt_length", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "thread_diameter", "name": "bolt_thread_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "thread_pitch", "name": "bolt_thread_pitch", "kind": "length", "source": "vision"}
+    ]
+  },
+  {
+    "class": "nut",
+    "description": "Hexagonal fastener with a threaded bore.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "width", "name": "nut_width", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "thickness", "name": "nut_thickness", "kind": "thickness", "source": "bbox", "axis": 2},
+      {"role": "thread_diameter", "name": "nut_thread_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "chamfer_angle", "name": "nut_chamfer_angle", "kind": "angle", "source": "vision"}
+    ]
+  },
+  {
+    "class": "ring",
+    "description": "Annular ring, revolved, e.g. a seal or retaining ring.",
+    "strategy_hint": "revolved",
+    "parameters": [
+      {"role": "outer_diameter", "name": "ring_outer_diameter", "kind": "diameter", "source": "slice"},
+      {"role": "inner_diameter", "name": "ring_inner_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "thickness", "name": "ring_thickness", "kind": "thickness", "source": "bbox", "axis": 2}
+    ]
+  },
+  {
+    "class": "link",
+    "description": "Connecting bar with holes at the ends, prismatic.",
+    "strategy_hint": "prismatic",
+    "parameters": [
+      {"role": "length", "name": "link_length", "kind": "length", "source": "bbox", "axis": 0},
+      {"role": "width", "name": "link_width", "kind": "length", "source": "bbox", "axis": 1},
+      {"role": "height", "name": "link_height", "kind": "length", "source": "bbox", "axis": 2},
+      {"role": "hole_diameter", "name": "link_hole_diameter", "kind": "diameter", "source": "vision"},
+      {"role": "hole_count", "name": "link_hole_count", "kind": "count", "source": "vision"}
+    ]
+  }
+]
