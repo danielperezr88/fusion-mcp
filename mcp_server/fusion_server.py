@@ -172,6 +172,37 @@ def _load_parameter_schemas():
         "resolve class schemas.")
 
 
+def _load_workflow_guide():
+    """Import mcp_server.workflow_guide from the repo, wherever it lives.
+
+    Same fallback-by-file-location strategy as _load_parameter_schemas:
+    works both when the repo root is on sys.path and when fusion_server.py
+    is launched directly by an MCP client.
+    """
+    try:
+        from mcp_server import workflow_guide
+        return workflow_guide
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(here, "workflow_guide.py"),
+        os.path.join(here, os.pardir, "mcp_server", "workflow_guide.py"),
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "fusionmcp_workflow_guide", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError(
+        "mcp_server/workflow_guide.py could not be found. Keep the "
+        "fusion-mcp repository importable so get_workflow_guide can serve "
+        "the workflow guide.")
+
+
 def _get_bosl2_path():
     """Resolve the bundled BOSL2 path, or None when the bundle is unavailable."""
     try:
@@ -1668,7 +1699,7 @@ def select_parameter_schema(object_class: str = "generic",
     scores. Vision-sourced roles are returned as placeholders (value None,
     confidence 0.3) for the model to fill in later.
 
-    Stage 4 of the mesh-to-parametric workflow (see get_workflow_guide).
+    Stage 5 of the mesh-to-parametric workflow (see get_workflow_guide).
 
     Args:
         object_class:   Object class name, e.g. 'bolt', 'gear', 'generic'.
@@ -1699,7 +1730,7 @@ def annotate_mesh_parameters(mesh: str = "0",
                              units: str = "cm") -> list:
     """
     Capture 4 viewport screenshots of a mesh + measured facts for vision
-    classification (stage 5 of the mesh-to-parametric workflow).
+    classification (stage 4 of the mesh-to-parametric workflow).
 
     Fetches the mesh triangle data from Fusion and runs the pure-Python
     analysis (watertightness, volume, bounding box, symmetry, primitive
@@ -1714,7 +1745,7 @@ def annotate_mesh_parameters(mesh: str = "0",
     `select_parameter_schema` with that class and the facts. This tool never
     invokes the matcher.
 
-    Stage 5 of the mesh-to-parametric workflow (see get_workflow_guide).
+    Stage 4 of the mesh-to-parametric workflow (see get_workflow_guide).
 
     Args:
         mesh:  Body name or index of a mesh body.
@@ -1798,7 +1829,7 @@ def review_reconstruction(mesh: str = "0", body: str = "0",
     missing, and either calls `reconstruct_mesh` again with feedback or
     accepts with `select_parameter_schema`.
 
-    Stage 9 of the mesh-to-parametric workflow (see get_workflow_guide).
+    Stage 8 of the mesh-to-parametric workflow (see get_workflow_guide).
 
     Args:
         mesh:  Body name or index of the ORIGINAL mesh body.
@@ -1871,6 +1902,41 @@ def review_reconstruction(mesh: str = "0", body: str = "0",
                         Image(data=base64.b64decode(vv["image_base64"]),
                               format="png"))
     return out
+
+
+@mcp.tool()
+def get_workflow_guide(step: str = "") -> str:
+    """
+    Return the mesh-to-parametric workflow guide (8 ordered steps).
+
+    Pure-data tool: no Fusion round-trip. With no step (default "") the FULL
+    guide is returned as JSON: import -> analyze -> slice -> annotate ->
+    select_parameter_schema -> reconstruct -> compare -> review. Each step
+    carries its tool name, purpose, expected inputs/outputs, the MODEL ACTION
+    the assistant must take (annotate: classify the object; review: compare
+    each pair and accept or re-run), the strategy branch at reconstruct, and
+    fallbacks. Pass a step name (e.g. "reconstruct" or the tool name
+    "reconstruct_mesh") to get that single step.
+
+    Stage 1 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        step: Step name to look up, e.g. "annotate" or "reconstruct_mesh".
+              Empty string (the default) returns the full guide.
+    """
+    step = str(step or "").strip()
+    try:
+        workflow_guide = _load_workflow_guide()
+    except Exception as e:
+        return json.dumps({"error": f"workflow guide load failed: {e}"},
+                          indent=2)
+    if step == "":
+        return workflow_guide.GUIDE_JSON
+    found = workflow_guide.get_step(step)
+    if found is None:
+        return json.dumps({"error": f"Unknown workflow step '{step}'"},
+                          indent=2)
+    return json.dumps(found, indent=2)
 
 
 @mcp.tool()
