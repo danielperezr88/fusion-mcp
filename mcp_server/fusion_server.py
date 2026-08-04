@@ -1621,6 +1621,39 @@ def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
 
 
 @mcp.tool()
+def compare_mesh_to_brep(mesh: str = "0", body: str = "0") -> str:
+    """
+    Compare a mesh body against a BRep body (vision-free fidelity QA).
+
+    Fetches both bodies' enclosed volume (cm^3) and bounding-box spans (cm)
+    from Fusion and reports the volume ratio mesh/BRep, the max per-axis
+    bounding-box span deviation, and a sampled surface deviation: ~200 mesh
+    vertices measured to the nearest point on the BRep surface
+    (mean/max/samples).  The method used for the sampled deviation is
+    reported in the response: "surface_evaluator" when the closest-point API
+    is available on the build, "vertex_fallback" otherwise.
+
+    Stage 7 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh: Body name or index of a mesh body.
+        body: Body name or index of a BRep body.
+    """
+    raw = _call("compare_mesh_brep", {"mesh": mesh, "body": body})
+    if raw.startswith("Error: "):
+        return json.dumps({"error": raw[len("Error: "):]}, indent=2)
+    if raw.startswith(("Cannot reach", "Unexpected error")):
+        return raw
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if "error" in data:
+        return json.dumps({"error": data["error"]}, indent=2)
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
 def select_parameter_schema(object_class: str = "generic",
                             measured_facts: dict = {},
                             units: str = "cm") -> str:

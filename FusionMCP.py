@@ -2378,6 +2378,118 @@ def _mesh_convert(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _compare_mesh_brep(root, p: dict) -> dict:
+    """Compare a mesh body against a BRep body (vision-free fidelity QA).
+
+    Reports both bodies' enclosed volume (cm^3) and bounding-box spans (cm),
+    the mesh/BRep volume ratio, the max per-axis bounding-box span deviation,
+    and a sampled surface deviation: ~200 mesh vertices, each measured to the
+    nearest point on the BRep surface (mean/max/samples).
+
+    Closest-point API: `SurfaceEvaluator.getClosestPointTo` was probed LIVE on
+    this Fusion 2026 build (Metis F6) and is NOT available -- the evaluators
+    only expose getParameterAtPoint / getPointAtParameter / getNormalAtPoint
+    (see the T8 notepad section).  When the API exists the sampled deviation
+    uses it and the response reports "method": "surface_evaluator"; on this
+    build the fallback measures each mesh vertex to its nearest BRep vertex
+    and reports "method": "vertex_fallback".
+    """
+    try:
+        mesh_ref = p.get("mesh", "0")
+        body_ref = p.get("body", "0")
+        mesh_body = _find_mesh_body(root, mesh_ref)
+        body = _require_body(root, body_ref)
+
+        mesh_vol = float(mesh_body.volume)
+        mesh_bbox = mesh_body.boundingBox
+        mesh_min = [mesh_bbox.minPoint.x, mesh_bbox.minPoint.y, mesh_bbox.minPoint.z]
+        mesh_max = [mesh_bbox.maxPoint.x, mesh_bbox.maxPoint.y, mesh_bbox.maxPoint.z]
+
+        brep_vol = float(body.physicalProperties.volume)
+        brep_bbox = body.boundingBox
+        brep_min = [brep_bbox.minPoint.x, brep_bbox.minPoint.y, brep_bbox.minPoint.z]
+        brep_max = [brep_bbox.maxPoint.x, brep_bbox.maxPoint.y, brep_bbox.maxPoint.z]
+
+        if brep_vol == 0.0:
+            return {"error": "BRep body '%s' has zero volume; cannot compute volume_ratio." % body_ref}
+        volume_ratio = mesh_vol / brep_vol
+
+        bbox_max_deviation = max(
+            abs((mesh_max[i] - mesh_min[i]) - (brep_max[i] - brep_min[i]))
+            for i in range(3))
+
+        # Sampled deviation: stride through the mesh's node list toward ~200
+        # samples; each node measured to the nearest point on the BRep.
+        mesh = mesh_body.displayMesh
+        node_coords = list(mesh.nodeCoordinates)
+        count = len(node_coords)
+        target = 200
+        stride = max(1, int(math.ceil(count / target))) if count else 1
+        sample_indices = list(range(0, count, stride))
+        if count and sample_indices[-1] != count - 1:
+            sample_indices.append(count - 1)
+
+        # Closest-point API availability (probed live: absent on this build).
+        face_evaluators = []
+        for i in range(body.faces.count):
+            ev = body.faces.item(i).evaluator
+            if hasattr(ev, "getClosestPointTo"):
+                face_evaluators.append(ev)
+        method = "surface_evaluator" if face_evaluators else "vertex_fallback"
+
+        brep_verts = []
+        if not face_evaluators:
+            for i in range(body.vertices.count):
+                v = body.vertices.item(i).geometry
+                brep_verts.append((v.x, v.y, v.z))
+
+        distances = []
+        for idx in sample_indices:
+            pt = node_coords[idx]
+            px, py, pz = pt.x, pt.y, pt.z
+            try:
+                if face_evaluators:
+                    best = None
+                    for ev in face_evaluators:
+                        _ret, cp = ev.getClosestPointTo(pt)
+                        d = math.sqrt((px - cp.x) ** 2 + (py - cp.y) ** 2 + (pz - cp.z) ** 2)
+                        if best is None or d < best:
+                            best = d
+                else:
+                    best = min(
+                        math.sqrt((px - bx) ** 2 + (py - by) ** 2 + (pz - bz) ** 2)
+                        for bx, by, bz in brep_verts)
+            except Exception:
+                continue  # per-vertex failures are skipped (counted via samples)
+            if best is not None:
+                distances.append(best)
+
+        if not distances:
+            return {"error": "No mesh vertices could be sampled on mesh body '%s'." % mesh_ref}
+        return {
+            "mesh": {
+                "volume_cm3": round(mesh_vol, 6),
+                "bbox_cm": [[round(v, 6) for v in mesh_min],
+                            [round(v, 6) for v in mesh_max]],
+            },
+            "brep": {
+                "volume_cm3": round(brep_vol, 6),
+                "bbox_cm": [[round(v, 6) for v in brep_min],
+                            [round(v, 6) for v in brep_max]],
+            },
+            "volume_ratio": round(volume_ratio, 6),
+            "bbox_max_deviation_cm": round(bbox_max_deviation, 6),
+            "sampled_deviation_cm": {
+                "mean": round(sum(distances) / len(distances), 6),
+                "max": round(max(distances), 6),
+                "samples": len(distances),
+            },
+            "method": method,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _update_scad_body(root, p: dict) -> dict:
     try:
         ref = p.get("body", 0)
@@ -2755,6 +2867,7 @@ def _process_command(data: dict) -> dict:
             "create_from_csg_tree":       lambda: _create_from_csg_tree(root, p),
             "revolve_cross_section":      lambda: _revolve_cross_section(root, p),
             "mesh_convert":               lambda: _mesh_convert(root, p),
+            "compare_mesh_brep":          lambda: _compare_mesh_brep(root, p),
         }
 
         if cmd in dispatch:
