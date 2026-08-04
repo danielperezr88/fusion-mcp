@@ -81,6 +81,36 @@ def _load_mesh_analysis():
         "repository importable so analyze_mesh can run mesh analysis.")
 
 
+def _load_mesh_slicer():
+    """Import mcp_server.mesh_slicer from the repo, wherever it lives.
+
+    Same fallback-by-file-location strategy as _load_mesh_analysis: works
+    both when the repo root is on sys.path and when fusion_server.py is
+    launched directly by an MCP client.
+    """
+    try:
+        from mcp_server import mesh_slicer
+        return mesh_slicer
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(here, "mesh_slicer.py"),
+        os.path.join(here, os.pardir, "mcp_server", "mesh_slicer.py"),
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "fusionmcp_mesh_slicer", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError(
+        "mcp_server/mesh_slicer.py could not be found. Keep the fusion-mcp "
+        "repository importable so slice_mesh can run plane intersection.")
+
+
 def _get_bosl2_path():
     """Resolve the bundled BOSL2 path, or None when the bundle is unavailable."""
     try:
@@ -1314,6 +1344,60 @@ def analyze_mesh(mesh: str = "0", units: str = "cm") -> str:
     report["mesh"] = data.get("mesh", mesh)
     report["units"] = units
     return json.dumps(report, indent=2)
+
+
+@mcp.tool()
+def slice_mesh(mesh: str = "0", axis: str = "Z", height_cm: float = 0.0,
+               units: str = "cm") -> str:
+    """
+    Slice a mesh body with a plane and return the 2D cross-section loops.
+
+    Fetches the mesh triangle data from Fusion, then runs pure-Python
+    triangle-plane intersection: for each triangle the plane-vs-triangle
+    intersection segment is computed, the segments are chained into ordered
+    closed 2D loops, and each loop is classified as an outer contour (CCW,
+    positive shoelace area) or a hole (CW, negative) by containment.
+
+    The plane is axis-aligned: one of X/Y/Z plus a signed height (cm) along
+    that axis.  Loop points are in the requested units.
+
+    Stage 3 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:      Body name or index of a mesh body.
+        axis:      Plane normal axis: X, Y, or Z (default Z).
+        height_cm: Signed plane height along the axis, in cm (default 0).
+        units:     Units for the loop points: mm, cm, or in (default cm).
+    """
+    axis = str(axis or "Z").strip().upper()
+    if axis not in ("X", "Y", "Z"):
+        return json.dumps({"error": "Axis must be X, Y, or Z"}, indent=2)
+    try:
+        factor = _cm_to_unit_factor(units)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    raw = _call("extract_mesh_data", {"mesh": mesh})
+    if raw.startswith("Error: "):
+        return json.dumps({"error": raw[len("Error: "):]}, indent=2)
+    if raw.startswith(("Cannot reach", "Unexpected error")):
+        return raw
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if "error" in data:
+        return json.dumps({"error": data["error"]}, indent=2)
+    try:
+        mesh_slicer = _load_mesh_slicer()
+        result = mesh_slicer.slice_mesh_at(
+            data.get("nodes", []), data.get("indices", []),
+            {"axis": axis, "height_cm": float(height_cm)})
+        result = mesh_slicer.scale_slice(result, factor)
+    except Exception as e:
+        return json.dumps({"error": f"slice failed: {e}"}, indent=2)
+    result["mesh"] = data.get("mesh", mesh)
+    result["units"] = units
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
