@@ -61,6 +61,7 @@ import os
 import sys
 
 import requests
+import time
 
 BASE_URL = "http://127.0.0.1:7432/command"
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -164,9 +165,62 @@ def run_check(name, fn):
 
 
 # ---- state / verification helpers (execute_script, all linear, no closures) ----
+#
+# Cross-boundary reads can see a not-yet-committed mutation (Wave 2
+# read-after-write precedent): a body may be counted (+1) but not yet findable
+# by name. Re-poll before concluding; real failures still raise after attempts.
+
+def _poll(fn, what, attempts=6, delay=0.5):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except (AssertionError, RuntimeError) as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(delay)
+    raise AssertionError(f"{what}: still failing after {attempts} attempts: {last}")
+
+
+def _await_count(reader, expected, what, attempts=6, delay=0.5):
+    last = None
+    for i in range(attempts):
+        last = reader()
+        if last == expected:
+            return last
+        if i < attempts - 1:
+            time.sleep(delay)
+    raise AssertionError(f"{what}: {last} != expected {expected}")
+
+
+def _await_min(reader, minimum, what, attempts=6, delay=0.5):
+    last = None
+    for i in range(attempts):
+        last = reader()
+        if last >= minimum:
+            return last
+        if i < attempts - 1:
+            time.sleep(delay)
+    raise AssertionError(f"{what}: {last} < minimum {minimum}")
+
+
+def _await_body_change(before_brep, before_mesh, what, attempts=6, delay=0.5):
+    b, m = before_brep, before_mesh
+    for i in range(attempts):
+        b, m = brep_count(), mesh_count()
+        if (b - before_brep) + (m - before_mesh) >= 1:
+            return b, m
+        if i < attempts - 1:
+            time.sleep(delay)
+    raise AssertionError(
+        f"{what}: no body appeared after mutation "
+        f"(BRep {before_brep}->{b}, mesh {before_mesh}->{m})")
+
 
 def bodies_state():
-    return run_code("result['output'] = [root.bRepBodies.count, root.meshBodies.count]")
+    return _poll(lambda: run_code(
+        "result['output'] = [root.bRepBodies.count, root.meshBodies.count]"),
+        "bodies_state")
 
 
 def brep_count():
@@ -182,48 +236,54 @@ def _bbox_size(bb):
 
 
 def mesh_bbox_by_name(name):
-    code = (
-        "b = None\n"
-        "for i in range(root.meshBodies.count):\n"
-        "    m = root.meshBodies.item(i)\n"
-        "    if m.name == %r:\n"
-        "        b = m\n"
-        "if b is None:\n"
-        "    result['output'] = {'error': 'mesh body not found: ' + %r}\n"
-        "else:\n"
-        "    bb = b.boundingBox\n"
-        "    mn = bb.minPoint\n"
-        "    mx = bb.maxPoint\n"
-        "    result['output'] = {'min': [mn.x, mn.y, mn.z], "
-        "'max': [mx.x, mx.y, mx.z]}\n"
-    ) % (name, name)
-    out = run_code(code)
-    if isinstance(out, dict) and "error" in out:
-        raise AssertionError(out["error"])
-    return out
+    def scan():
+        code = (
+            "b = None\n"
+            "for i in range(root.meshBodies.count):\n"
+            "    m = root.meshBodies.item(i)\n"
+            "    if m.name == %r:\n"
+            "        b = m\n"
+            "if b is None:\n"
+            "    result['output'] = {'error': 'mesh body not found: ' + %r}\n"
+            "else:\n"
+            "    bb = b.boundingBox\n"
+            "    mn = bb.minPoint\n"
+            "    mx = bb.maxPoint\n"
+            "    result['output'] = {'min': [mn.x, mn.y, mn.z], "
+            "'max': [mx.x, mx.y, mx.z]}\n"
+        ) % (name, name)
+        out = run_code(code)
+        if isinstance(out, dict) and "error" in out:
+            raise AssertionError(out["error"])
+        return out
+    return _poll(scan, f"mesh_bbox_by_name({name!r})")
 
 
 def brep_bbox(idx):
-    code = (
-        "b = root.bRepBodies.item(%d)\n"
-        "bb = b.boundingBox\n"
-        "mn = bb.minPoint\n"
-        "mx = bb.maxPoint\n"
-        "result['output'] = {'min': [mn.x, mn.y, mn.z], "
-        "'max': [mx.x, mx.y, mx.z]}\n"
-    ) % idx
-    out = run_code(code)
-    if isinstance(out, dict) and "error" in out:
-        raise AssertionError(out["error"])
-    return out
+    def scan():
+        code = (
+            "b = root.bRepBodies.item(%d)\n"
+            "bb = b.boundingBox\n"
+            "mn = bb.minPoint\n"
+            "mx = bb.maxPoint\n"
+            "result['output'] = {'min': [mn.x, mn.y, mn.z], "
+            "'max': [mx.x, mx.y, mx.z]}\n"
+        ) % idx
+        out = run_code(code)
+        if isinstance(out, dict) and "error" in out:
+            raise AssertionError(out["error"])
+        return out
+    return _poll(scan, f"brep_bbox({idx})")
 
 
 def timeline_types():
-    resp = call("get_timeline_info", timeout=60)
-    items = resp.get("items") if isinstance(resp, dict) else None
-    if items is None:
-        raise AssertionError(f"unexpected get_timeline_info shape: {resp}")
-    return [it.get("type") for it in items]
+    def fetch():
+        resp = call("get_timeline_info", timeout=60)
+        items = resp.get("items") if isinstance(resp, dict) else None
+        if items is None:
+            raise AssertionError(f"unexpected get_timeline_info shape: {resp}")
+        return [it.get("type") for it in items]
+    return _poll(fetch, "timeline_types")
 
 
 # ---- new-tool dispatch ----
@@ -284,8 +344,7 @@ def check_run_scad_cube():
     name = resp.get("mesh_body")
     if not name:
         raise AssertionError(f"no mesh_body in response: {resp}")
-    if mesh_count() != before + 1:
-        raise AssertionError(f"mesh count {before} -> {mesh_count()}, expected +1")
+    _await_count(mesh_count, before + 1, "mesh count")
     bb = mesh_bbox_by_name(name)          # resolve by NAME (not creation-ordered)
     size = _bbox_size(bb)
     if any(abs(s - 1.0) > TOL_CM for s in size):
@@ -358,8 +417,7 @@ def check_create_difference():
     if resp.get("method") != "csg_translation":
         raise AssertionError(
             f"method={resp.get('method')}, expected csg_translation: {resp}")
-    if brep_count() < 1:
-        raise AssertionError("no BRep body created")
+    _await_min(brep_count, 1, "BRep count")
     types = timeline_types()
     if "ExtrudeFeature" not in types or "CombineFeature" not in types:
         raise AssertionError(
@@ -398,8 +456,7 @@ def check_create_linear_extrude():
     if resp.get("method") != "csg_translation":
         raise AssertionError(
             f"method={resp.get('method')}, expected csg_translation: {resp}")
-    if brep_count() < 1:
-        raise AssertionError("no BRep body created")
+    _await_min(brep_count, 1, "BRep count")
     return f"method=csg_translation bodies={resp.get('bodies')}"
 
 
@@ -411,8 +468,7 @@ def check_create_bosl2_cuboid():
     if resp.get("method") != "csg_translation":
         raise AssertionError(
             f"method={resp.get('method')}, expected csg_translation: {resp}")
-    if brep_count() < 1:
-        raise AssertionError("no BRep body created")
+    _await_min(brep_count, 1, "BRep count")
     bb = brep_bbox(0)
     size = _bbox_size(bb)
     if any(abs(s - 2.0) > TOL_CM for s in size):
@@ -436,9 +492,7 @@ def check_create_torus_mesh_fallback():
         raise AssertionError(f"unsupported_nodes={uns}, expected ['rotate_extrude']")
     if not resp.get("fallback_reason"):
         raise AssertionError("missing fallback_reason")
-    if mesh_count() != before_mesh + 1:
-        raise AssertionError(
-            f"mesh count {before_mesh} -> {mesh_count()}, expected +1")
+    _await_count(mesh_count, before_mesh + 1, "mesh count")
     return (f"method=mesh_fallback unsupported={uns} "
             f"reason={str(resp.get('fallback_reason'))[:60]}")
 
@@ -448,9 +502,7 @@ def check_create_xcopies():
     call("clear_design")
     resp = create_from_scad(code)
     _assert_created(resp, "xcopies")
-    n = brep_count()
-    if n != 3:
-        raise AssertionError(f"BRep bodies={n}, expected 3 (for-loop unrolled)")
+    n = _await_count(brep_count, 3, "BRep count")
     return f"3 BRep bodies created (bodies={resp.get('bodies')})"
 
 
@@ -462,13 +514,11 @@ def check_create_diff_edge_profile():
     _assert_created(resp, "diff+edge_profile")
     method = resp.get("method")
     if method == "csg_translation":
-        if brep_count() < 1:
-            raise AssertionError("no BRep body created")
+        _await_min(brep_count, 1, "BRep count")
         return (f"method=csg_translation bodies={resp.get('bodies')} "
                 f"features={resp.get('features')}")
     if method == "mesh_fallback":
-        if mesh_count() < 1:
-            raise AssertionError("mesh fallback created no mesh body")
+        _await_min(mesh_count, 1, "mesh count")
         return (f"method=mesh_fallback (plan prefers csg_translation; see "
                 f"summary) reason={str(resp.get('fallback_reason'))[:60]}")
     raise AssertionError(f"unexpected method={method}: {resp}")
@@ -487,12 +537,8 @@ def check_hull_fallback():
     reason = str(resp.get("fallback_reason") or "")
     if "hull" not in reason.lower():
         raise AssertionError(f"fallback_reason does not mention hull: {reason}")
-    if brep_count() != before_brep:
-        raise AssertionError(
-            f"partial BRep bodies left behind: {before_brep} -> {brep_count()}")
-    if mesh_count() != before_mesh + 1:
-        raise AssertionError(
-            f"mesh count {before_mesh} -> {mesh_count()}, expected +1")
+    _await_count(brep_count, before_brep, "BRep count")   # no partial BRep left
+    _await_count(mesh_count, before_mesh + 1, "mesh count")
     return f"mesh fallback, no partial BRep left (reason: {reason[:60]})"
 
 
@@ -509,8 +555,7 @@ def check_prismoid():
         return (f"method=csg_translation, LoftFeature present, "
                 f"features={resp.get('features')}")
     if method == "mesh_fallback":
-        if mesh_count() < 1:
-            raise AssertionError("mesh fallback created no mesh body")
+        _await_min(mesh_count, 1, "mesh count")
         return (f"method=mesh_fallback (plan expects Loft; see summary) "
                 f"reason={str(resp.get('fallback_reason'))[:60]}")
     raise AssertionError(f"unexpected method={method}: {resp}")
@@ -524,8 +569,8 @@ def check_spheroid():
     resp = create_from_scad(code)
     _assert_created(resp, "spheroid")
     method = resp.get("method")
-    after_brep = brep_count()
-    after_mesh = mesh_count()
+    after_brep, after_mesh = _await_body_change(
+        before_brep, before_mesh, "body creation")
     delta = (after_brep - before_brep) + (after_mesh - before_mesh)
     if delta < 1:
         raise AssertionError("no body created (BRep/mesh delta 0)")
