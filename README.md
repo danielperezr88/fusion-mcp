@@ -66,6 +66,30 @@ Claude Desktop  ──stdio──▶  MCP Server (Python)  ──HTTP──▶  
 - `import_mesh_data` — create a mesh body directly from raw triangle data (flat coordinate/index lists; auto-generates face normals if omitted)
 - `create_from_scad` — translate `.scad`/BOSL2 source into native parametric Fusion features (sketch/extrude/revolve/combine) visible in the timeline, resolving the source via the CSG translator (mm/cm/in units); falls back to a mesh body when a construct is unsupported (hull, surface, text, import, arbitrary polyhedra) or `fallback_to_mesh` is enabled
 
+### Mesh Reconstruction
+- `get_workflow_guide` — the pipeline map and entry point: returns the 8-step mesh-to-parametric workflow as JSON — import -> analyze -> slice -> annotate -> select_parameter_schema -> reconstruct -> compare -> review — with each step's tool name, purpose, inputs/outputs, the model action to take, the strategy branch at reconstruct, and fallbacks; pass a step name (e.g. "annotate") to get a single step
+- `analyze_mesh` — analyze a mesh body and report measured facts plus a recommended reconstruction strategy: watertightness, manifoldness, vertex/triangle counts, enclosed volume, bounding box, mirror symmetry, primitive hints, and a recommended strategy (prismatic | revolved | csg_decompose | organic)
+- `slice_mesh` — slice a mesh body with an axis-aligned plane (X/Y/Z + signed height) and return the ordered 2D cross-section loops: outer contours (CCW) and holes (CW)
+- `annotate_mesh_parameters` — capture 4 viewport screenshots (isometric/front/top/right) of a mesh plus its measured facts, returned as base64 PNG image blocks for model-side classification
+- `select_parameter_schema` — pure-data tool: binds measured facts (bbox dims, slice loop diameter, fit params) to stable named parameters for a classified object (20 part classes + generic fallback) with confidence scores; vision-sourced roles return as placeholders for the model to fill
+- `reconstruct_mesh` — rebuild the mesh as native parametric Fusion timeline features: `prismatic` (one linear extrude of the constant cross-section), `revolved` (half cross-section revolved around an axis), `csg_decompose` (union tree of fitted boxes/cylinders), or `organic` (Fusion's PREVIEW `MeshConvertFeature` API)
+- `compare_mesh_to_brep` — vision-free fidelity QA between the original mesh and the reconstructed BRep: volume ratio, per-axis bounding-box deviation, and a sampled surface deviation (mean/max)
+- `review_reconstruction` — capture side-by-side mesh vs reconstructed-BRep screenshots per view, paired with a local geometry summary, for the final QA pass
+
+Classification happens on the **model side** — no server-side vision API calls. `annotate_mesh_parameters` and `review_reconstruction` return screenshots as MCP Image blocks (base64 PNG) via `image_base64`, and `select_parameter_schema` maps the measured facts to parameters deterministically.
+
+The `organic` strategy uses Fusion's PREVIEW `MeshConvertFeature` API, which is only present on recent Fusion builds and is additionally license-gated; when unavailable, the tool returns a graceful not-available error instead of a converted body.
+
+Example workflow:
+
+```text
+1. import_mesh_file("bracket.stl")
+2. analyze_mesh(mesh="0")                    # recommended_strategy: prismatic
+3. reconstruct_mesh(mesh="0", strategy="prismatic")
+4. compare_mesh_to_brep(mesh="0", body="0")
+5. review_reconstruction(mesh="0", body="0")
+```
+
 ### Other
 - Execute arbitrary Python scripts inside Fusion 360
 - Create/clear documents
