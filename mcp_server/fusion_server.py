@@ -111,6 +111,36 @@ def _load_mesh_slicer():
         "repository importable so slice_mesh can run plane intersection.")
 
 
+def _load_mesh_csg():
+    """Import mcp_server.mesh_csg from the repo, wherever it lives.
+
+    Same fallback-by-file-location strategy as _load_mesh_slicer: works both
+    when the repo root is on sys.path and when fusion_server.py is launched
+    directly by an MCP client.
+    """
+    try:
+        from mcp_server import mesh_csg
+        return mesh_csg
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(here, "mesh_csg.py"),
+        os.path.join(here, os.pardir, "mcp_server", "mesh_csg.py"),
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "fusionmcp_mesh_csg", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError(
+        "mcp_server/mesh_csg.py could not be found. Keep the fusion-mcp "
+        "repository importable so reconstruct_mesh can build CSG trees.")
+
+
 def _load_parameter_schemas():
     """Import mcp_server.parameter_schemas from the repo, wherever it lives.
 
@@ -1429,6 +1459,132 @@ def slice_mesh(mesh: str = "0", axis: str = "Z", height_cm: float = 0.0,
     result["mesh"] = data.get("mesh", mesh)
     result["units"] = units
     return json.dumps(result, indent=2)
+
+
+def _count_csg_nodes(nodes):
+    """Recursively count the nodes in a CSG tree (reconstruction envelope)."""
+    total = 0
+    for node in nodes or []:
+        total += 1
+        total += _count_csg_nodes(node.get("children", []))
+    return total
+
+
+def _envelope_reconstruction(result, strategy, method, csg_nodes):
+    """Wrap a handler result in the T6 reconstruct_mesh envelope.
+
+    Handler errors pass through verbatim; successes are normalized to
+    {"strategy", "method", "bodies", "features", "csg_nodes"}.
+    """
+    try:
+        data = json.loads(result)
+    except ValueError:
+        return result
+    if not isinstance(data, dict):
+        return result
+    if "error" in data:
+        return json.dumps({"error": data["error"]}, indent=2)
+    return json.dumps({
+        "strategy": strategy,
+        "method": data.get("method", method),
+        "bodies": data.get("bodies", 0),
+        "features": data.get("features", 0),
+        "csg_nodes": csg_nodes,
+    }, indent=2)
+
+
+@mcp.tool()
+def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
+                     params: dict = None) -> str:
+    """
+    Reconstruct a mesh body as parametric CAD features (CSG tree or revolve).
+
+    Fetches the mesh triangle data from Fusion and runs pure-Python
+    reconstruction: `prismatic` slices the mesh at interior heights along an
+    axis and emits ONE linear_extrude of the constant cross-section (holes
+    become polygon paths); `revolved` computes the half cross-section profile
+    through the Z-containing plane and revolves it around the Z axis;
+    `csg_decompose` fits boxes/cylinders to planar face regions and emits a
+    union tree.  The CSG trees / revolve profiles are scaled cm -> units and
+    handed to the add-in's create_from_csg_tree / revolve_cross_section
+    handlers, which turn them into native Fusion timeline features.
+
+    Stage 6 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:     Body name or index of a mesh body.
+        strategy: auto (routes via the analysis recommendation), prismatic,
+                  revolved, or csg_decompose.
+        units:    Units for the reconstructed model: mm, cm, or in (default mm).
+        params:   Optional strategy params, e.g. {"axis": "Z",
+                  "num_slices": 3, "angle_deg": 360}.
+    """
+    strategy = str(strategy or "auto").strip().lower()
+    if strategy not in ("auto", "prismatic", "revolved", "csg_decompose"):
+        return json.dumps({
+            "error": f"Unknown strategy '{strategy}'. Supported: auto, "
+                     "prismatic, revolved, csg_decompose"}, indent=2)
+    try:
+        factor = _cm_to_unit_factor(units)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    raw = _call("extract_mesh_data", {"mesh": mesh})
+    if raw.startswith("Error: "):
+        return json.dumps({"error": raw[len("Error: "):]}, indent=2)
+    if raw.startswith(("Cannot reach", "Unexpected error")):
+        return raw
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if "error" in data:
+        return json.dumps({"error": data["error"]}, indent=2)
+    params = dict(params or {})
+    try:
+        mesh_csg = _load_mesh_csg()
+        chosen = strategy
+        if strategy == "auto":
+            try:
+                mesh_analysis = _load_mesh_analysis()
+                report = mesh_analysis.analyze_mesh_data(
+                    data.get("nodes", []), data.get("indices", []),
+                    data.get("normals", []))
+                chosen = report.get("recommended_strategy", "prismatic")
+            except Exception:
+                chosen = "prismatic"
+        if chosen == "organic":
+            return json.dumps({
+                "error": "strategy 'organic' is not supported yet (arrives "
+                         "with the next milestone). Use prismatic, revolved, "
+                         "or csg_decompose."}, indent=2)
+        if chosen == "revolved":
+            try:
+                profile = mesh_csg.compute_revolved_profile(data, params)
+            except Exception as e:
+                return json.dumps({"error": f"revolve profile failed: {e}"},
+                                  indent=2)
+            profile = [[round(x * factor, 6), round(z * factor, 6)]
+                       for x, z in profile]
+            result = _call(
+                "revolve_cross_section",
+                {"profile_pts": profile, "angle": params.get("angle", 360.0),
+                 "units": units},
+                timeout=330)
+            return _envelope_reconstruction(result, "revolved", "revolve", 0)
+        try:
+            tree = mesh_csg.build_csg_tree(data, chosen, params)
+        except mesh_csg.NotPrismaticError:
+            if strategy != "auto":
+                raise
+            tree = mesh_csg.build_csg_tree(data, "csg_decompose", params)
+            chosen = "csg_decompose"
+        tree = mesh_csg.scale_tree(tree, factor)
+        result = _call("create_from_csg_tree", {"csg_tree": tree, "units": units},
+                       timeout=330)
+        return _envelope_reconstruction(result, chosen, "csg_translation",
+                                        _count_csg_nodes(tree))
+    except Exception as e:
+        return json.dumps({"error": f"reconstruction failed: {e}"}, indent=2)
 
 
 @mcp.tool()

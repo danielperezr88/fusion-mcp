@@ -2146,6 +2146,161 @@ def _create_from_scad(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _create_from_csg_tree(root, p: dict) -> dict:
+    """Translate a CSG tree (built by the server's mesh_csg strategy router)
+    into native Fusion features.  Same flow as _create_from_scad minus the
+    mesh-fallback path (there is no source code to re-render): the server has
+    already resolved the tree, so a translation failure is final.
+    """
+    try:
+        csg_tree = p.get("csg_tree")
+        if not isinstance(csg_tree, list) or not csg_tree:
+            return {"error": "No CSG tree received. The MCP server must build it with build_csg_tree() before sending it here."}
+        units = str(p.get("units", "mm") or "mm").lower()
+
+        translator = _get_scad_translator()
+        design = _design()
+        if design is None:
+            return {"error": "No active Fusion 360 design. Open or create one first."}
+
+        before_bodies = _snapshot_names(root.bRepBodies)
+        before_body_count = root.bRepBodies.count
+        before_mesh_count = root.meshBodies.count
+        before_sketches = _snapshot_names(root.sketches)
+        before_planes = _snapshot_names(root.constructionPlanes)
+        before_timeline = design.timeline.count
+
+        try:
+            _patch_boolean_types_aliases()
+            created_names = translator.translate_to_fusion_commands(
+                csg_tree, root, design, units=units)
+        except translator.UnsupportedSCADNodeError as e:
+            deleted = _cleanup_translation(
+                root, before_bodies, before_sketches, before_planes)
+            return {
+                "error": f"Unsupported CSG node: {e}",
+                "unsupported_nodes": [getattr(e, "kind", None) or str(e).split(" ")[0]],
+                "partial_bodies_deleted": deleted,
+            }
+        except Exception as e:
+            deleted = _cleanup_translation(
+                root, before_bodies, before_sketches, before_planes)
+            return {
+                "error": f"CSG translation failed: {e}",
+                "partial_bodies_deleted": deleted,
+            }
+
+        bodies = (root.bRepBodies.count - before_body_count
+                  + root.meshBodies.count - before_mesh_count)
+        features = design.timeline.count - before_timeline
+        if len(created_names) <= 0 and bodies <= 0:
+            return {"error": "translation produced no bodies"}
+        return {
+            "created": True,
+            "method": "csg_translation",
+            "bodies": bodies,
+            "features": features,
+            "body_names": created_names,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# cm <-> display units for revolve profiles (mirrors scad_translator
+# DEFAULT_UNITS; the server sends the profile already scaled to `units`).
+_UNIT_TO_CM = {"mm": 0.1, "cm": 1.0, "in": 2.54}
+
+
+def _revolve_cross_section(root, p: dict) -> dict:
+    """Revolve a half cross-section profile into a solid.
+
+    The profile is the x>=0 half of the mesh's intersection with the Y=0 plane
+    (points are [x, z] pairs, already scaled to `units` by the server).
+
+    Empirical revolve findings on this Fusion 2026 build (see notepad T6):
+      - Construction-axis revolves (root.zConstructionAxis etc.) ALWAYS raise
+        ASM_PATH_TANGENT, regardless of profile/plane.
+      - Sketch-line-axis revolves map the sketch 2D frame as (u, v) -> (X, Y):
+        an axis line along the sketch's v-axis revolves around world Y, and
+        along the u-axis around world X.  On the XY plane this is the identity
+        mapping and works correctly; on XZ/YZ a v-direction axis (world Z) is
+        misread as a world-Y revolve, so world-Z solids can NOT be made
+        directly via sketch lines.
+      - A closed profile whose axis-side edge lies ON the sketch-line axis
+        revolves fine (profiles=1, no ASM_PATH_TANGENT).
+
+    Recipe (proven): draw the half-profile as (u=radius, v=height) on the XY
+    plane with the axis line along the sketch v-axis (world Y), revolve 360
+    deg, then rotate each resulting body +90 deg about the world X axis so the
+    solid axis maps Y -> Z and the solid lands on the mesh's own Z extent.
+    """
+    try:
+        profile = p.get("profile_pts") or p.get("profile")
+        if not isinstance(profile, list) or len(profile) < 3:
+            return {"error": "No revolve profile received. Provide 'profile_pts' as a list of [x, z] half-cross-section points."}
+        units = str(p.get("units", "mm") or "mm").lower()
+        if units not in _UNIT_TO_CM:
+            return {"error": f"Unsupported units '{units}'. Use 'mm', 'cm', or 'in'."}
+        f = _UNIT_TO_CM[units]
+        angle_deg = float(p.get("angle", p.get("angle_deg", 360.0)) or 360.0)
+
+        pts = [[float(x) * f, float(z) * f] for x, z in profile]
+
+        sketch = root.sketches.add(root.xYConstructionPlane)
+        sketch.name = "revolved_profile_sketch"
+        sketch.isComputeDeferred = False
+        lines = sketch.sketchCurves.sketchLines
+        # Revolve axis = sketch v-axis = world Y (identity mapping on XY).
+        # The profile's axis-side edge (x=0) lies ON this line, which is the
+        # Config-E/T14-proven working tangency case for sketch-line axes.
+        axis_line = lines.addByTwoPoints(
+            adsk.core.Point3D.create(0.0, 0.0, 0.0),
+            adsk.core.Point3D.create(0.0, 1.0, 0.0))
+        # Closed loop: (u, v) = (radius, height) = mesh (x, z).
+        for i in range(len(pts)):
+            x1, z1 = pts[i]
+            x2, z2 = pts[(i + 1) % len(pts)]
+            lines.addByTwoPoints(
+                adsk.core.Point3D.create(x1, z1, 0.0),
+                adsk.core.Point3D.create(x2, z2, 0.0))
+        if sketch.profiles.count == 0:
+            sketch.deleteMe()
+            return {"error": "The revolve profile points did not form a closed loop."}
+        rev_input = root.features.revolveFeatures.createInput(
+            sketch.profiles.item(0), axis_line, _op(p.get("operation", "new_body")))
+        rev_input.setAngleExtent(
+            False, adsk.core.ValueInput.createByReal(math.radians(angle_deg)))
+        feature = root.features.revolveFeatures.add(rev_input)
+        names = []
+        # Map the solid axis Y -> Z: rotate each body +90 deg about world X at
+        # the origin (moveFeatures.createInput2 + defineAsFreeMove).
+        for i in range(feature.bodies.count):
+            body = feature.bodies.item(i)
+            bodies_col = adsk.core.ObjectCollection.create()
+            bodies_col.add(body)
+            transform = adsk.core.Matrix3D.create()
+            transform.setToRotation(
+                math.radians(90.0),
+                adsk.core.Vector3D.create(1.0, 0.0, 0.0),
+                adsk.core.Point3D.create(0.0, 0.0, 0.0))
+            move_input = root.features.moveFeatures.createInput2(bodies_col)
+            move_input.defineAsFreeMove(transform)
+            root.features.moveFeatures.add(move_input)
+            body.name = f"revolved_{i + 1}"
+            names.append(body.name)
+        return {
+            "created": True,
+            "method": "revolve",
+            "bodies": len(names),
+            "features": 1,
+            "names": names,
+            "profile_pts": len(pts),
+            "angle_deg": angle_deg,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _find_mesh_body(root, ref) -> "adsk.fusion.MeshBody":
     bodies = root.meshBodies
     if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
@@ -2533,6 +2688,8 @@ def _process_command(data: dict) -> dict:
             "import_mesh_data":           lambda: _import_mesh_data(root, p),
             "extract_mesh_data":          lambda: _extract_mesh_data(root, p),
             "create_from_scad":           lambda: _create_from_scad(root, p),
+            "create_from_csg_tree":       lambda: _create_from_csg_tree(root, p),
+            "revolve_cross_section":      lambda: _revolve_cross_section(root, p),
         }
 
         if cmd in dispatch:
