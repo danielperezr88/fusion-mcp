@@ -188,6 +188,26 @@ def test_touch_vertex_triangle_skipped():
     assert res["loops"] == []
 
 
+def test_degenerate_zero_area_triangle_skipped():
+    """A zero-area (degenerate) triangle -- two coincident vertices -- is
+    skipped without crashing: its two plane crossings collapse to ONE point,
+    the zero-length segment is deduped away, and no spurious loop appears.
+    Mixed into a real mesh it must leave the slice byte-identical."""
+    # degenerate: vertices 0 and 1 coincide; the plane at z=0.5 cuts both
+    # remaining edges at the same point (0.5, 0, 0.5).
+    nodes = [0, 0, 0,  0, 0, 0,  1, 0, 1]
+    indices = [0, 1, 2]
+    res = slice_mesh_at(nodes, indices, 0.5)
+    assert res["loops"] == []
+
+    cube_nodes, cube_indices = _unit_cube()
+    mixed_nodes = cube_nodes + [0, 0, 0,  0, 0, 0,  1, 0, 1]
+    mixed_indices = list(cube_indices) + [8, 9, 10]
+    clean = slice_mesh_at(cube_nodes, cube_indices, 0.5)
+    mixed = slice_mesh_at(mixed_nodes, mixed_indices, 0.5)
+    assert mixed == clean
+
+
 def test_empty_mesh_no_crash():
     res = slice_mesh_at([], [], {"axis": "Z", "height_cm": 0.5})
     assert res["loops"] == []

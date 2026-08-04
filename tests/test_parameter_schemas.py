@@ -59,6 +59,31 @@ def test_unknown_class_falls_back_to_generic():
 
 
 # ---------------------------------------------------------------------------
+# Unmatched roles (resolution-order rule 6: everything else)
+# ---------------------------------------------------------------------------
+
+def test_unresolved_roles_land_in_unmatched_roles():
+    """Roles that cannot be resolved from ANY measured fact are reported in
+    unmatched_roles.  Vision-sourced roles are the EXCEPTION: they become
+    None placeholders in parameters (never fabricated numbers) and are NOT
+    unmatched."""
+    result = select_schema("bolt", {})
+    # head_diameter (slice), head_thickness (bbox), length (bbox) -- no facts
+    assert set(result["unmatched_roles"]) == {
+        "head_diameter", "head_thickness", "length"}
+    names = {p["name"] for p in result["parameters"]}
+    assert not names & {"bolt_head_diameter", "bolt_head_thickness",
+                        "bolt_length"}
+    # vision-sourced roles stay as placeholders, never unmatched
+    assert "thread_diameter" not in result["unmatched_roles"]
+    assert "thread_pitch" not in result["unmatched_roles"]
+    # supplying the facts clears the corresponding unmatched entries
+    filled = select_schema(
+        "bolt", {"slice_diameter_cm": 4.0, "bbox_cm": [4, 4, 3]})
+    assert set(filled["unmatched_roles"]) == set()
+
+
+# ---------------------------------------------------------------------------
 # Determinism
 # ---------------------------------------------------------------------------
 

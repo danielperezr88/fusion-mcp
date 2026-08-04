@@ -310,6 +310,19 @@ def test_organic_strategy_raises_until_t7():
         build_csg_tree(_mesh_data(nodes, indices), "organic", {})
 
 
+def test_revolved_strategy_is_profile_not_csg():
+    """'revolved' emits NO CSG tree: build_csg_tree raises
+    UnsupportedStrategyError (the profile path is compute_revolved_profile,
+    covered by the revolved half-profile tests below)."""
+    nodes, indices = _unit_cube()
+    with pytest.raises(UnsupportedStrategyError) as excinfo:
+        build_csg_tree(_mesh_data(nodes, indices), "revolved", {})
+    assert "revolve profile" in str(excinfo.value)
+    # and the profile path is the supported route: it produces pts, not a tree
+    profile = compute_revolved_profile(_mesh_data(nodes, indices), {})
+    assert isinstance(profile, list) and len(profile) >= 3
+
+
 # ---------------------------------------------------------------------------
 # revolved half-profile
 # ---------------------------------------------------------------------------

@@ -253,3 +253,21 @@ def test_scale_report_mm():
     assert scaled["recommended_strategy"] == "prismatic"
     assert scaled["watertight"] is True
     assert scaled["vertex_count"] == report["vertex_count"]
+
+
+# ---------------------------------------------------------------------------
+# QA-failure proof (plan acceptance "deliberately wrong expectation")
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="deliberately wrong expectation proving the test machinery is live")
+def test_qa_failure_proof_machinery_live():
+    """Proves the test machinery is live -- this assertion is intentionally
+    wrong.  A real analysis of the unit cube reports volume 1.0 cm^3, so this
+    assertion FAILS; xfail(strict=True) records it as an expected failure
+    (XFAIL) so the headless suite stays green while proving assertions really
+    execute.  If it ever XPASSES, the machinery is broken."""
+    nodes, indices, normals = _unit_cube()
+    report = analyze_mesh_data(nodes, indices, normals)
+    assert report["volume_cm3"] == 42.0  # deliberately wrong: real volume is 1.0
