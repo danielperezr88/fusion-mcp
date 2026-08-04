@@ -1493,6 +1493,29 @@ def _envelope_reconstruction(result, strategy, method, csg_nodes):
     }, indent=2)
 
 
+def _envelope_organic(result, operation):
+    """Wrap a mesh_convert handler result in the T7 organic envelope.
+
+    Handler errors pass through verbatim; successes become the PREVIEW-caveat
+    envelope {"strategy", "method", "preview_api", "parametric", "note"}.
+    """
+    try:
+        data = json.loads(result)
+    except ValueError:
+        return result
+    if not isinstance(data, dict):
+        return result
+    if "error" in data:
+        return json.dumps({"error": data["error"]}, indent=2)
+    return json.dumps({
+        "strategy": "organic",
+        "method": "mesh_convert",
+        "preview_api": True,
+        "parametric": bool(operation == "parametric"),
+        "note": "Organic conversion is a PREVIEW API result, not a parameterized solid.",
+    }, indent=2)
+
+
 @mcp.tool()
 def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
                      params: dict = None) -> str:
@@ -1509,21 +1532,29 @@ def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
     handed to the add-in's create_from_csg_tree / revolve_cross_section
     handlers, which turn them into native Fusion timeline features.
 
+    `organic` uses Fusion's PREVIEW MeshConvertFeature API instead: the mesh
+    is converted in-place by Fusion and the result may be a dumb BaseFeature
+    body rather than a parameterized solid (see the envelope's `note`).
+    PREVIEW CAVEAT: the API is only present on recent Fusion builds and is
+    additionally gated by the license; when unavailable the tool returns a
+    graceful not-available error instead of a converted body.
+
     Stage 6 of the mesh-to-parametric workflow (see get_workflow_guide).
 
     Args:
         mesh:     Body name or index of a mesh body.
         strategy: auto (routes via the analysis recommendation), prismatic,
-                  revolved, or csg_decompose.
+                  revolved, csg_decompose, or organic (PREVIEW API).
         units:    Units for the reconstructed model: mm, cm, or in (default mm).
         params:   Optional strategy params, e.g. {"axis": "Z",
-                  "num_slices": 3, "angle_deg": 360}.
+                  "num_slices": 3, "angle_deg": 360}.  For organic also
+                  {"operation": "parametric"|"base"} (default parametric).
     """
     strategy = str(strategy or "auto").strip().lower()
-    if strategy not in ("auto", "prismatic", "revolved", "csg_decompose"):
+    if strategy not in ("auto", "prismatic", "revolved", "csg_decompose", "organic"):
         return json.dumps({
             "error": f"Unknown strategy '{strategy}'. Supported: auto, "
-                     "prismatic, revolved, csg_decompose"}, indent=2)
+                     "prismatic, revolved, csg_decompose, organic"}, indent=2)
     try:
         factor = _cm_to_unit_factor(units)
     except ValueError as e:
@@ -1541,7 +1572,6 @@ def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
         return json.dumps({"error": data["error"]}, indent=2)
     params = dict(params or {})
     try:
-        mesh_csg = _load_mesh_csg()
         chosen = strategy
         if strategy == "auto":
             try:
@@ -1553,10 +1583,13 @@ def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
             except Exception:
                 chosen = "prismatic"
         if chosen == "organic":
-            return json.dumps({
-                "error": "strategy 'organic' is not supported yet (arrives "
-                         "with the next milestone). Use prismatic, revolved, "
-                         "or csg_decompose."}, indent=2)
+            operation = str(params.get("operation", "parametric") or "parametric").strip().lower()
+            result = _call(
+                "mesh_convert",
+                {"mesh": mesh, "method": "organic", "operation": operation},
+                timeout=330)
+            return _envelope_organic(result, operation)
+        mesh_csg = _load_mesh_csg()
         if chosen == "revolved":
             try:
                 profile = mesh_csg.compute_revolved_profile(data, params)

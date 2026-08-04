@@ -2314,6 +2314,70 @@ def _find_mesh_body(root, ref) -> "adsk.fusion.MeshBody":
     raise Exception(f"Body '{ref}' not found.")
 
 
+def _mesh_convert(root, p: dict) -> dict:
+    """Convert a mesh body to a BRep solid via the PREVIEW MeshConvertFeature.
+
+    PREVIEW API (July 2025): `design.features.meshConvertFeatures` is only
+    present on recent Fusion builds, and even then the `add()` step is gated
+    by the license (live 2026 build raises "3 : No rights for mesh
+    conversion.").  Absence / gating is detected through BOTH an
+    `hasattr(design.features, "meshConvertFeatures")` guard AND try/except
+    around `createInput` AND a rights-check on `add()`; every one of those
+    paths returns the same exact not-available error so the caller never
+    sees a crash.
+
+    params: {mesh, method (prismatic|organic), operation ("parametric"|"base")}
+      method    -> MeshConvertMethodTypes: Faceted=0, Prismatic=1, Organic=2
+      operation -> MeshConvertOperationTypes: ParametricFeature=0 (timeline),
+                   BaseFeature=1 (dumb body)
+    """
+    try:
+        design = _design()
+        if design is None:
+            return {"error": "No active Fusion 360 design. Open or create one first."}
+        method = str(p.get("method", "organic") or "organic").strip().lower()
+        if method not in ("prismatic", "organic"):
+            return {"error": "Unsupported method '%s'. Use 'prismatic' or 'organic'." % method}
+        operation = str(p.get("operation", "parametric") or "parametric").strip().lower()
+        if operation not in ("parametric", "base"):
+            return {"error": "Unsupported operation '%s'. Use 'parametric' or 'base'." % operation}
+
+        mesh_body = _find_mesh_body(root, p.get("mesh", 0))
+        mesh_features = root.features
+        # Absence path 1: API not present on this build.
+        if not hasattr(mesh_features, "meshConvertFeatures"):
+            return {"error": "MeshConvertFeature not available on this Fusion build (PREVIEW API)"}
+        # Absence path 2: present but createInput is unusable.
+        try:
+            convert_input = mesh_features.meshConvertFeatures.createInput([mesh_body])
+        except Exception:
+            return {"error": "MeshConvertFeature not available on this Fusion build (PREVIEW API)"}
+        try:
+            convert_input.meshConvertMethodType = 2 if method == "organic" else 1
+            convert_input.meshConvertOperationType = 0 if operation == "parametric" else 1
+            feature = mesh_features.meshConvertFeatures.add(convert_input)
+        except Exception as e:
+            # Rights-gated PREVIEW (live 2026: "No rights for mesh
+            # conversion." fires when the input's method/operation types are
+            # assigned, not only at add()) -- same not-available contract.
+            if "rights" in str(e).lower():
+                return {"error": "MeshConvertFeature not available on this Fusion build (PREVIEW API)"}
+            return {"error": "mesh convert failed: %s" % e}
+        names = []
+        for i in range(feature.bodies.count):
+            names.append(feature.bodies.item(i).name)
+        return {
+            "converted": True,
+            "bodies": len(names),
+            "names": names,
+            "method": method,
+            "operation": operation,
+            "preview_api": True,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _update_scad_body(root, p: dict) -> dict:
     try:
         ref = p.get("body", 0)
@@ -2690,6 +2754,7 @@ def _process_command(data: dict) -> dict:
             "create_from_scad":           lambda: _create_from_scad(root, p),
             "create_from_csg_tree":       lambda: _create_from_csg_tree(root, p),
             "revolve_cross_section":      lambda: _revolve_cross_section(root, p),
+            "mesh_convert":               lambda: _mesh_convert(root, p),
         }
 
         if cmd in dispatch:
