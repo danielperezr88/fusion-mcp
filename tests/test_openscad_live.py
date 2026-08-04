@@ -44,6 +44,10 @@ Checks (plan lines 219-221):
    13. create_from_scad hull() fallback_to_mesh=True -> mesh fallback, no partials
    14. create_from_scad prismoid()                   -> Loft (or honest fallback)
    15. create_from_scad spheroid(style="icosa")      -> polyhedron mesh body
+   17. create_from_scad scale([2,1,1])               -> ScaleFeature, bbox ~[2,1,1] cm
+   18. create_from_scad mirror([1,0,0])              -> MirrorFeature, min.x ~ -1.0 cm
+   19. create_from_scad resize([20,20,20])           -> ScaleFeature, bbox ~[2,2,2] cm
+   20. create_from_scad rotate([45,0,0])             -> free-move rotation, y/z ~1.414 cm
 
 The Kumiko source is PROPRIETARY (Paper View, confidential header): the test
 references it BY PATH ONLY (env var or default) and never copies any of its
@@ -584,6 +588,77 @@ def check_spheroid():
     raise AssertionError(f"unexpected method={method}: {resp}")
 
 
+def check_create_scale():
+    code = "scale([2,1,1])cube([10,10,10]);"
+    call("clear_design")
+    resp = create_from_scad(code)
+    _assert_created(resp, "scale")
+    if resp.get("method") != "csg_translation":
+        raise AssertionError(
+            f"method={resp.get('method')}, expected csg_translation: {resp}")
+    _await_min(brep_count, 1, "BRep count")
+    bb = brep_bbox(0)
+    size = _bbox_size(bb)
+    if any(abs(size[i] - [2.0, 1.0, 1.0][i]) > TOL_CM for i in range(3)):
+        raise AssertionError(
+            f"bbox size={size}, expected ~[2,1,1] cm (scale([2,1,1]) of 10mm cube)")
+    return f"scale([2,1,1]) -> bbox={size} cm (ScaleFeature, origin at world origin)"
+
+
+def check_create_mirror():
+    code = "mirror([1,0,0])cube([10,10,10]);"
+    call("clear_design")
+    resp = create_from_scad(code)
+    _assert_created(resp, "mirror")
+    if resp.get("method") != "csg_translation":
+        raise AssertionError(
+            f"method={resp.get('method')}, expected csg_translation: {resp}")
+    _await_min(brep_count, 1, "BRep count")
+    bb = brep_bbox(0)
+    mn = bb["min"]
+    if abs(mn[0] - (-1.0)) > TOL_CM:
+        raise AssertionError(
+            f"bbox min={mn}, expected min.x ~ -1.0 (mirror about x=0 plane)")
+    return (f"mirror([1,0,0]) -> bbox min.x={mn[0]} cm "
+            f"(MirrorFeature through origin plane)")
+
+
+def check_create_resize():
+    code = "resize([20,20,20])cube([10,10,10]);"
+    call("clear_design")
+    resp = create_from_scad(code)
+    _assert_created(resp, "resize")
+    if resp.get("method") != "csg_translation":
+        raise AssertionError(
+            f"method={resp.get('method')}, expected csg_translation: {resp}")
+    _await_min(brep_count, 1, "BRep count")
+    bb = brep_bbox(0)
+    size = _bbox_size(bb)
+    if any(abs(s - 2.0) > TOL_CM for s in size):
+        raise AssertionError(
+            f"bbox size={size}, expected ~[2,2,2] cm (resize to 20mm cube)")
+    return f"resize([20,20,20]) -> bbox={size} cm (ScaleFeature with per-axis factors)"
+
+
+def check_create_rotate():
+    code = "rotate([45,0,0])cube([10,10,10]);"
+    call("clear_design")
+    resp = create_from_scad(code)
+    _assert_created(resp, "rotate")
+    if resp.get("method") != "csg_translation":
+        raise AssertionError(
+            f"method={resp.get('method')}, expected csg_translation: {resp}")
+    _await_min(brep_count, 1, "BRep count")
+    bb = brep_bbox(0)
+    size = _bbox_size(bb)
+    # 10mm cube rotated 45 deg about X: y/z spans grow to sqrt(2) * 1.0 cm.
+    if any(abs(size[i] - 1.4142) > TOL_CM for i in (1, 2)):
+        raise AssertionError(
+            f"bbox size={size}, expected ~[1.0,1.414,1.414] cm "
+            f"(rotate([45,0,0]) of 10mm cube)")
+    return f"rotate([45,0,0]) -> bbox={size} cm (rotation matrix via free move)"
+
+
 def main():
     global MODE
     if "--mode" in sys.argv:
@@ -635,6 +710,10 @@ def main():
     run_check("13. create_from_scad hull mesh fallback", check_hull_fallback)
     run_check("14. create_from_scad prismoid", check_prismoid)
     run_check("15. create_from_scad spheroid icosa", check_spheroid)
+    run_check("17. create_from_scad scale [2,1,1]", check_create_scale)
+    run_check("18. create_from_scad mirror [1,0,0]", check_create_mirror)
+    run_check("19. create_from_scad resize 20mm", check_create_resize)
+    run_check("20. create_from_scad rotate 45deg X", check_create_rotate)
 
     executed = [r for r in _results if r[1] is not None]
     passed = sum(1 for _, ok, _ in executed if ok)

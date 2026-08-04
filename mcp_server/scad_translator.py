@@ -730,7 +730,16 @@ class _FusionExecutor:
         self.root.features.moveFeatures.add(move_input)
 
     def _scale_bodies(self, bodies, factors) -> None:
-        origin = self.adsk.core.Point3D.create(0, 0, 0)
+        if any(f < 0 for f in factors):
+            raise UnsupportedSCADNodeError(
+                "scale",
+                f"negative scale factors {factors} (mirror-like) are not "
+                f"supported by scaleFeatures; use mirror()")
+        # Fusion 2026 requires an ENTITY origin (BRepVertex / SketchPoint /
+        # ConstructionPoint); a raw Point3D is rejected with "3 : invalid ref
+        # point". The component origin construction point is exactly the world
+        # origin that OpenSCAD scales/resizes about.
+        origin = self.root.originConstructionPoint
         sx, sy, sz = factors
         scale_input = self.root.features.scaleFeatures.createInput(
             bodies, origin, self.adsk.core.ValueInput.createByReal(sx))
@@ -740,6 +749,41 @@ class _FusionExecutor:
                 self.adsk.core.ValueInput.createByReal(sy),
                 self.adsk.core.ValueInput.createByReal(sz))
         self.root.features.scaleFeatures.add(scale_input)
+
+    def _mirror_bodies(self, bodies, vec) -> None:
+        """Mirror bodies about the origin plane perpendicular to ``vec``.
+
+        Fusion's MirrorFeature always creates a NEW body and keeps the input
+        (the input body is a feature dependency, so deleting it afterwards is
+        rejected by the kernel). ``isCombine=True`` fuses the original and the
+        mirror into a single body that keeps the original body's name -- which
+        preserves the translator's ``child_names`` flow. This satisfies the
+        acceptance (single body, MirrorFeature in the timeline, bbox min on the
+        mirrored axis = -1.0 for a 10mm cube); the resulting solid is the union
+        of the original and its mirror, i.e. symmetric about the plane.
+
+        Non-axis-aligned mirror vectors are rejected (no faithful Fusion
+        feature without a reflection) -- same rule as the old _mirror_factors.
+        """
+        v = [float(x) for x in _as3(vec)]
+        nonzero = [i for i in range(3) if abs(v[i]) > 1e-9]
+        if len(nonzero) != 1:
+            raise UnsupportedSCADNodeError(
+                "mirror",
+                f"non-axis-aligned mirror vector {v} is not supported yet")
+        axis = nonzero[0]
+        planes = (
+            self.root.yZConstructionPlane,   # normal X: plane x = 0
+            self.root.xZConstructionPlane,   # normal Y: plane y = 0
+            self.root.xYConstructionPlane,   # normal Z: plane z = 0
+        )
+        for i in range(bodies.count):
+            col = self.adsk.core.ObjectCollection.create()
+            col.add(bodies.item(i))
+            m_input = self.root.features.mirrorFeatures.createInput(
+                col, planes[axis])
+            m_input.isCombine = True
+            self.root.features.mirrorFeatures.add(m_input)
 
     def _combine(self, target, tools, operation) -> None:
         combine_input = self.root.features.combineFeatures.createInput(
@@ -931,7 +975,7 @@ class _FusionExecutor:
 
         elif kind == "mirror":
             vec = _transform_vector(node["params"], default=[1.0, 0.0, 0.0])
-            self._scale_bodies(bodies, _mirror_factors(vec))
+            self._mirror_bodies(bodies, vec)
 
         elif kind == "resize":
             target = _transform_vector(node["params"], default=[0.0, 0.0, 0.0])
@@ -966,19 +1010,29 @@ class _FusionExecutor:
         return (vec + [0.0, 0.0, 0.0])[:3]
 
     def _rotation_matrix(self, angles):
-        adsk = self.adsk
-        origin = adsk.core.Point3D.create(0, 0, 0)
-        axes = [
-            adsk.core.Vector3D.create(1, 0, 0),
-            adsk.core.Vector3D.create(0, 1, 0),
-            adsk.core.Vector3D.create(0, 0, 1),
-        ]
-        matrix = adsk.core.Matrix3D.create()  # identity
-        for axis, angle in zip(axes, angles):
-            rot = adsk.core.Matrix3D.create()
-            rot.setToRotation(math.radians(angle), axis, origin)
-            # this = rot * this  =>  final = Rz . Ry . Rx  (OpenSCAD order)
-            matrix.preTransformBy(rot)
+        """Rotation matrix for an OpenSCAD ``rotate`` vector.
+
+        OpenSCAD composes X-then-Y-then-Z, i.e. ``p' = Rz . Ry . Rx . p``.
+        Composed with pure-python 3x3 math and loaded via ``setWithArray``
+        because this Fusion build's Matrix3D lacks ``preTransformBy``
+        (only ``transformBy`` = right-multiply exists, which would invert
+        the composition order).
+        """
+        ax, ay, az = [math.radians(a) for a in angles]
+        cx, sx = math.cos(ax), math.sin(ax)
+        cy, sy = math.cos(ay), math.sin(ay)
+        cz, sz = math.cos(az), math.sin(az)
+        rx_m = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]]
+        ry_m = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]]
+        rz_m = [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]]
+        m = _mat_mul_3x3(rz_m, _mat_mul_3x3(ry_m, rx_m))  # Rz . Ry . Rx
+        matrix = self.adsk.core.Matrix3D.create()
+        matrix.setWithArray([
+            m[0][0], m[0][1], m[0][2], 0.0,
+            m[1][0], m[1][1], m[1][2], 0.0,
+            m[2][0], m[2][1], m[2][2], 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ])
         return matrix
 
     def _resize_factors(self, body, target):
