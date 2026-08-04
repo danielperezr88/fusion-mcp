@@ -8,6 +8,7 @@ them to the Fusion 360 API on the main thread via custom events.
 
 import adsk.core
 import adsk.fusion
+import base64
 import traceback
 import threading
 import json
@@ -2302,7 +2303,13 @@ def _capture_screenshot(p):
     width = int(p.get("width", 1920))
     height = int(p.get("height", 1080))
     app.activeViewport.saveAsImageFile(path, width, height)
-    return {"screenshot": path, "size": f"{width}x{height}"}
+    with open(path, "rb") as f:
+        png_bytes = f.read()
+    return {
+        "screenshot": path,
+        "size": f"{width}x{height}",
+        "image_base64": base64.b64encode(png_bytes).decode("ascii"),
+    }
 
 
 # ---- History ----
