@@ -113,6 +113,63 @@ def run_code(code, timeout=240):
     return resp.get("output")
 
 
+# ---- document lifecycle helpers (close test-created docs, never leak) ----
+
+def _open_doc_ids():
+    """Snapshot currently-open Fusion document ids via execute_script.
+
+    Returns None when the snapshot cannot be taken (bridge hiccup) so the
+    caller skips cleanup instead of ever closing pre-existing documents.
+    """
+    try:
+        out = run_code(
+            "_ids = []\n"
+            "for _i in range(app.documents.count):\n"
+            "    _ids.append(app.documents.item(_i).creationId)\n"
+            "result['output'] = _ids\n")
+    except Exception:
+        return None
+    return out if isinstance(out, list) else None
+
+
+def _close_docs_except(pre_ids):
+    """Close every open Fusion document whose id is NOT in pre_ids.
+
+    Collects the ids to close FIRST, then re-finds each document before
+    closing (indices shift as documents close -- never close while iterating
+    by index). Each close is guarded so an already-closed document or an API
+    hiccup never fails the test; cleanup never raises. Returns how many
+    documents were closed.
+    """
+    if pre_ids is None:
+        return 0
+    try:
+        n = run_code(
+            "_pre = %s\n"
+            "_ids = []\n"
+            "for _i in range(app.documents.count):\n"
+            "    _d = app.documents.item(_i)\n"
+            "    if _d.creationId not in _pre:\n"
+            "        _ids.append(_d.creationId)\n"
+            "_closed = 0\n"
+            "for _did in _ids:\n"
+            "    for _i in range(app.documents.count):\n"
+            "        _d = app.documents.item(_i)\n"
+            "        if _d.creationId == _did:\n"
+            "            try:\n"
+            "                _d.close(False)\n"
+            "                _closed += 1\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "            break\n"
+            "result['output'] = _closed\n" % repr(pre_ids))
+    except Exception as e:
+        print(f"[cleanup] document close skipped: {e}")
+        return 0
+    print(f"[cleanup] closed {n or 0} test document(s)")
+    return n or 0
+
+
 def fresh_dispatch(command, params, timeout=240):
     """Drive a repo FusionMCP.py handler in a fresh module inside Fusion.
 
@@ -719,7 +776,11 @@ def main():
     print()
 
     _install_server(None)
-    _run_all_checks()
+    pre_ids = _open_doc_ids()
+    try:
+        _run_all_checks()
+    finally:
+        _close_docs_except(pre_ids)
     return _summary()
 
 
@@ -745,7 +806,11 @@ def test_mesh_reconstruction_live_suite(bridge, monkeypatch):
     _results.clear()
     monkeypatch.setattr(sys.modules[__name__], "MODE", "fresh")
     _install_server(monkeypatch)
-    _run_all_checks()
+    pre_ids = _open_doc_ids()
+    try:
+        _run_all_checks()
+    finally:
+        _close_docs_except(pre_ids)
     executed = [r for r in _results if r[1] is not None]
     failed = [(n, d) for n, ok, d in _results if ok is False]
     assert not failed, (

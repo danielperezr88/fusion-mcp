@@ -103,6 +103,72 @@ def fresh_exec(command, params):
         raise BridgeError(f"Could not parse fresh-exec output: {e}")
 
 
+def run_code(code):
+    """Run Python inside Fusion via execute_script; returns parsed output."""
+    resp = call("execute_script", {"code": code})
+    if isinstance(resp, dict) and "error" in resp:
+        raise RuntimeError(
+            "execute_script failed inside Fusion:\n" + str(resp["error"])[:2000])
+    return resp.get("output")
+
+
+# ---- document lifecycle helpers (close test-created docs, never leak) ----
+
+def _open_doc_ids():
+    """Snapshot currently-open Fusion document ids via execute_script.
+
+    Returns None when the snapshot cannot be taken (bridge hiccup) so the
+    caller skips cleanup instead of ever closing pre-existing documents.
+    """
+    try:
+        out = run_code(
+            "_ids = []\n"
+            "for _i in range(app.documents.count):\n"
+            "    _ids.append(app.documents.item(_i).creationId)\n"
+            "result['output'] = _ids\n")
+    except Exception:
+        return None
+    return out if isinstance(out, list) else None
+
+
+def _close_docs_except(pre_ids):
+    """Close every open Fusion document whose id is NOT in pre_ids.
+
+    Collects the ids to close FIRST, then re-finds each document before
+    closing (indices shift as documents close -- never close while iterating
+    by index). Each close is guarded so an already-closed document or an API
+    hiccup never fails the test; cleanup never raises. Returns how many
+    documents were closed.
+    """
+    if pre_ids is None:
+        return 0
+    try:
+        n = run_code(
+            "_pre = %s\n"
+            "_ids = []\n"
+            "for _i in range(app.documents.count):\n"
+            "    _d = app.documents.item(_i)\n"
+            "    if _d.creationId not in _pre:\n"
+            "        _ids.append(_d.creationId)\n"
+            "_closed = 0\n"
+            "for _did in _ids:\n"
+            "    for _i in range(app.documents.count):\n"
+            "        _d = app.documents.item(_i)\n"
+            "        if _d.creationId == _did:\n"
+            "            try:\n"
+            "                _d.close(False)\n"
+            "                _closed += 1\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "            break\n"
+            "result['output'] = _closed\n" % repr(pre_ids))
+    except Exception as e:
+        print(f"[cleanup] document close skipped: {e}")
+        return 0
+    print(f"[cleanup] closed {n or 0} test document(s)")
+    return n or 0
+
+
 def dimension_call(command, params):
     """Call a dimensioning command, honoring the selected mode."""
     if MODE == "http":
@@ -305,6 +371,7 @@ def main():
         print("      new handlers are invoked in-process via execute_script + "
               "fresh-module import.")
     print()
+    pre_ids = _open_doc_ids()
     run_check("create fresh document", check_fresh_document)
     run_check("create box fixture (5x3x2)", check_box_fixture)
     run_check("physical properties: volume", check_volume)
@@ -317,6 +384,7 @@ def main():
     run_check("inspect_body: circle edge", check_circle_edge)
     run_check("failure path: bad body reference", check_failure_path)
 
+    _close_docs_except(pre_ids)
     total = _passed + _failed
     print()
     print(f"{_passed}/{total} checks PASSED")

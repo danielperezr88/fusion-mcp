@@ -68,6 +68,63 @@ def run_code(code):
     return resp.get("output")
 
 
+# ---- document lifecycle helpers (close test-created docs, never leak) ----
+
+def _open_doc_ids():
+    """Snapshot currently-open Fusion document ids via execute_script.
+
+    Returns None when the snapshot cannot be taken (bridge hiccup) so the
+    caller skips cleanup instead of ever closing pre-existing documents.
+    """
+    try:
+        out = run_code(
+            "_ids = []\n"
+            "for _i in range(app.documents.count):\n"
+            "    _ids.append(app.documents.item(_i).creationId)\n"
+            "result['output'] = _ids\n")
+    except Exception:
+        return None
+    return out if isinstance(out, list) else None
+
+
+def _close_docs_except(pre_ids):
+    """Close every open Fusion document whose id is NOT in pre_ids.
+
+    Collects the ids to close FIRST, then re-finds each document before
+    closing (indices shift as documents close -- never close while iterating
+    by index). Each close is guarded so an already-closed document or an API
+    hiccup never fails the test; cleanup never raises. Returns how many
+    documents were closed.
+    """
+    if pre_ids is None:
+        return 0
+    try:
+        n = run_code(
+            "_pre = %s\n"
+            "_ids = []\n"
+            "for _i in range(app.documents.count):\n"
+            "    _d = app.documents.item(_i)\n"
+            "    if _d.creationId not in _pre:\n"
+            "        _ids.append(_d.creationId)\n"
+            "_closed = 0\n"
+            "for _did in _ids:\n"
+            "    for _i in range(app.documents.count):\n"
+            "        _d = app.documents.item(_i)\n"
+            "        if _d.creationId == _did:\n"
+            "            try:\n"
+            "                _d.close(False)\n"
+            "                _closed += 1\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "            break\n"
+            "result['output'] = _closed\n" % repr(pre_ids))
+    except Exception as e:
+        print(f"[cleanup] document close skipped: {e}")
+        return 0
+    print(f"[cleanup] closed {n or 0} test document(s)")
+    return n or 0
+
+
 def fresh_import(handler, params):
     """Drive a FusionMCP.py import handler in a fresh module inside Fusion."""
     inner = (
@@ -159,6 +216,10 @@ def main():
         print(f"Cannot reach Fusion 360 at {FUSION_URL}: {exc}")
         print("Make sure Fusion 360 is open and the FusionMCP add-in is running.")
         return 1
+
+    # Snapshot pre-existing documents so the doc this suite creates can be
+    # closed afterwards (the name is only echoed; the doc stays open forever).
+    pre_ids = _open_doc_ids()
 
     tmp = tempfile.mkdtemp(prefix="fusionmcp_import_live_")
     step_path = os.path.join(tmp, "roundtrip.step")
@@ -261,8 +322,10 @@ def main():
               "not found" in err.lower(), f"error={err!r}")
     except RuntimeError as exc:
         print(f"\nFATAL: {exc}")
+        _close_docs_except(pre_ids)
         return 1
 
+    _close_docs_except(pre_ids)
     passed = sum(1 for _, ok, _ in _results if ok)
     total = len(_results)
     print(f"\n{passed}/{total} checks PASSED")

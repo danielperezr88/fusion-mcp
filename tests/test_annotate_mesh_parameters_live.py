@@ -77,6 +77,92 @@ def run_code(code, timeout=240):
     return resp.get("output")
 
 
+# ---- document lifecycle helpers (close test-created docs, never leak) ----
+
+def _open_doc_ids():
+    """Snapshot currently-open Fusion document ids via execute_script.
+
+    Returns None when the snapshot cannot be taken (bridge hiccup) so the
+    caller skips cleanup instead of ever closing pre-existing documents.
+    """
+    try:
+        out = run_code(
+            "_ids = []\n"
+            "for _i in range(app.documents.count):\n"
+            "    _ids.append(app.documents.item(_i).creationId)\n"
+            "result['output'] = _ids\n")
+    except Exception:
+        return None
+    return out if isinstance(out, list) else None
+
+
+def _close_docs_except(pre_ids):
+    """Close every open Fusion document whose id is NOT in pre_ids.
+
+    Collects the ids to close FIRST, then re-finds each document before
+    closing (indices shift as documents close -- never close while iterating
+    by index). Each close is guarded so an already-closed document or an API
+    hiccup never fails the test; cleanup never raises. Returns how many
+    documents were closed.
+    """
+    if pre_ids is None:
+        return 0
+    try:
+        n = run_code(
+            "_pre = %s\n"
+            "_ids = []\n"
+            "for _i in range(app.documents.count):\n"
+            "    _d = app.documents.item(_i)\n"
+            "    if _d.creationId not in _pre:\n"
+            "        _ids.append(_d.creationId)\n"
+            "_closed = 0\n"
+            "for _did in _ids:\n"
+            "    for _i in range(app.documents.count):\n"
+            "        _d = app.documents.item(_i)\n"
+            "        if _d.creationId == _did:\n"
+            "            try:\n"
+            "                _d.close(False)\n"
+            "                _closed += 1\n"
+            "            except Exception:\n"
+            "                pass\n"
+            "            break\n"
+            "result['output'] = _closed\n" % repr(pre_ids))
+    except Exception as e:
+        print(f"[cleanup] document close skipped: {e}")
+        return 0
+    print(f"[cleanup] closed {n or 0} test document(s)")
+    return n or 0
+
+
+def _activate_last_doc():
+    """Pin app.activeProduct to the newest document before the test body runs.
+
+    create_new_document returns before Fusion's activeProduct finishes
+    switching to the new document; an import right afterwards can land in the
+    PREVIOUS document (intermittent 'Mesh body 0 not found' flake). Activate
+    the newest document explicitly and poll until its design owns the active
+    product. Never raises: if the check cannot be satisfied the caller keeps
+    going (import may land in the wrong doc -- a pre-existing flake).
+    """
+    try:
+        return run_code(
+            "import time\n"
+            "_d = app.documents.item(app.documents.count - 1)\n"
+            "_d.activate()\n"
+            "_ok = False\n"
+            "for _t in range(15):\n"
+            "    _p = app.activeProduct\n"
+            "    if _p is not None and hasattr(_p, 'parentDocument'):\n"
+            "        _pd = _p.parentDocument\n"
+            "        if _pd is not None and _pd.creationId == _d.creationId:\n"
+            "            _ok = True\n"
+            "            break\n"
+            "    time.sleep(0.2)\n"
+            "result['output'] = {'ok': _ok, 'doc': _d.creationId}\n")
+    except Exception:
+        return None
+
+
 def fresh_dispatch(command, params, timeout=240):
     """Drive the repo FusionMCP.py handler in a fresh module inside Fusion.
 
@@ -151,7 +237,11 @@ def _ensure_mesh():
     add-in's dispatcher lacks import_mesh_data too). Returns '0' (index of
     the first mesh body).
     """
-    if _mesh_body_count() == 0:
+    # _mesh_body_count() returns {'mesh_bodies': N} -- comparing the whole
+    # dict to 0 is always False, so the import below silently never ran and
+    # the tests depended on a leftover mesh being present in the active doc
+    # (the historical flake). Read the count out of the dict instead.
+    if _mesh_body_count().get("mesh_bodies", 0) == 0:
         nodes, indices, normals = _unit_cube()
         resp = fresh_dispatch("import_mesh_data", {
             "coordinates": nodes,
@@ -181,6 +271,20 @@ def bridge():
             "Fusion bridge unreachable on http://127.0.0.1:7432 - is Fusion "
             "open and the FusionMCP add-in running?")
     return True
+
+
+@pytest.fixture(autouse=True)
+def _fresh_doc_and_close(bridge):
+    """Create a fresh document (_ensure_mesh needs an active document with a
+    mesh body) and close it -- plus any document the test creates --
+    afterwards. Self-contained: never depends on documents left open by
+    earlier tests."""
+    pre_ids = _open_doc_ids()
+    resp = call("create_new_document", {"name": "T5_annotate_QA"})
+    assert "error" not in resp, f"create_new_document failed: {resp}"
+    _activate_last_doc()
+    yield
+    _close_docs_except(pre_ids)
 
 
 def test_capture_mesh_views_returns_4_png_views(bridge):
