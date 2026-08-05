@@ -206,7 +206,7 @@ Phases are sequential by user specification, but tasks within each phase run in 
   QA scenarios: happy — call decompose with preset="accurate" on a known mesh → more planar faces than preset=None. failure — call with invalid preset name → `ValueError` with allowed values. Evidence: .omo/evidence/task-15-mesh-graph-pipeline.log
   Commit: Y | feat(mesh_analysis): expose tolerance params + presets on decompose (R-9)
 
-- [ ] 16. R-10: trimesh.facets cross-check diagnostic in tests
+- [x] 16. R-10: trimesh.facets cross-check diagnostic in tests
   What to do / Must NOT do: Add a diagnostic function `_compare_with_trimesh_facets(decompose_result, mesh: trimesh.Trimesh)` in mesh_analysis.py (test-only utility, or in `tests/` as a helper). Run `mesh.facets` (which uses trimesh's curvature-adaptive ratio predicate: `(radius/span)^2 > 5000`). Compare our planar_faces group assignments with trimesh's facet assignments. Log discrepancies (where our face count differs from trimesh facet count) as test diagnostics. Also cover known trimesh edge cases (trimesh issue #347 — single-face facets; issue #1745 — splitting with faces on a plane). Write tests: `test_trimesh_facets_cross_check` — decompose a known mesh, run facets, assert our face count ≥ facets count (connectivity constraint → at least as many groups), log differences. Must NOT change production code — test/diagnostic only. Must NOT fail the build — assertions are warnings (use `pytest.warns` or `warnings.warn`).
   Parallelization: Wave W6 | Blocked by: — | Blocks: —
   References: RESEARCH-A L2075-2083 (R-10: trimesh facets predicate, issues #347 and #1745); trimesh graph.py:293 (facets), graph.py:329 (ratio > 5000); tests/test_decompose_faces_fix.py (existing test pattern)
