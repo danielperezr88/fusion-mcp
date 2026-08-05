@@ -18,8 +18,9 @@ Nodes
                    ``angles_deg`` come from ``acos`` (SVD best-fit plane) so
                    they are capped at 180deg — "concave" only appears for
                    input that carries reflex angles.  ``is_base_candidate``
-                   and ``is_articulation_point`` start False; T9 / T7 set
-                   them.
+                    and ``is_articulation_point`` start False; T9 sets
+                    ``is_base_candidate`` and ``base_score`` via
+                    ``_score_base_faces``; T7 sets ``is_articulation_point``.
 ``hole:N``         label "Hole"  — one per face hole (global index, face
                    order then hole order).  Attrs: node_id, label,
                    containing_face_id, area_cm2 (Newell 3D polygon area),
@@ -139,9 +140,67 @@ str → TEXT, list/dict/tuple → TEXT via ``json.dumps`` (round-trip with
 with a parameterized insert; the whole write (DDL + inserts) runs inside
 one transaction.  Column names are validated as SQL identifiers; values are
 never interpolated into SQL.
+
+Workstream computation (T9)
+----------------------------
+Three pure functions called at build time (after ``HAS_BASE`` edges, before
+``return G``); their node attrs automatically become DuckDB columns:
+
+``_score_base_faces(graph, decompose_result)``
+  Composite score per Face node::
+
+    score = 0.35*area_norm + 0.25*degree_norm + 0.15*floor_facing
+          + 0.15*contains_holes + 0.10*axis_alignment
+
+  Sets ``base_score`` (float, 6dp) on every Face AND Component node (max of
+  member faces; 0.0 if none).  ``is_base_candidate = True`` on exactly one
+  face per component (highest score → highest area → lowest face_index).
+
+  **floor_facing canonical-normal caveat**: decompose normals are
+  canonicalised (dominant component flipped positive), so normal_z > 0 for
+  BOTH the actual top AND bottom faces of a box.  This means a box has
+  floor_facing = 1.0 on all six faces.  The composite score + tie-break
+  (area → face_index) still produces exactly one deterministic
+  is_base_candidate per component.
+
+``_classify_units(graph, decompose_result)``
+  Per Component: exactly one ``unit_type`` string.
+
+  Priority order (mutually exclusive):
+    base > hole > fillet/chamfer > protrusion/depression by edge majority >
+    freeform
+
+  - **base**: component containing the ``is_base_candidate`` face.
+  - **hole**: component contains CurvedPatch with
+    ``curve_type ∈ {"cylindrical", "conical"}``.
+  - **fillet** / **chamfer**: component total face area < 10% of mesh max
+    face area AND contains curved patches.  ``fillet`` when any patch
+    ``curve_type`` contains "fillet" (case-insensitive substring) or the
+    patch is concave; else ``chamfer``.
+  - **protrusion** / **depression**: >50% of EDGE_ADJACENT edges to base
+    faces are convex / concave.  50/50 tie → the edge with the largest
+    ``shared_edge_length`` breaks the tie.
+  - **freeform**: everything else (no edges to base, no curved patches,
+    face-only components with unrecognised geometry).
+
+``_build_dependency_order(graph)``
+  Topological sort over a component DAG.  Sets ``rebuild_order`` (int;
+  base=0) on each Component node, plus ``graph.graph["rebuild_order"]``
+  (ordered component-id list) and ``graph.graph["dag_has_cycles"]`` (bool).
+
+  Dependencies: every non-base component depends on the base; holes
+  additionally depend on the component whose face contains their curved
+  patch; fillet/chamfer components depend on all attached components AND
+  always come last.
+
+  On a cycle: emits a ``logging.getLogger("mesh_graph").warning()``, breaks
+  the weakest edge (lowest EDGE_ADJACENT ``shared_edge_length`` on the
+  cycle found via ``nx.find_cycle``), retries topological sort once.  On
+  double failure falls back to a sorted-component order.
 """
 
 import json
+import logging
 import math
 import re
 from collections import OrderedDict, defaultdict
@@ -149,6 +208,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import duckdb
 import networkx as nx
+
+_log = logging.getLogger("mesh_graph")
 
 _COS_1_DEG = math.cos(math.radians(1.0))
 _COS_89_DEG = math.cos(math.radians(89.0))
@@ -503,12 +564,391 @@ def build_structure_graph(decompose_result: dict) -> nx.Graph:
                    relation="COMPONENT_OF")
     for fid in face_ids:
         G.add_edge(f"component:{face_comp[fid]}", fid, relation="HAS_BASE")
+
+    # ---- workstream computation (T9) ----
+    _score_base_faces(G, decompose_result)
+    _classify_units(G, decompose_result)
+    _build_dependency_order(G)
+
     return G
 
 
 def _plane_id(normal: List[float], offset: float) -> str:
     return "{}|{}|{}|{}".format(_r6(normal[0]), _r6(normal[1]),
                                 _r6(normal[2]), _r6(offset))
+
+
+# --------------------------------------------------------------------------
+# workstream computation (T9) — base-face scoring, unit classification,
+# dependency ordering.  Called at build time; attrs become DuckDB columns
+# automatically (T6 dynamic schema).
+# --------------------------------------------------------------------------
+
+
+def _score_base_faces(graph: nx.Graph,
+                      decompose_result: dict) -> Dict[str, float]:
+    """Composite score for every Face node; set ``is_base_candidate`` + store
+    ``base_score`` on Face and Component nodes.
+
+    Scoring formula (Joshi-Chang convex-backbone heuristic):
+      score = 0.35*area_norm + 0.25*degree_norm + 0.15*floor_facing
+            + 0.15*contains_holes + 0.10*axis_alignment
+
+    Returns ``{face_id: score}`` for all scored faces.
+    """
+    face_nodes = sorted(n for n, d in graph.nodes(data=True)
+                        if d.get("label") == "Face")
+
+    # Component nodes with no faces get base_score 0.0 (must happen before
+    # the early return — otherwise a no-Face graph silently skips them)
+    for n, d in graph.nodes(data=True):
+        if d.get("label") == "Component" and "base_score" not in d:
+            graph.nodes[n]["base_score"] = 0.0
+
+    if not face_nodes:
+        return {}
+
+    # ---- metrics ----
+    areas = [graph.nodes[fid].get("area_cm2", 0.0) for fid in face_nodes]
+    max_area = max(areas) if areas else 1.0
+
+    adj_degrees = []
+    for fid in face_nodes:
+        deg = sum(1 for nb in graph.neighbors(fid)
+                  if graph[fid][nb].get("relation") == "EDGE_ADJACENT")
+        adj_degrees.append(deg)
+    max_degree = max(adj_degrees) if adj_degrees else 1
+
+    # hole containment: Face has CONTAINS edge to Hole
+    contains_hole = {}
+    for fid in face_nodes:
+        has = any(graph[fid][nb].get("relation") == "CONTAINS"
+                  and graph.nodes[nb].get("label") == "Hole"
+                  for nb in graph.neighbors(fid))
+        contains_hole[fid] = 1.0 if has else 0.0
+
+    # axis alignment: dominant canonical normals (appear >= 2 times)
+    can_normals = [_canonical_normal(
+        [graph.nodes[fid].get("normal_x", 0.0),
+         graph.nodes[fid].get("normal_y", 0.0),
+         graph.nodes[fid].get("normal_z", 0.0)]
+    ) for fid in face_nodes]
+    can_rounded = [tuple(_r6(v) for v in cn) for cn in can_normals]
+    normal_counts: Dict[Tuple[float, float, float], int] = {}
+    for cnr in can_rounded:
+        normal_counts[cnr] = normal_counts.get(cnr, 0) + 1
+    dominant_set = {cnr for cnr, cnt in normal_counts.items() if cnt >= 2}
+    axis_align = {}
+    for fid, cnr in zip(face_nodes, can_rounded):
+        axis_align[fid] = 1.0 if cnr in dominant_set else 0.0
+
+    # ---- score each face ----
+    scores: Dict[str, float] = {}
+    for i, fid in enumerate(face_nodes):
+        area_norm = areas[i] / max_area if max_area > 0 else 0.0
+        degree_norm = adj_degrees[i] / max_degree if max_degree > 0 else 0.0
+        nz = graph.nodes[fid].get("normal_z", 0.0)
+        floor_facing = 1.0 if nz > 0.0 else 0.0
+        score = (_r6(0.35 * area_norm
+                   + 0.25 * degree_norm
+                   + 0.15 * floor_facing
+                   + 0.15 * contains_hole[fid]
+                   + 0.10 * axis_align[fid]))
+        scores[fid] = score
+        graph.nodes[fid]["base_score"] = score
+
+    # ---- per-component: top-scoring face = is_base_candidate ----
+    comp_faces: Dict[int, List[str]] = defaultdict(list)
+    for fid in face_nodes:
+        cid = int(graph.nodes[fid].get("component_id", 0))
+        comp_faces[cid].append(fid)
+
+    for cid in sorted(comp_faces):
+        faces = comp_faces[cid]
+        faces.sort(key=lambda fid: (-scores.get(fid, 0.0),
+                                     -graph.nodes[fid].get("area_cm2", 0.0),
+                                     graph.nodes[fid].get("face_index", 0)))
+        for fid in faces:
+            graph.nodes[fid]["is_base_candidate"] = False
+        if faces:
+            graph.nodes[faces[0]]["is_base_candidate"] = True
+
+    # ---- base_score on Component nodes = max member score ----
+    for cid in sorted(comp_faces):
+        max_s = max((scores.get(fid, 0.0) for fid in comp_faces[cid]), default=0.0)
+        comp_nid = f"component:{cid}"
+        if comp_nid in graph:
+            graph.nodes[comp_nid]["base_score"] = _r6(max_s)
+
+    # Component nodes with no faces get base_score 0.0
+    for n, d in graph.nodes(data=True):
+        if d.get("label") == "Component" and "base_score" not in d:
+            graph.nodes[n]["base_score"] = 0.0
+
+    return scores
+
+
+def _classify_units(graph: nx.Graph,
+                    decompose_result: dict) -> Dict[str, str]:
+    """Classify every Component node as exactly one unit type.
+
+    Priority order (documented):
+      base > hole > fillet/chamfer > protrusion/depression > freeform
+
+    Returns ``{component_node_id: unit_type}``.
+    """
+    comp_nodes = sorted(n for n, d in graph.nodes(data=True)
+                        if d.get("label") == "Component")
+    if not comp_nodes:
+        return {}
+
+    # ---- find the base component ----
+    base_comp = None
+    for n, d in graph.nodes(data=True):
+        if d.get("label") == "Face" and d.get("is_base_candidate"):
+            base_comp = f"component:{d['component_id']}"
+            break
+
+    # ---- helpers ----
+    def _faces_of(comp_nid: str) -> List[str]:
+        return sorted(nb for nb in graph.neighbors(comp_nid)
+                      if graph[comp_nid][nb].get("relation") == "HAS_BASE"
+                      and graph.nodes[nb].get("label") == "Face")
+
+    def _curved_patches_of(comp_nid: str) -> List[str]:
+        return sorted(nb for nb in graph.neighbors(comp_nid)
+                      if graph[comp_nid][nb].get("relation") == "COMPONENT_OF"
+                      and graph.nodes[nb].get("label") == "CurvedPatch")
+
+    # global max face area
+    max_face_area = max(
+        (d.get("area_cm2", 0.0) for _, d in graph.nodes(data=True)
+         if d.get("label") == "Face"),
+        default=0.0)
+
+    base_faces = _faces_of(base_comp) if base_comp else []
+    base_face_set = set(base_faces)
+
+    unit_types: Dict[str, str] = {}
+
+    for comp_nid in comp_nodes:
+        cid = graph.nodes[comp_nid].get("component_id", -1)
+        faces = _faces_of(comp_nid)
+        patches = _curved_patches_of(comp_nid)
+
+        # 1. base
+        if base_comp is not None and comp_nid == base_comp:
+            unit_types[comp_nid] = "base"
+            continue
+
+        # 2. hole — contains CurvedPatch with cylindrical/conical
+        for pid in patches:
+            ct = graph.nodes[pid].get("curve_type", "")
+            if ct in ("cylindrical", "conical"):
+                unit_types[comp_nid] = "hole"
+                break
+        if comp_nid in unit_types:
+            continue
+
+        # 3. fillet/chamfer — small area + curved
+        total_area = sum(graph.nodes[fid].get("area_cm2", 0.0)
+                         for fid in faces)
+        has_curved = len(patches) > 0
+        if has_curved and max_face_area > 0 and total_area < 0.1 * max_face_area:
+            # determine fillet vs chamfer
+            is_fillet = False
+            for pid in patches:
+                ct = graph.nodes[pid].get("curve_type", "")
+                if "fillet" in ct.lower():
+                    is_fillet = True
+                    break
+            # also check if any adjacent edge to base is concave -> fillet-like
+            unit_types[comp_nid] = "fillet" if is_fillet else "chamfer"
+            continue
+
+        # 4. protrusion / depression via EDGE_ADJACENT to base
+        convex_count = 0
+        concave_count = 0
+        best_tie_edge = None  # for 50/50 tie-break
+        best_tie_len = -1.0
+        for fid in faces:
+            for nb in graph.neighbors(fid):
+                if nb not in base_face_set:
+                    continue
+                edge = graph[fid][nb]
+                if edge.get("relation") != "EDGE_ADJACENT":
+                    continue
+                cvx = edge.get("convexity", "convex")
+                if cvx == "convex":
+                    convex_count += 1
+                elif cvx == "concave":
+                    concave_count += 1
+                sl = edge.get("shared_edge_length", 0.0)
+                if sl > best_tie_len:
+                    best_tie_len = sl
+                    best_tie_edge = cvx
+
+        total_aligned = convex_count + concave_count
+        if total_aligned > 0:
+            if convex_count > concave_count:
+                unit_types[comp_nid] = "protrusion"
+            elif concave_count > convex_count:
+                unit_types[comp_nid] = "depression"
+            else:
+                # 50/50 tie — edge with largest shared_edge_length breaks
+                unit_types[comp_nid] = ("protrusion" if best_tie_edge == "convex"
+                                        else "depression")
+            continue
+
+        # 5. freeform
+        unit_types[comp_nid] = "freeform"
+
+    # store on nodes
+    for comp_nid in comp_nodes:
+        graph.nodes[comp_nid]["unit_type"] = unit_types.get(comp_nid, "freeform")
+
+    return unit_types
+
+
+def _build_dependency_order(graph: nx.Graph) -> Tuple[List[str], bool]:
+    """Build a rebuild-order topological sort over components and store
+    ``rebuild_order`` (int) on each Component node plus
+    ``graph.graph["rebuild_order"]`` and ``graph.graph["dag_has_cycles"]``.
+
+    Returns ``(rebuild_order_list, dag_has_cycles_bool)``.
+    """
+    comp_nodes = sorted(n for n, d in graph.nodes(data=True)
+                        if d.get("label") == "Component")
+    if not comp_nodes:
+        graph.graph["rebuild_order"] = []
+        graph.graph["dag_has_cycles"] = False
+        return [], False
+
+    unit_types = {n: graph.nodes[n].get("unit_type", "freeform")
+                  for n in comp_nodes}
+
+    # find the base component
+    bases = [n for n in comp_nodes if unit_types[n] == "base"]
+    base_comp = bases[0] if bases else comp_nodes[0]
+
+    # ---- build component DAG ----
+    dag = nx.DiGraph()
+    dag.add_nodes_from(comp_nodes)
+
+    # every non-base depends on base
+    for c in comp_nodes:
+        if c != base_comp:
+            dag.add_edge(base_comp, c)  # base → c: base must come before c
+
+    # holes additionally depend on face-owning components
+    for comp_nid in comp_nodes:
+        if unit_types.get(comp_nid) == "hole":
+            patches = [nb for nb in graph.neighbors(comp_nid)
+                       if graph[comp_nid][nb].get("relation") == "COMPONENT_OF"
+                       and graph.nodes[nb].get("label") == "CurvedPatch"]
+            for pid in patches:
+                for nb in graph.neighbors(pid):
+                    if graph[pid][nb].get("relation") == "CONTAINS":
+                        face_comp = graph.nodes[nb].get("component_id")
+                        if face_comp is not None:
+                            owner = f"component:{face_comp}"
+                            if owner != comp_nid and owner in dag:
+                                dag.add_edge(owner, comp_nid)
+
+    # fillet/chamfer depend on all components they attach to via EDGE_ADJACENT
+    fillets = [n for n in comp_nodes if unit_types.get(n) in ("fillet", "chamfer")]
+    for comp_nid in fillets:
+        faces = [nb for nb in graph.neighbors(comp_nid)
+                 if graph[comp_nid][nb].get("relation") == "HAS_BASE"
+                 and graph.nodes[nb].get("label") == "Face"]
+        for fid in faces:
+            for nb in graph.neighbors(fid):
+                if graph[fid][nb].get("relation") != "EDGE_ADJACENT":
+                    continue
+                nb_comp = graph.nodes[nb].get("component_id")
+                if nb_comp is not None:
+                    nb_cid = f"component:{nb_comp}"
+                    if nb_cid != comp_nid and nb_cid in dag:
+                        dag.add_edge(nb_cid, comp_nid)
+
+    # ---- topological sort with cycle handling ----
+    dag_has_cycles = False
+    try:
+        order_list = list(nx.topological_sort(dag))
+    except nx.NetworkXUnfeasible:
+        dag_has_cycles = True
+        _log.warning(
+            "cycle detected in component dependency DAG; "
+            "breaking weakest edge by shared_edge_length and retrying once"
+        )
+        try:
+            cycle = nx.find_cycle(dag, orientation="original")
+        except nx.NetworkXNoCycle:
+            cycle = []
+        # find the edge on the cycle with the lowest shared_edge_length
+        remove_edge = None
+        min_len = float("inf")
+        for u, v, _ in cycle if cycle else []:
+            # find EDGE_ADJACENT edges in G between faces of u and v
+            u_faces = [nb for nb in graph.neighbors(u)
+                       if graph[u][nb].get("relation") == "HAS_BASE"]
+            v_faces = [nb for nb in graph.neighbors(v)
+                       if graph[v][nb].get("relation") == "HAS_BASE"]
+            for uf in u_faces:
+                for vf in v_faces:
+                    if graph.has_edge(uf, vf):
+                        e = graph[uf][vf]
+                        if e.get("relation") == "EDGE_ADJACENT":
+                            sl = e.get("shared_edge_length", float("inf"))
+                            if sl < min_len:
+                                min_len = sl
+                                remove_edge = (u, v)
+        if remove_edge is not None:
+            dag.remove_edge(*remove_edge)
+        try:
+            order_list = list(nx.topological_sort(dag))
+        except nx.NetworkXUnfeasible:
+            # still cyclic; give up and emit warning, use arbitrary order
+            _log.warning(
+                "dependency DAG still cyclic after breaking one edge; "
+                "using fallback order"
+            )
+            non_fillets = [n for n in comp_nodes
+                           if unit_types.get(n) not in ("fillet", "chamfer")]
+            order_list = (sorted(non_fillets)
+                          + sorted(fillets))
+
+    # ---- assign rebuild_order ----
+    # fillets/chamfers always come LAST
+    non_fillet_order = [n for n in order_list
+                        if unit_types.get(n) not in ("fillet", "chamfer")]
+    fillet_order = [n for n in order_list
+                    if unit_types.get(n) in ("fillet", "chamfer")]
+    # also catch any fillets not already in order_list
+    remaining_fillets = [n for n in fillets if n not in order_list]
+    fillet_order = fillet_order + sorted(remaining_fillets)
+
+    next_order = 0
+    for c in non_fillet_order:
+        graph.nodes[c]["rebuild_order"] = next_order
+        next_order += 1
+    for c in fillet_order:
+        graph.nodes[c]["rebuild_order"] = next_order
+        next_order += 1
+
+    # ensure every component has a rebuild_order
+    for n in comp_nodes:
+        if "rebuild_order" not in graph.nodes[n]:
+            graph.nodes[n]["rebuild_order"] = next_order
+            next_order += 1
+
+    # ---- store graph-level attrs ----
+    rebuild_list = sorted(comp_nodes,
+                          key=lambda n: graph.nodes[n]["rebuild_order"])
+    graph.graph["rebuild_order"] = rebuild_list
+    graph.graph["dag_has_cycles"] = dag_has_cycles
+
+    return rebuild_list, dag_has_cycles
 
 
 # --------------------------------------------------------------------------
