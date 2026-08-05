@@ -14,6 +14,7 @@ import os
 import math
 import re
 from decimal import Decimal
+from typing import Optional
 import networkx as nx
 from mcp.server.fastmcp import FastMCP, Image
 
@@ -1427,7 +1428,12 @@ def _cm_to_unit_factor(units: str) -> float:
 
 
 @mcp.tool()
-def analyze_mesh(mesh: str = "0", units: str = "cm") -> str:
+def analyze_mesh(mesh: str = "0", units: str = "cm",
+                  angle_tolerance_deg: Optional[float] = None,
+                  offset_tol: Optional[float] = None,
+                  snap_tol: Optional[float] = None,
+                  simplify_vertices: bool = True,
+                  preset: Optional[str] = None) -> str:
     """
     Analyze a mesh body and report measured facts + a recommended strategy.
 
@@ -1443,6 +1449,24 @@ def analyze_mesh(mesh: str = "0", units: str = "cm") -> str:
     Args:
         mesh:  Body name or index of a mesh body.
         units: Units for the report: mm, cm, or in (default cm).
+        angle_tolerance_deg:
+            Dihedral angle threshold for planar face grouping in degrees
+            (default ``None`` → resolves to ``0.5`` or the preset's angle).
+            An explicit value overrides the preset.
+        offset_tol:
+            Per-plane offset tolerance for coplanarity grouping (cm).
+            Overrides both defaults and preset when provided.
+        snap_tol:
+            Vertex-snap tolerance for seam closure (cm).
+            Overrides both defaults and preset when provided.
+        simplify_vertices:
+            If True (default), collapse nearly-collinear polygon vertices
+            in planar face outlines.
+        preset:
+            Tolerance preset — ``"accurate"``, ``"balanced"``, or
+            ``"coarse"``.  ``"accurate"`` is stricter (more faces);
+            ``"coarse"`` is looser (fewer faces).  Invalid names raise
+            an error.
     """
     try:
         factor = _cm_to_unit_factor(units)
@@ -1463,7 +1487,10 @@ def analyze_mesh(mesh: str = "0", units: str = "cm") -> str:
         mesh_analysis = _load_mesh_analysis()
         report = mesh_analysis.analyze_mesh_data(
             data.get("nodes", []), data.get("indices", []),
-            data.get("normals", []))
+            data.get("normals", []),
+            angle_tolerance_deg=angle_tolerance_deg,
+            offset_tol=offset_tol, snap_tol=snap_tol,
+            simplify_vertices=simplify_vertices, preset=preset)
         report = mesh_analysis.scale_report(report, factor)
     except Exception as e:
         return json.dumps({"error": f"analysis failed: {e}"}, indent=2)
@@ -1499,7 +1526,12 @@ def _base_face_candidates(graph):
 
 
 @mcp.tool()
-def structure_graph(mesh: str = "0", units: str = "cm") -> str:
+def structure_graph(mesh: str = "0", units: str = "cm",
+                     angle_tolerance_deg: Optional[float] = None,
+                     offset_tol: Optional[float] = None,
+                     snap_tol: Optional[float] = None,
+                     simplify_vertices: bool = True,
+                     preset: Optional[str] = None) -> str:
     """
     Build the structure graph of a mesh body and persist it to DuckDB.
 
@@ -1525,6 +1557,24 @@ def structure_graph(mesh: str = "0", units: str = "cm") -> str:
     Args:
         mesh:  Body name or index of a mesh body.
         units: Units for the report: mm, cm, or in (default cm).
+        angle_tolerance_deg:
+            Dihedral angle threshold for planar face grouping in degrees
+            (default ``None`` → resolves to ``0.5`` or the preset's angle).
+            An explicit value overrides the preset.
+        offset_tol:
+            Per-plane offset tolerance for coplanarity grouping (cm).
+            Overrides both defaults and preset when provided.
+        snap_tol:
+            Vertex-snap tolerance for seam closure (cm).
+            Overrides both defaults and preset when provided.
+        simplify_vertices:
+            If True (default), collapse nearly-collinear polygon vertices
+            in planar face outlines.
+        preset:
+            Tolerance preset — ``"accurate"``, ``"balanced"``, or
+            ``"coarse"``.  ``"accurate"`` is stricter (more faces);
+            ``"coarse"`` is looser (fewer faces).  Invalid names raise
+            an error.
     """
     try:
         _cm_to_unit_factor(units)
@@ -1545,7 +1595,10 @@ def structure_graph(mesh: str = "0", units: str = "cm") -> str:
         mesh_analysis = _load_mesh_analysis()
         mesh_graph = _load_mesh_graph()
         decompose_result = mesh_analysis.decompose_mesh_faces(
-            data.get("nodes", []), data.get("indices", []))
+            data.get("nodes", []), data.get("indices", []),
+            angle_tolerance_deg=angle_tolerance_deg,
+            simplify_vertices=simplify_vertices,
+            offset_tol=offset_tol, snap_tol=snap_tol, preset=preset)
         graph = mesh_graph.build_structure_graph(decompose_result)
 
         articulation_points = sorted(nx.articulation_points(graph))

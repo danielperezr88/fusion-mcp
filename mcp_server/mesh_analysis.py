@@ -34,7 +34,7 @@ from __future__ import annotations
 import copy
 import math
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclasses_replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -2062,8 +2062,9 @@ def _extract_curved_patches(welded_verts, welded_tris, planar_tri_set,
     return patches
 
 
-def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
-                         simplify_vertices=True):
+def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=None,
+                         simplify_vertices=True, offset_tol=None,
+                         snap_tol=None, simp_tol=None, preset=None):
     """Decompose mesh into planar faces and curved patches.
 
     Returns a dict with ``components_detected``, ``planar_faces``, and
@@ -2073,6 +2074,32 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
     ``warnings`` list of per-face residual non-manifold edge warnings.
     Curved patches report triangle count, area, and a fitted surface
     classification (cylinder / sphere / cone / freeform).
+
+    Args:
+        nodes: Vertex coordinates (flat list or list of triples).
+        indices: Triangle corner indices (flat list or list of triples).
+        angle_tolerance_deg:
+            Dihedral angle threshold for planar grouping in degrees.
+            Default (``None``) resolves to ``0.5``, or the preset value
+            when a preset is active.  An explicit value always wins.
+        simplify_vertices:
+            If True (default), collapse nearly-collinear polygon vertices
+            in the 2D outline via ``simp_tol``.
+        offset_tol:
+            Per-plane offset tolerance for coplanarity grouping (cm).
+            Overrides both defaults and preset values when provided.
+        snap_tol:
+            Vertex-snap tolerance for seam closure (cm).  Overrides
+            both defaults and preset values when provided.
+        simp_tol:
+            Polygon simplification tolerance (cm).  Overrides both
+            defaults and preset values when provided.
+        preset:
+            Optional tolerance preset — one of ``"accurate"``, ``"balanced"``,
+            ``"coarse"``.  ``"accurate"`` uses extent-relative tolerances
+            an order of magnitude tighter than defaults; ``"coarse"``
+            uses looser tolerances; ``"balanced"`` keeps the defaults.
+            Invalid preset names raise ``ValueError``.
 
     Bug fixes (2026-08-04):
       * **Bug A** – weld vertices FIRST (numpy-safe rounded-key dedupe), then
@@ -2102,6 +2129,47 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
         extent = _max_extent_nodes(node_list)
         quant_step = _detect_quantization_step(node_list)
         tol = _ToleranceConfig.from_(quant_step, extent)
+
+        # R-9: resolve preset + individual tolerance overrides
+        # angle_tolerance_deg=None means "use default or preset" at every
+        # layer (decompose_mesh_faces, analyze_mesh_data, and the MCP tools
+        # all default to None and forward it), so the sentinel always
+        # reaches this resolution point unless the caller passed an explicit
+        # value.
+        if angle_tolerance_deg is None:
+            effective_angle = 0.5  # default
+        else:
+            effective_angle = float(angle_tolerance_deg)
+
+        if preset is not None:
+            preset = preset.lower()
+            if preset == "accurate":
+                if angle_tolerance_deg is None:
+                    effective_angle = 0.1
+                tol = _dataclasses_replace(tol,
+                    offset_tol=max(1e-8, 1e-6 * extent),
+                    snap_tol=max(1e-8, 1e-6 * extent))
+            elif preset == "balanced":
+                # defaults — effective_angle already resolved above
+                pass
+            elif preset == "coarse":
+                if angle_tolerance_deg is None:
+                    effective_angle = 1.0
+                tol = _dataclasses_replace(tol,
+                    offset_tol=max(1e-6, 1e-3 * extent),
+                    snap_tol=max(1e-5, 1e-3 * extent))
+            else:
+                raise ValueError(
+                    f"unknown preset '{preset}' — "
+                    f"expected one of: accurate, balanced, coarse")
+
+        if offset_tol is not None:
+            tol = _dataclasses_replace(tol, offset_tol=float(offset_tol))
+        if snap_tol is not None:
+            tol = _dataclasses_replace(tol, snap_tol=float(snap_tol))
+        if simp_tol is not None:
+            tol = _dataclasses_replace(tol, simp_tol=float(simp_tol))
+
         welded_verts, welded_tris = _weld_vertices(node_list, raw_tris,
                                                     tol.weld_eps)
 
@@ -2125,7 +2193,7 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
 
         # --- Planar grouping (angle_tolerance_deg wired through, Bug D) ---
         planar_groups = _group_planar_triangles(
-            v_arr, f_arr, tri_normals, angle_tolerance_deg, extent, tol=tol)
+            v_arr, f_arr, tri_normals, effective_angle, extent, tol=tol)
 
         planar_tri_set: set = set()
         planar_faces: List[Dict] = []
@@ -2353,7 +2421,13 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
 # --------------------------------------------------------------------------
 
 def analyze_mesh_data(nodes: Sequence, indices: Sequence,
-                      normals: Optional[Sequence] = None) -> Dict:
+                      normals: Optional[Sequence] = None,
+                      angle_tolerance_deg: Optional[float] = None,
+                      offset_tol: Optional[float] = None,
+                      snap_tol: Optional[float] = None,
+                      simp_tol: Optional[float] = None,
+                      simplify_vertices: bool = True,
+                      preset: Optional[str] = None) -> Dict:
     """Analyze a triangle mesh and return the measured-facts report.
 
     Returns a dict with keys: watertight, manifold, vertex_count,
@@ -2361,6 +2435,17 @@ def analyze_mesh_data(nodes: Sequence, indices: Sequence,
     recommended_strategy.  Never raises on empty/degenerate input; raises
     ValueError only for structurally invalid input (flat list lengths not
     divisible by 3, or triangle indices out of range).
+
+    Args:
+        angle_tolerance_deg:
+            Dihedral angle threshold for planar grouping (degrees, default
+            ``None`` → resolves to ``0.5`` or the preset's angle).  An
+            explicit value overrides the preset.
+        offset_tol:  Per-plane offset tolerance (cm, overrides defaults/presets).
+        snap_tol:    Vertex-snap tolerance (cm, overrides defaults/presets).
+        simp_tol:    Polygon simplification tolerance (cm, overrides defaults/presets).
+        simplify_vertices:  If True, collapse nearly-collinear polygon vertices.
+        preset:      Tolerance preset: ``"accurate"``, ``"balanced"``, ``"coarse"``.
     """
     node_list = _as_triples(nodes)
     tri_list = [(int(a), int(b), int(c)) for a, b, c in _as_triples(indices)]
@@ -2439,7 +2524,12 @@ def analyze_mesh_data(nodes: Sequence, indices: Sequence,
     hints = _primitive_hints(node_list, centroids, face_normals, face_areas,
                              bbox_min, bbox_max)
 
-    face_decomp = decompose_mesh_faces(node_list, tri_list)
+    face_decomp = decompose_mesh_faces(
+        node_list, tri_list,
+        angle_tolerance_deg=angle_tolerance_deg,
+        simplify_vertices=simplify_vertices,
+        offset_tol=offset_tol, snap_tol=snap_tol,
+        simp_tol=simp_tol, preset=preset)
 
     return {
         "watertight": watertight,
