@@ -1225,6 +1225,17 @@ def _snap_group_vertices(welded_verts, tri_indices, welded_tris, snap_tol):
     *snap_tol* of each other are merged — this fixes the seam-duplicate
     problem (Bug B residual) where displayMesh emits slightly-offset copies
     of the same corner for adjacent fragments, preventing edge cancellation.
+
+    R-3: O(n) average grid-bucketed spatial hash instead of the former
+    O(n^2) all-pairs scan.  Cell size = *snap_tol*, cell key =
+    ``(floor(x / snap_tol), floor(y / snap_tol), floor(z / snap_tol))``.
+    Two vertices closer than *snap_tol* have per-axis keys differing by at
+    most 1 (|a - b| < tol  =>  |floor(a/tol) - floor(b/tol)| <= 1), so they
+    always land in the same or an adjacent cell: probing the 27-cell
+    neighbourhood finds every in-range pair, and the merge set is identical
+    to the all-pairs scan.  The union rule (smaller root absorbs larger)
+    keeps each cluster's canonical root equal to its smallest vertex index
+    regardless of probe order, so the output remap is unchanged.
     """
     if snap_tol <= 0:
         return {}
@@ -1250,17 +1261,26 @@ def _snap_group_vertices(welded_verts, tri_indices, welded_tris, snap_tol):
         return root
 
     snap_sq = snap_tol * snap_tol
+    cells: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
     for i in range(n):
-        pi = coords[i]
-        for j in range(i + 1, n):
-            diff = coords[j] - pi
-            if float(diff @ diff) < snap_sq:
-                ri, rj = _find(i), _find(j)
-                if ri != rj:
-                    if ri < rj:
-                        parent[rj] = ri
-                    else:
-                        parent[ri] = rj
+        p = coords[i]
+        cell = (int(math.floor(p[0] / snap_tol)),
+                int(math.floor(p[1] / snap_tol)),
+                int(math.floor(p[2] / snap_tol)))
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for u in cells.get((cell[0] + dx, cell[1] + dy,
+                                        cell[2] + dz), ()):
+                        diff = coords[i] - coords[u]
+                        if float(diff @ diff) < snap_sq:
+                            ri, rj = _find(u), _find(i)
+                            if ri != rj:
+                                if ri < rj:
+                                    parent[rj] = ri
+                                else:
+                                    parent[ri] = rj
+        cells[cell].append(i)
 
     remap: Dict[int, int] = {}
     for i, v in enumerate(vi_list):

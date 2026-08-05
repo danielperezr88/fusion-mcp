@@ -38,6 +38,7 @@ from mcp_server.mesh_analysis import (
     _detect_quantization_step,
     _max_extent_nodes,
     _group_planar_triangles,
+    _snap_group_vertices,
 )
 
 
@@ -694,4 +695,177 @@ def test_connectivity_constrained_non_coplanar_adjacent():
     memberships = sorted(sorted(g["tri_indices"]) for g in groups)
     assert memberships == [[0], [1]], (
         f"expected two separate groups, got {memberships}")
+
+
+# ---------------------------------------------------------------------------
+# R-3: grid-bucketed spatial-hash snap (functionally equivalent to O(n^2))
+# ---------------------------------------------------------------------------
+
+def _snap_group_vertices_quadratic_ref(welded_verts, tri_indices, welded_tris,
+                                       snap_tol):
+    """Reference copy of the pre-R-3 O(n^2) all-pairs snapping, kept here
+    test-only so the spatial-hash version can be proven functionally
+    equivalent (same cluster membership)."""
+    if snap_tol <= 0:
+        return {}
+    vi_set = set()
+    for ti in tri_indices:
+        a, b, c = welded_tris[ti]
+        vi_set.update((a, b, c))
+    vi_list = sorted(vi_set)
+    n = len(vi_list)
+    if n < 2:
+        return {}
+    coords = np.array([welded_verts[v] for v in vi_list], dtype=np.float64)
+    parent = list(range(n))
+
+    def _find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    snap_sq = snap_tol * snap_tol
+    for i in range(n):
+        pi = coords[i]
+        for j in range(i + 1, n):
+            diff = coords[j] - pi
+            if float(diff @ diff) < snap_sq:
+                ri, rj = _find(i), _find(j)
+                if ri != rj:
+                    if ri < rj:
+                        parent[rj] = ri
+                    else:
+                        parent[ri] = rj
+
+    remap = {}
+    for i, v in enumerate(vi_list):
+        root = vi_list[_find(i)]
+        if root != v:
+            remap[v] = root
+    return remap
+
+
+def _snap_partition(remap, vi_list):
+    """Canonical cluster partition (groups + sizes) from a snap remap.
+
+    Returns a sorted tuple of sorted tuples of GLOBAL vertex indices, one
+    per cluster.  Comparing partitions (not raw remap dicts) is the
+    functional-equivalence contract: cluster membership must match while the
+    representative per cluster may differ.
+    """
+    roots = {}
+    for v in vi_list:
+        roots.setdefault(remap.get(v, v), []).append(v)
+    return tuple(sorted(tuple(sorted(m)) for m in roots.values()))
+
+
+def _random_snap_group(n_verts, rng, tol, cluster_size=5):
+    """Build (welded_verts, tri_indices, welded_tris) for a planar group of
+    *n_verts* random vertices: points dropped in clusters within tol/3 of a
+    random centre, so intra-cluster merging is guaranteed while clusters sit
+    on random cell boundaries (floor-key grid gets exercised).  Two anchor
+    vertices sit far outside the cluster field."""
+    anchors = [(-1.0, -1.0, 0.0), (2.0, 2.0, 0.0)]
+    pts = list(anchors)
+    n_clusters = max(1, n_verts // cluster_size)
+    for _ in range(n_clusters):
+        cx = float(rng.uniform(0.0, 1.0))
+        cy = float(rng.uniform(0.0, 1.0))
+        for _ in range(cluster_size):
+            pts.append((cx + float(rng.uniform(-1.0, 1.0)) * tol / 3.0,
+                        cy + float(rng.uniform(-1.0, 1.0)) * tol / 3.0,
+                        float(rng.uniform(-1.0, 1.0)) * tol / 3.0))
+    pts = pts[:2 + n_verts]
+    tris = [(0, 2 + i, 3 + i) for i in range(len(pts) - 3)]
+    tris.append((0, len(pts) - 1, 1))
+    return pts, list(range(len(tris))), tris
+
+
+def test_snap_spatial_hash_functionally_equivalent():
+    """The R-3 spatial-hash snap must produce the SAME cluster partition as
+    the O(n^2) all-pairs snap for random inputs of increasing size, and the
+    full decompose pipeline must give the same face count through both
+    paths."""
+    import mcp_server.mesh_analysis as ma
+
+    tol = 0.05
+    for n_verts in (10, 100, 500, 2000):
+        rng = np.random.default_rng(seed=1000 + n_verts)
+        pts, tri_indices, tris = _random_snap_group(n_verts, rng, tol)
+        vi_list = sorted({v for ti in tri_indices for v in tris[ti]})
+        new = ma._snap_group_vertices(pts, tri_indices, tris, tol)
+        ref = _snap_group_vertices_quadratic_ref(pts, tri_indices, tris, tol)
+        assert _snap_partition(new, vi_list) == _snap_partition(ref, vi_list), (
+            f"n_verts={n_verts}: cluster partitions differ "
+            f"new={_snap_partition(new, vi_list)!r} "
+            f"ref={_snap_partition(ref, vi_list)!r}")
+
+    # Full pipeline through both snap paths -> same face count and area.
+    d = 0.00015
+    nodes = [
+        0, 0, 0,  2, 0, 0,  2, 1, 0,  0, 1, 0,
+        2 + d, 0, 0,  4, 0, 0,  4, 1, 0,
+        2 + d, 1, 0,  2, 1, 0,
+    ]
+    indices = [0, 1, 2,  0, 2, 3,  4, 5, 6,  4, 6, 7]
+    orig = ma._snap_group_vertices
+    try:
+        ma._snap_group_vertices = _snap_group_vertices_quadratic_ref
+        ref_result = decompose_mesh_faces(nodes, indices)
+    finally:
+        ma._snap_group_vertices = orig
+    new_result = decompose_mesh_faces(nodes, indices)
+    ref_faces = ref_result["planar_faces"]
+    new_faces = new_result["planar_faces"]
+    assert len(new_faces) == len(ref_faces) == 1, (
+        f"face counts differ: new={len(new_faces)} ref={len(ref_faces)}")
+    assert new_faces[0]["area"] == pytest.approx(ref_faces[0]["area"],
+                                                 abs=1e-3)
+
+
+def test_snap_gap_barely_exceeding_tol_not_merged():
+    """A gap just ABOVE snap_tol must NOT merge; a gap just BELOW it must.
+    The exact-tolerance boundary (vertex on the cell boundary) must also not
+    merge — the strict ``< snap_sq`` predicate is preserved."""
+    tol = 0.01
+    just_over = (tol + 1e-9, 0.0, 0.0)
+    exact = (tol, 0.0, 0.0)
+    just_under = (tol - 1e-9, 0.0, 0.0)
+
+    # gap > snap_tol -> NOT merged (spatial hash must agree with ref).
+    pts = [(0.0, 0.0, 0.0), just_over]
+    tris = [(0, 1, 0)]
+    assert _snap_group_vertices_quadratic_ref(pts, [0], tris, tol) == {}
+    assert _snap_group_vertices(pts, [0], tris, tol) == {}, (
+        "gap barely exceeding snap_tol must not merge")
+
+    # gap == snap_tol (cell boundary straddle) -> NOT merged.
+    pts_exact = [(0.0, 0.0, 0.0), exact]
+    assert _snap_group_vertices(pts_exact, [0], [(0, 1, 0)], tol) == {}, (
+        "gap exactly snap_tol must not merge (strict predicate)")
+
+    # gap < snap_tol -> merged, smaller index (0) absorbs larger (1).
+    pts_under = [(0.0, 0.0, 0.0), just_under]
+    merged = _snap_group_vertices(pts_under, [0], [(0, 1, 0)], tol)
+    assert merged == {1: 0}, f"gap below tol should merge, got {merged!r}"
+
+
+def test_snap_spatial_hash_5000_vertices_fast():
+    """A 5000-vertex group snaps in well under the 5 s CI budget (the
+    O(n^2) all-pairs scan would take ~10x longer at this size)."""
+    import time
+
+    rng = np.random.default_rng(seed=20260805)
+    tol = 0.01
+    pts, tri_indices, tris = _random_snap_group(5000, rng, tol)
+    t0 = time.perf_counter()
+    remap = _snap_group_vertices(pts, tri_indices, tris, tol)
+    elapsed = time.perf_counter() - t0
+    assert isinstance(remap, dict)
+    assert elapsed < 5.0, f"spatial-hash snap took {elapsed:.3f}s (> 5 s)"
+    # Sanity: the clustered input must actually have merged something.
+    assert len(remap) > 0, "expected merges from clustered input"
 
