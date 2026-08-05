@@ -2490,6 +2490,123 @@ def _compare_mesh_brep(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _create_sketch_from_polygon(root, p: dict) -> dict:
+    """Create a sketch from polygon vertices and extrude it.
+
+    Receives one or more polygon vertex lists (each a closed loop of
+    [x, y, z] points in display units) and creates a native Fusion sketch
+    on a construction plane parallel to XY at *plane_height*, then
+    optionally extrudes each closed profile.  The x,y components are used
+    as sketch-space coordinates; z is ignored (the construction plane
+    handles the vertical position).  Coordinates are converted from the
+    requested display *units* to Fusion's internal cm.
+
+    params:
+      polygons:          list of polygon vertex lists, each [[x,y,z], ...].
+      plane_height:      Z height for the sketch plane (display units, default 0).
+      extrude_height:    extrusion distance (display units, 0 = no extrude).
+      extrude_direction: "positive" (default), "negative", or "symmetric".
+      units:             mm / cm / in (display units, converted to cm internally).
+      operation:         "new_body" (default), "join", "cut".
+      target_body:       body name/index for join/cut operations.
+    """
+    try:
+        polygons = p.get("polygons") or p.get("polygon")
+        if not polygons or not isinstance(polygons, list):
+            return {"error": "No polygons provided. Provide 'polygons' as a list of vertex lists."}
+        # Accept a single polygon (flat vertex list) for convenience.
+        if polygons and isinstance(polygons[0], (int, float)):
+            polygons = [polygons]
+
+        units = str(p.get("units", "cm") or "cm").lower()
+        if units not in _UNIT_TO_CM:
+            return {"error": f"Unsupported units '{units}'. Use 'mm', 'cm', or 'in'."}
+        f = _UNIT_TO_CM[units]
+
+        plane_height_cm = float(p.get("plane_height", 0)) * f
+        extrude_height_raw = float(p.get("extrude_height", 0))
+        extrude_direction = str(p.get("extrude_direction", "positive")).strip().lower()
+        operation = p.get("operation", "new_body")
+
+        design = _design()
+        if design is None:
+            return {"error": "No active Fusion 360 design. Open or create one first."}
+
+        before_body_count = root.bRepBodies.count
+        before_timeline = design.timeline.count
+
+        if abs(plane_height_cm) > 1e-9:
+            planes = root.constructionPlanes
+            plane_input = planes.createInput()
+            plane_input.setByOffset(
+                root.xYConstructionPlane,
+                adsk.core.ValueInput.createByReal(plane_height_cm))
+            sketch_plane = planes.add(plane_input)
+        else:
+            sketch_plane = root.xYConstructionPlane
+
+        sketch = root.sketches.add(sketch_plane)
+        sketch.name = "face_polygon_sketch"
+        sketch.isComputeDeferred = False
+        lines = sketch.sketchCurves.sketchLines
+
+        for poly in polygons:
+            if not isinstance(poly, list) or len(poly) < 3:
+                continue
+            pts = []
+            for vertex in poly:
+                if isinstance(vertex, (int, float)):
+                    continue
+                x = float(vertex[0]) * f
+                y = float(vertex[1]) * f
+                pts.append(adsk.core.Point3D.create(x, y, 0.0))
+            if len(pts) < 3:
+                continue
+            for i in range(len(pts)):
+                lines.addByTwoPoints(pts[i], pts[(i + 1) % len(pts)])
+
+        if sketch.profiles.count == 0:
+            sketch.deleteMe()
+            return {"error": "The polygon vertices did not form any closed profile."}
+
+        body_names = []
+        if extrude_height_raw > 0:
+            height_cm = extrude_height_raw * f
+            signed_height = height_cm
+            is_symmetric = False
+            if extrude_direction == "symmetric":
+                is_symmetric = True
+            elif extrude_direction == "negative":
+                signed_height = -height_cm
+
+            for i in range(sketch.profiles.count):
+                profile = sketch.profiles.item(i)
+                ext_input = root.features.extrudeFeatures.createInput(
+                    profile, _op(operation))
+                ext_input.setDistanceExtent(
+                    is_symmetric,
+                    adsk.core.ValueInput.createByReal(signed_height))
+                feature = root.features.extrudeFeatures.add(ext_input)
+                for j in range(feature.bodies.count):
+                    body_names.append(feature.bodies.item(j).name)
+
+        bodies_created = root.bRepBodies.count - before_body_count
+        features_created = design.timeline.count - before_timeline
+        body_name = body_names[0] if body_names else ""
+
+        return {
+            "created": True,
+            "method": "polygon_extrude",
+            "bodies": bodies_created,
+            "features": features_created,
+            "bodies_created": bodies_created,
+            "body_name": body_name,
+            "sketch_name": sketch.name,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _update_scad_body(root, p: dict) -> dict:
     try:
         ref = p.get("body", 0)
@@ -2918,6 +3035,7 @@ def _process_command(data: dict) -> dict:
             "revolve_cross_section":      lambda: _revolve_cross_section(root, p),
             "mesh_convert":               lambda: _mesh_convert(root, p),
             "compare_mesh_brep":          lambda: _compare_mesh_brep(root, p),
+            "create_sketch_from_polygon": lambda: _create_sketch_from_polygon(root, p),
         }
 
         if cmd in dispatch:

@@ -11,6 +11,7 @@ import json
 import base64
 import importlib.util
 import os
+import math
 from mcp.server.fastmcp import FastMCP, Image
 
 FUSION_URL = "http://127.0.0.1:7432"
@@ -1649,6 +1650,153 @@ def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
                                         _count_csg_nodes(tree))
     except Exception as e:
         return json.dumps({"error": f"reconstruction failed: {e}"}, indent=2)
+
+
+@mcp.tool()
+def reconstruct_from_faces(mesh: str = "0", units: str = "mm") -> str:
+    """Reconstruct a mesh body using exact face polygon boundaries.
+
+    Analyzes the mesh, extracts planar face decomposition, identifies the
+    dominant extrusion direction, and creates native Fusion sketches +
+    extrudes from the actual polygon vertices (not box-fitted
+    approximations).  Best for prismatic parts with planar faces.
+
+    Args:
+        mesh:  Body name or index of a mesh body.
+        units: Units for the reconstructed model: mm, cm, or in
+               (default mm).
+    """
+    try:
+        factor = _cm_to_unit_factor(units)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    raw = _call("extract_mesh_data", {"mesh": mesh})
+    if raw.startswith("Error: "):
+        return json.dumps({"error": raw[len("Error: "):]}, indent=2)
+    if raw.startswith(("Cannot reach", "Unexpected error")):
+        return raw
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if "error" in data:
+        return json.dumps({"error": data["error"]}, indent=2)
+    try:
+        mesh_analysis = _load_mesh_analysis()
+        report = mesh_analysis.analyze_mesh_data(
+            data.get("nodes", []), data.get("indices", []),
+            data.get("normals", []))
+    except ImportError:
+        return json.dumps({
+            "error": "Face decomposition requires trimesh. "
+                     "Install it with: pip install trimesh numpy"}, indent=2)
+    except Exception as e:
+        return json.dumps({"error": f"analysis failed: {e}"}, indent=2)
+
+    face_decomp = report.get("face_decomposition") or {}
+    planar_faces = face_decomp.get("planar_faces", [])
+    if not planar_faces:
+        return json.dumps({
+            "error": "No planar faces found in face decomposition. "
+                     "This tool is best for prismatic parts with flat faces."
+        }, indent=2)
+
+    try:
+        axis_areas = {0: 0.0, 1: 0.0, 2: 0.0}
+        for face in planar_faces:
+            normal = face.get("normal", [0, 0, 1])
+            area = float(face.get("area", 0))
+            abs_n = [abs(c) for c in normal]
+            dom_axis = abs_n.index(max(abs_n))
+            axis_areas[dom_axis] += area
+        dominant_axis = max(axis_areas, key=axis_areas.get)
+
+        def axis_value(vertex):
+            return float(vertex[dominant_axis])
+
+        pos_faces = []
+        neg_faces = []
+        for face in planar_faces:
+            normal = face.get("normal", [0, 0, 1])
+            abs_n = [abs(c) for c in normal]
+            face_dom = abs_n.index(max(abs_n))
+            if face_dom != dominant_axis:
+                continue
+            if normal[dominant_axis] >= 0:
+                pos_faces.append(face)
+            else:
+                neg_faces.append(face)
+
+        def mean_axis(face):
+            verts = face.get("vertices", [])
+            if not verts:
+                return 0.0
+            return sum(axis_value(v) for v in verts) / len(verts)
+
+        def best_face(group):
+            if not group:
+                return None
+            return max(group, key=lambda f: float(f.get("area", 0)))
+
+        top_face = best_face(pos_faces)
+        bottom_face = best_face(neg_faces)
+
+        bbox = report.get("bounding_box_cm") or report.get("bbox_cm")
+        bbox_height = None
+        if isinstance(bbox, list) and len(bbox) >= 2:
+            try:
+                bbox_height = abs(float(bbox[1][dominant_axis]) -
+                                 float(bbox[0][dominant_axis]))
+            except (IndexError, TypeError):
+                pass
+
+        if top_face and bottom_face:
+            top_z = mean_axis(top_face)
+            bottom_z = mean_axis(bottom_face)
+            extrude_height_cm = abs(top_z - bottom_z)
+        elif top_face or bottom_face:
+            primary = top_face or bottom_face
+            primary_z = mean_axis(primary)
+            if bbox_height and bbox_height > 0:
+                extrude_height_cm = bbox_height
+            else:
+                verts = primary.get("vertices", [])
+                zs = [axis_value(v) for v in verts]
+                extrude_height_cm = max(zs) - min(zs) if zs else 1.0
+                if extrude_height_cm < 1e-6:
+                    extrude_height_cm = 1.0
+        else:
+            extrude_height_cm = bbox_height or 1.0
+
+        if extrude_height_cm < 1e-6:
+            extrude_height_cm = bbox_height or 1.0
+
+        profile_face = top_face or bottom_face or best_face(planar_faces)
+        if not profile_face:
+            return json.dumps({"error": "Could not select a profile face."}, indent=2)
+
+        axis_map = {0: (1, 2), 1: (0, 2), 2: (0, 1)}
+        sketch_axes = axis_map[dominant_axis]
+        polygon_scaled = []
+        for vertex in profile_face.get("vertices", []):
+            sx = float(vertex[sketch_axes[0]]) * factor
+            sy = float(vertex[sketch_axes[1]]) * factor
+            sz = float(vertex[dominant_axis]) * factor
+            polygon_scaled.append([round(sx, 6), round(sy, 6), round(sz, 6)])
+
+        extrude_height_units = extrude_height_cm * factor
+
+        result = _call("create_sketch_from_polygon", {
+            "polygons": [polygon_scaled],
+            "plane_height": 0,
+            "extrude_height": round(extrude_height_units, 6),
+            "units": units,
+            "operation": "new_body",
+        }, timeout=330)
+        return _envelope_reconstruction(
+            result, "face_reconstruction", "polygon_extrude", 0)
+    except Exception as e:
+        return json.dumps({"error": f"face reconstruction failed: {e}"}, indent=2)
 
 
 @mcp.tool()

@@ -3,3 +3,6 @@ requests>=2.31.0
 openscad-lalr-parser>=1.1.0
 openscad-evaluator>=1.1.0
 manifold3d>=3.5.2
+numpy>=1.24.0
+trimesh>=4.0.0
+scipy>=1.10.0
