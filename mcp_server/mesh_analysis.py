@@ -34,12 +34,135 @@ from __future__ import annotations
 import copy
 import math
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import trimesh
 
 Float3 = Tuple[float, float, float]
+
+
+# ==========================================================================
+# R-6: Unified tolerance model
+# ==========================================================================
+
+@dataclass(frozen=True)
+class _ToleranceConfig:
+    """Unified tolerance model computed once from (quant_step, extent).
+
+    All values derived per the R-1/R-6 formulas.  ``tjunc_tol`` equals
+    ``snap_tol`` by construction.  R-9 presets can override individual
+    fields (offset_tol / snap_tol / simp_tol) by constructing an instance
+    directly rather than via ``from_()``.
+    """
+    quant_step: float
+    extent: float
+    weld_eps: float
+    snap_tol: float
+    offset_tol: float
+    simp_tol: float
+    tjunc_tol: float
+
+    @classmethod
+    def from_(cls, quant_step: float, extent: float) -> "_ToleranceConfig":
+        """Build config from the quantization step and model extent.
+
+        Uses the max-form formulas from R-1 (identical weld_eps, snap_tol).
+        """
+        weld = max(max(1e-9, 1e-7 * extent), 3 * quant_step)
+        snap = max(1e-5, max(5e-4 * extent, 2 * quant_step))
+        return cls(
+            quant_step=quant_step,
+            extent=extent,
+            weld_eps=weld,
+            snap_tol=snap,
+            offset_tol=max(1e-6, 1e-4 * extent),
+            simp_tol=max(1e-6, 1e-4 * extent),
+            tjunc_tol=snap,
+        )
+
+
+def _smallest_eigenvector_3x3(cov):
+    """Closed-form smallest eigenvector of a 3×3 symmetric covariance matrix.
+
+    Derivation — analytic cubic formula + adjugate nullspace:
+
+    1. Characteristic polynomial  λ³ + a₁λ² + a₂λ + a₃ = 0  where
+       a₁=−tr(C), a₂=sum of principal 2×2 minors, a₃=−det(C).
+    2. Depress: let  λ = t − a₁/3  →  t³ + pt + q = 0.
+    3. For a *symmetric* matrix all eigenvalues are real → p ≤ 0,
+       three real roots via the trigonometric solution:
+         r = √(−p/3),  φ = ⅓·acos(−q/(2r³)),
+         t₀,₁,₂ = 2r·cos(φ + 2πk/3)  (k=0,1,2).
+    4. Smallest eigenvalue  λ_min = min(tₖ) − a₁/3.
+    5. Eigenvector = any nonzero row of  adj(C − λ_min·I).
+       Use row-0 cofactors; fall back to rows 1, 2 if zero.
+
+    O(1), no numpy linear algebra.  Returns a **unit-length**
+    ``np.ndarray(3, dtype=np.float64)``.  Degenerate covariances
+    (all points coincident) return the Z-axis unit vector.
+    """
+    # ── unpack symmetric 3×3 elements (row-major) ──
+    a, b, c = float(cov[0, 0]), float(cov[0, 1]), float(cov[0, 2])
+    d, e, f = float(cov[1, 1]), float(cov[1, 2]), float(cov[2, 2])
+    # (cov[1,0]=b, cov[2,0]=c, cov[2,1]=e — symmetry assumed)
+
+    # ── characteristic polynomial coefficients ──
+    a1 = -(a + d + f)
+    a2 = (a * d - b * b) + (a * f - c * c) + (d * f - e * e)
+    a3 = -(a * (d * f - e * e) - b * (b * f - c * e) + c * (b * e - c * d))
+
+    # ── depressed cubic: t³ + p·t + q = 0 ──
+    p = a2 - a1 * a1 / 3.0
+    q = 2.0 * a1 * a1 * a1 / 27.0 - a1 * a2 / 3.0 + a3
+
+    eps_c = 1e-15
+    if abs(p) < eps_c:
+        # p ≈ 0 → t³ = −q → three equal real roots
+        t_root = -math.copysign(abs(q) ** (1.0 / 3.0), q) if abs(q) > eps_c else 0.0
+        lam = t_root - a1 / 3.0
+        eigs = [lam, lam, lam]
+    else:
+        r = math.sqrt(-p / 3.0)
+        arg = -q / (2.0 * r * r * r)
+        arg = max(-1.0, min(1.0, arg))            # clamp for float safety
+        theta = math.acos(arg) / 3.0
+        pi23 = 2.0 * math.pi / 3.0
+        eigs = [2.0 * r * math.cos(theta + k * pi23) - a1 / 3.0
+                for k in (0, 1, 2)]
+
+    lam_min = min(eigs)
+
+    # ── eigenvector via adjugate row cofactors ──
+    m00, m01, m02 = a - lam_min, b, c
+    m10, m11, m12 = b, d - lam_min, e
+    m20, m21, m22 = c, e, f - lam_min
+
+    z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    def _cofactor_row(r):
+        # Row-0,1,2 cofactor triples of M = C − λ_min·I
+        if r == 0:
+            return (m11 * m22 - m12 * m21,
+                    m12 * m20 - m10 * m22,
+                    m10 * m21 - m11 * m20)
+        if r == 1:
+            return (m02 * m21 - m01 * m22,
+                    m00 * m22 - m02 * m20,
+                    m01 * m20 - m00 * m21)
+        return (m01 * m12 - m02 * m11,
+                m02 * m10 - m00 * m12,
+                m00 * m11 - m01 * m10)
+
+    for row in (0, 1, 2):
+        vx, vy, vz = _cofactor_row(row)
+        vn = vx * vx + vy * vy + vz * vz
+        if vn > 1e-20:
+            inv = 1.0 / math.sqrt(vn)
+            return np.array([vx * inv, vy * inv, vz * inv], dtype=np.float64)
+
+    return z  # fully degenerate covariance
 
 _CLUSTER_ANGLE_DEG = 15.0      # normal clustering angular threshold
 _CYL_SIDE_ANGLE_DEG = 85.0     # normals within 5 deg of perpendicular = "side"
@@ -1029,7 +1152,71 @@ def _cluster_near_vertices(v_arr, tol):
     return out
 
 
-def _group_planar_triangles(v_arr, f_arr, tri_normals, angle_tol_deg, extent):
+def _triangle_centroid(v_arr, f_arr, ti):
+    """Centroid of triangle *ti* as a (float, float, float) tuple."""
+    a = v_arr[f_arr[ti, 0]]
+    b = v_arr[f_arr[ti, 1]]
+    c = v_arr[f_arr[ti, 2]]
+    return ((a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0)
+
+
+def _accept_by_running_plane_fit(face_centroid, face_normal,
+                                  centroid_sum, cov_sum, cnt,
+                                  seed_normal, offset_tol, cos_tol):
+    """R-7 running-plane-fit acceptance predicate.
+
+    Reconstructs the refit plane normal from the ACCUMULATED centroid
+    covariance of already-accepted triangles (O(1), 3x3 analytic
+    eigenvector), then tests whether *face_centroid* lies within
+    *offset_tol* of that plane AND *face_normal* agrees with the refit
+    normal within *cos_tol*.
+
+    When *cnt* < 3 (fewer than 3 centroids) the covariance is rank-
+    deficient (2 points → line, 1 point → point) and the smallest
+    eigenvector is underdetermined.  In that regime the seed's own plane
+    normal is used — this is correct for truly coplanar triangles and
+    avoids rejecting valid neighbours during the initial expansion.
+    """
+    if cnt == 0:
+        return True
+    if cnt < 3:
+        refit_n = seed_normal
+        mx = centroid_sum[0] / cnt
+        my = centroid_sum[1] / cnt
+        mz = centroid_sum[2] / cnt
+    else:
+        inv = 1.0 / cnt
+        mx = centroid_sum[0] * inv
+        my = centroid_sum[1] * inv
+        mz = centroid_sum[2] * inv
+        cov = np.array([
+            [cov_sum[0][0] * inv - mx * mx,
+             cov_sum[0][1] * inv - mx * my,
+             cov_sum[0][2] * inv - mx * mz],
+            [cov_sum[0][1] * inv - mx * my,
+             cov_sum[1][1] * inv - my * my,
+             cov_sum[1][2] * inv - my * mz],
+            [cov_sum[0][2] * inv - mx * mz,
+             cov_sum[1][2] * inv - my * mz,
+             cov_sum[2][2] * inv - mz * mz],
+        ], dtype=np.float64)
+        refit_n = _smallest_eigenvector_3x3(cov)
+
+    nu = face_normal
+    dot = abs(float(nu[0] * refit_n[0] + nu[1] * refit_n[1] + nu[2] * refit_n[2]))
+    if dot < cos_tol:
+        return False
+    cx, cy, cz = face_centroid
+    d = abs(refit_n[0] * (cx - mx)
+            + refit_n[1] * (cy - my)
+            + refit_n[2] * (cz - mz))
+    return d < offset_tol
+
+
+def _group_planar_triangles(v_arr, f_arr, tri_normals, angle_tol_deg, extent,
+                            tol=None):
     """Greedy-group triangles by coplanarity (normal within *angle_tol_deg*,
     plane offset within tol).
 
@@ -1039,17 +1226,24 @@ def _group_planar_triangles(v_arr, f_arr, tri_normals, angle_tol_deg, extent):
     R-2: a connectivity-constrained region-growing FIRST PASS is the primary
     path.  Regions are grown from the largest-area unassigned triangle over
     edge-adjacent faces (edge map over the welded soup, with near-coincident
-    seam vertices clustered first) using the same coplanarity predicate as
-    the global path.  Any triangle the connectivity pass cannot place falls
-    through to the unchanged global first-match path.  Deterministic: seeds
-    by largest area (smallest index on ties), neighbors traversed in sorted
-    index order, groups emitted in seed order.
+    seam vertices clustered first) using the coplanarity predicate.  Any
+    triangle the connectivity pass cannot place falls through to the
+    unchanged global first-match path.  Deterministic: seeds by largest area
+    (smallest index on ties), neighbors traversed in sorted index order,
+    groups emitted in seed order.
+
+    R-7: when *tol* is a ``_ToleranceConfig``, the connectivity pass uses a
+    RUNNING plane-fit (accumulated centroid covariance → smallest eigenvector
+    → refit plane) instead of the static first-match predicate, removing
+    seed-order bias.  When *tol* is None the original static predicate
+    ``_coplanar_with_region`` is used (backward-compat).
     """
     cos_tol = math.cos(math.radians(angle_tol_deg))
-    offset_tol = max(1e-6, 1e-4 * extent)
-    # Edge-coincidence tolerance = extent-based floor of snap_tol: edges
-    # closer than this are the same seam edge (duplicated at exporter
-    # precision) and must merge here, or touching seam faces would split.
+    use_running_fit = tol is not None
+    if use_running_fit:
+        offset_tol = tol.offset_tol
+    else:
+        offset_tol = max(1e-6, 1e-4 * extent)
     edge_adj_tol = max(1e-5, 5e-4 * extent)
 
     n_faces = len(f_arr)
@@ -1103,6 +1297,11 @@ def _group_planar_triangles(v_arr, f_arr, tri_normals, angle_tol_deg, extent):
     groups: List[Dict] = []
 
     # --- Connectivity-constrained first pass (primary) ---
+    # R-7: when *tol* is provided, uses a running plane-fit residual
+    # (accumulated centroid covariance → smallest eigenvector → refit plane)
+    # instead of the static seed-plane predicate.  This removes seed-order
+    # bias while preserving connectivity semantics (region still grows from
+    # edge-adjacent seeds).
     seed_order = sorted(
         (ti for ti in range(n_faces) if face_planes[ti] is not None),
         key=lambda ti: (-face_areas[ti], ti))
@@ -1114,19 +1313,49 @@ def _group_planar_triangles(v_arr, f_arr, tri_normals, angle_tol_deg, extent):
         queue = [seed]
         seen = {seed}
         qi = 0
+        if use_running_fit:
+            c0 = _triangle_centroid(v_arr, f_arr, seed)
+            centroid_sum = list(c0)
+            cov_sum = [[c0[0] * c0[0], c0[0] * c0[1], c0[0] * c0[2]],
+                       [c0[1] * c0[0], c0[1] * c0[1], c0[1] * c0[2]],
+                       [c0[2] * c0[0], c0[2] * c0[1], c0[2] * c0[2]]]
+            cnt = 1
         while qi < len(queue):
             cur = queue[qi]
             qi += 1
             region.append(cur)
             for nbr in sorted(adj[cur]):
-                if nbr in seen or face_planes[nbr] is None:
+                if nbr in seen or assigned[nbr] or face_planes[nbr] is None:
                     continue
-                if not _coplanar_with_region(
-                        face_planes[nbr], (gn, goffset),
-                        cos_tol, offset_tol):
+                fp_nu, fp_off = face_planes[nbr]
+                accepted = False
+                if use_running_fit:
+                    accepted = _accept_by_running_plane_fit(
+                        _triangle_centroid(v_arr, f_arr, nbr),
+                        fp_nu, centroid_sum, cov_sum, cnt,
+                        gn, offset_tol, cos_tol)
+                else:
+                    accepted = _coplanar_with_region(
+                        (fp_nu, fp_off), (gn, goffset), cos_tol, offset_tol)
+                if not accepted:
                     continue
                 seen.add(nbr)
                 queue.append(nbr)
+                if use_running_fit:
+                    cn = _triangle_centroid(v_arr, f_arr, nbr)
+                    centroid_sum[0] += cn[0]
+                    centroid_sum[1] += cn[1]
+                    centroid_sum[2] += cn[2]
+                    cov_sum[0][0] += cn[0] * cn[0]
+                    cov_sum[0][1] += cn[0] * cn[1]
+                    cov_sum[0][2] += cn[0] * cn[2]
+                    cov_sum[1][1] += cn[1] * cn[1]
+                    cov_sum[1][2] += cn[1] * cn[2]
+                    cov_sum[2][2] += cn[2] * cn[2]
+                    cov_sum[1][0] = cov_sum[0][1]
+                    cov_sum[2][0] = cov_sum[0][2]
+                    cov_sum[2][1] = cov_sum[1][2]
+                    cnt += 1
         for ti in region:
             assigned[ti] = True
         groups.append({"normal": gn.copy(), "offset": goffset,
@@ -1872,8 +2101,9 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
         # --- Bug A: weld FIRST, then process=False ---
         extent = _max_extent_nodes(node_list)
         quant_step = _detect_quantization_step(node_list)
-        eps = max(max(1e-9, 1e-7 * extent), 3 * quant_step)
-        welded_verts, welded_tris = _weld_vertices(node_list, raw_tris, eps)
+        tol = _ToleranceConfig.from_(quant_step, extent)
+        welded_verts, welded_tris = _weld_vertices(node_list, raw_tris,
+                                                    tol.weld_eps)
 
         v_arr = np.array(welded_verts, dtype=np.float64)
         f_arr = np.array([[a, b, c] for a, b, c in welded_tris], dtype=np.int64)
@@ -1895,14 +2125,12 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
 
         # --- Planar grouping (angle_tolerance_deg wired through, Bug D) ---
         planar_groups = _group_planar_triangles(
-            v_arr, f_arr, tri_normals, angle_tolerance_deg, extent)
+            v_arr, f_arr, tri_normals, angle_tolerance_deg, extent, tol=tol)
 
         planar_tri_set: set = set()
         planar_faces: List[Dict] = []
         face_idx = 0
         has_warnings = False
-        simp_tol = max(1e-6, 1e-4 * extent)
-        snap_tol = max(1e-5, max(5e-4 * extent, 2 * quant_step))
 
         for g in planar_groups:
             tri_indices = g["tri_indices"]
@@ -1912,12 +2140,12 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
             normal = g["normal"]
 
             remap = _snap_group_vertices(
-                welded_verts, tri_indices, welded_tris, snap_tol)
+                welded_verts, tri_indices, welded_tris, tol.snap_tol)
             residual_out: Dict = {}
             loops_vi = _boundary_loops(
                 tri_indices, welded_tris, remap,
                 tri_normals=tri_normals, group_normal=normal,
-                welded_verts=welded_verts, tjunc_tol=snap_tol,
+                welded_verts=welded_verts, tjunc_tol=tol.tjunc_tol,
                 residual_out=residual_out)
             if not loops_vi:
                 continue
@@ -2030,7 +2258,7 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
                 outer_2d = outer["pts_2d"]
 
                 if simplify_vertices:
-                    keep = _simplify_2d_keep(outer_2d, simp_tol)
+                    keep = _simplify_2d_keep(outer_2d, tol.simp_tol)
                 else:
                     keep = list(range(len(outer_3d)))
                 simp_3d = [outer_3d[i] for i in keep]
@@ -2144,9 +2372,9 @@ def analyze_mesh_data(nodes: Sequence, indices: Sequence,
     extent = max(max(p[k] for p in node_list) - min(p[k] for p in node_list)
                  for k in range(3))
     quant_step = _detect_quantization_step(node_list)
+    tol = _ToleranceConfig.from_(quant_step, extent)
     node_list, tri_list = _weld_vertices(
-        node_list, tri_list,
-        max(max(1e-9, 1e-7 * extent), 3 * quant_step))
+        node_list, tri_list, tol.weld_eps)
     vertex_count = len(node_list)
 
     edge_counts = defaultdict(int)
