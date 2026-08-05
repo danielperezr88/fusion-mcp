@@ -113,12 +113,41 @@ All iteration is over sorted keys/node ids; ``G.graph`` carries
 ``has_warnings`` and ``components_detected``.  Same input dict →
 bit-identical graph.  Pure Python (math only, no numpy).  Attr values are
 JSON-serialisable (lists/tuples round-trip to TEXT in the T6 DuckDB sink).
+
+DuckDB persistence (T6)
+-----------------------
+``_persist_to_duckdb(G, mesh_key)`` writes the graph into an in-memory
+DuckDB database and returns the connection, also caching it in the
+module-level LRU ``_GRAPH_DBS`` (``MAX_GRAPHS`` = 16; on overflow the
+least-recently-used connection is closed and evicted).  ``_get_graph_db(
+mesh_key)`` returns the cached connection (promoting it to most-recent) or
+raises ``KeyError`` — the databases are ephemeral and die with the MCP
+server process.
+
+Tables — columns beyond the fixed core are the SORTED union of attribute
+keys across all nodes (resp. all edges), so the schema is derived per
+persist: attributes added later (T9: base_score/unit_type/rebuild_order)
+become columns with no change here:
+
+  nodes(node_id TEXT PRIMARY KEY, label TEXT, <attr> <TYPE>, ...)
+  edges(source TEXT, target TEXT, relation TEXT, <attr> <TYPE>, ...)
+  CREATE INDEX IF NOT EXISTS idx_edges_src_rel ON edges(source, relation)
+
+Per-column type mapping: bool → BOOLEAN, int → INTEGER, float → DOUBLE,
+str → TEXT, list/dict/tuple → TEXT via ``json.dumps`` (round-trip with
+``json.loads`` in queries), missing attribute → NULL.  Every value is bound
+with a parameterized insert; the whole write (DDL + inserts) runs inside
+one transaction.  Column names are validated as SQL identifiers; values are
+never interpolated into SQL.
 """
 
+import json
 import math
-from collections import defaultdict
-from typing import Dict, List, Set, Tuple
+import re
+from collections import OrderedDict, defaultdict
+from typing import Dict, List, Optional, Set, Tuple
 
+import duckdb
 import networkx as nx
 
 _COS_1_DEG = math.cos(math.radians(1.0))
@@ -480,3 +509,165 @@ def build_structure_graph(decompose_result: dict) -> nx.Graph:
 def _plane_id(normal: List[float], offset: float) -> str:
     return "{}|{}|{}|{}".format(_r6(normal[0]), _r6(normal[1]),
                                 _r6(normal[2]), _r6(offset))
+
+
+# --------------------------------------------------------------------------
+# DuckDB persistence — in-memory sink for the structure graph (T6)
+# --------------------------------------------------------------------------
+
+MAX_GRAPHS = 16
+"""Maximum number of persisted graphs kept in ``_GRAPH_DBS``."""
+
+_GRAPH_DBS: "OrderedDict[str, duckdb.DuckDBPyConnection]" = OrderedDict()
+"""LRU cache: mesh_key -> open in-memory DuckDB connection (see module
+docstring).  Access order is the recency order: ``move_to_end`` on insert
+and on ``_get_graph_db``; ``popitem(last=False)`` evicts the oldest."""
+
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_ident(name: str) -> str:
+    """Reject attr keys that cannot be a SQL identifier (values are always
+    parameterized; column names are the only thing reaching SQL text)."""
+    if _IDENT_RE.match(name) is None:
+        raise ValueError(f"unsafe DuckDB column name: {name!r}")
+    return name
+
+
+def _column_type(values: List[object]) -> str:
+    """DuckDB type for one column, inferred from its non-None values.
+
+    Priority: a JSON container (list/dict/tuple) forces TEXT (stored as a
+    JSON string); bool → BOOLEAN; int → INTEGER; int/float mix → DOUBLE;
+    str → TEXT; anything else falls back to TEXT.  ``bool`` is checked
+    before ``int`` because ``bool`` subclasses ``int``.
+    """
+    present = [v for v in values if v is not None]
+    if not present:
+        return "TEXT"
+    if any(isinstance(v, (list, dict, tuple)) for v in present):
+        return "TEXT"
+    if all(isinstance(v, bool) for v in present):
+        return "BOOLEAN"
+    if all(isinstance(v, int) for v in present):
+        return "INTEGER"
+    if all(isinstance(v, (int, float)) for v in present):
+        return "DOUBLE"
+    return "TEXT"
+
+
+def _sql_value(value: object, col_type: str) -> object:
+    """Normalise one attr value for a typed DuckDB parameter.
+
+    None stays NULL; list/dict/tuple become a JSON string; an int bound to
+    a DOUBLE column is widened to float.  Everything else binds natively.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, dict, tuple)):
+        return json.dumps(value)
+    if col_type == "DOUBLE" and isinstance(value, int):
+        return float(value)
+    return value
+
+
+def _tabulate(rows: List[Tuple[str, dict]],
+              core: Tuple[str, ...]) -> Tuple[List[str], List[Tuple[object, ...]]]:
+    """Flatten ``(id, attrs)`` pairs into a stable table layout.
+
+    Returns ``(columns, aligned_rows)``: ``columns`` is the fixed ``core``
+    followed by the SORTED union of all attr keys minus the core; each row
+    is a tuple aligned to ``columns`` with ``None`` for a missing attr.
+    Sorted (never insertion-ordered) so the schema is deterministic.
+    """
+    columns = list(core) + sorted({k for _, attrs in rows for k in attrs}
+                                  - set(core))
+    return columns, [tuple(attrs.get(c) for c in columns) for _, attrs in rows]
+
+
+def _create_table(conn: duckdb.DuckDBPyConnection, table: str,
+                  rows: List[Tuple[str, dict]], core: Tuple[str, ...],
+                  primary_key: Optional[str] = None) -> None:
+    """Create ``table`` from ``rows`` and bulk-insert them (parameterized).
+
+    Column names are validated identifiers; values go through
+    ``_sql_value``.  The caller owns the surrounding transaction.
+    """
+    columns, aligned = _tabulate(rows, core)
+    col_types = {c: _column_type([r[i] for r in aligned])
+                 for i, c in enumerate(columns)}
+    defs = []
+    for c in columns:
+        _safe_ident(c)
+        d = f'"{c}" {col_types[c]}'
+        if c == primary_key:
+            d += " PRIMARY KEY"
+        defs.append(d)
+    conn.execute(f"CREATE TABLE {table} ({', '.join(defs)})")
+    placeholders = ", ".join("?" for _ in columns)
+    normalized = [tuple(_sql_value(v, col_types[c])
+                        for c, v in zip(columns, row))
+                  for row in aligned]
+    if normalized:
+        conn.executemany(f"INSERT INTO {table} VALUES ({placeholders})",
+                         normalized)
+
+
+def _persist_to_duckdb(graph: nx.Graph,
+                       mesh_key: str) -> duckdb.DuckDBPyConnection:
+    """Persist ``graph`` into an in-memory DuckDB database and cache it.
+
+    Returns the connection.  The nodes/edges tables carry the graph's attrs
+    as dynamically-derived columns (see the module docstring); the whole
+    write is one transaction (rolls back atomically on failure).  The
+    connection replaces any previously cached one for ``mesh_key`` (the old
+    connection is closed first) and is moved to the most-recent end of the
+    LRU; on overflow the least-recently-used connection is closed+evicted.
+    """
+    node_rows = [(n, dict(d)) for n, d in graph.nodes(data=True)]
+    edge_rows = []
+    for u, v, d in graph.edges(data=True):
+        attrs = dict(d)
+        attrs["source"] = u
+        attrs["target"] = v
+        edge_rows.append((u, attrs))
+
+    conn = duckdb.connect(":memory:")
+    conn.execute("BEGIN")
+    try:
+        _create_table(conn, "nodes", node_rows, ("node_id", "label"),
+                      primary_key="node_id")
+        _create_table(conn, "edges", edge_rows,
+                      ("source", "target", "relation"))
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_src_rel "
+                     "ON edges(source, relation)")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        conn.close()
+        raise
+
+    if mesh_key in _GRAPH_DBS:
+        _GRAPH_DBS[mesh_key].close()
+    _GRAPH_DBS[mesh_key] = conn
+    _GRAPH_DBS.move_to_end(mesh_key)
+    while len(_GRAPH_DBS) > MAX_GRAPHS:
+        _evicted_key, evicted_conn = _GRAPH_DBS.popitem(last=False)
+        evicted_conn.close()
+    return conn
+
+
+def _get_graph_db(mesh_key: str) -> duckdb.DuckDBPyConnection:
+    """Return the cached in-memory DuckDB connection for ``mesh_key``.
+
+    Promotes the key to most-recently-used.  Raises ``KeyError`` when no
+    graph has been persisted for ``mesh_key`` — graphs are ephemeral: the
+    MCP server restart drops them.
+    """
+    if mesh_key not in _GRAPH_DBS:
+        raise KeyError(
+            f"no graph built for mesh '{mesh_key}'. Call structure_graph "
+            "first (graphs are ephemeral: the MCP server restart drops "
+            "them)")
+    _GRAPH_DBS.move_to_end(mesh_key)
+    return _GRAPH_DBS[mesh_key]
