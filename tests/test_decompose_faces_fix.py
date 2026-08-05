@@ -869,3 +869,65 @@ def test_snap_spatial_hash_5000_vertices_fast():
     # Sanity: the clustered input must actually have merged something.
     assert len(remap) > 0, "expected merges from clustered input"
 
+
+# ---------------------------------------------------------------------------
+# R-4: residual non-manifold edge warnings (unpaired_boundary_edges)
+# ---------------------------------------------------------------------------
+
+def test_clean_mesh_no_warnings():
+    """A perfectly seam-matching mesh (shared edges cancel exactly) must
+    report no residual non-manifold edges: has_warnings False and every face
+    carries an empty warnings list."""
+    nodes, indices = _two_touching_coplanar_quads()
+    result = decompose_mesh_faces(nodes, indices)
+    assert result["has_warnings"] is False
+    assert result["planar_faces"], "expected at least one face"
+    for face in result["planar_faces"]:
+        assert face["warnings"] == [], (
+            f"clean face {face['face_index']} has warnings: {face['warnings']}")
+
+
+def test_offset_seam_emits_unpaired_warning():
+    """A seam whose duplicated fragment is offset by 0.1 cm — far above
+    snap_tol, so the seam does NOT snap closed — leaves unbalanced boundary
+    edges (the far edge and the T-junction-split seam sub-edges appear twice
+    with the same winding and never cancel).  decompose_mesh_faces must
+    report has_warnings True with at least one face carrying an
+    unpaired_boundary_edges warning."""
+    offset = 0.1
+    nodes = [
+        0, 0, 0,  4, 0, 0,  4, 4, 0,  0, 4, 0,
+        4, 0, 0,  6, 0, 0,  6, 4, 0,  4, 4, 0,
+        4 + offset, 0, 0,  6, 0, 0,  6, 4, 0,  4 + offset, 4, 0,
+    ]
+    indices = [
+        0, 1, 2,  0, 2, 3,
+        4, 5, 6,  4, 6, 7,
+        8, 9, 10,  8, 10, 11,
+    ]
+    result = decompose_mesh_faces(nodes, indices)
+    assert result["has_warnings"] is True
+    warned = [f for f in result["planar_faces"] if f["warnings"]]
+    assert warned, "expected at least one face with warnings"
+    for face in warned:
+        assert {"type": "unpaired_boundary_edges",
+                "count": face["warnings"][0]["count"]} in face["warnings"]
+        assert face["warnings"][0]["count"] > 0
+
+
+def test_warnings_additive_contract():
+    """R-4 adds per-face ``warnings`` and top-level ``has_warnings`` WITHOUT
+    removing or renaming any existing key — the additive-contract rule."""
+    nodes, indices = _two_touching_coplanar_quads()
+    result = decompose_mesh_faces(nodes, indices)
+    for face in result["planar_faces"]:
+        assert _REQUIRED_FACE_KEYS.issubset(face.keys()), (
+            f"missing keys: {_REQUIRED_FACE_KEYS - face.keys()}")
+        assert "warnings" in face, "face missing new 'warnings' key"
+        assert isinstance(face["warnings"], list)
+    assert "has_warnings" in result
+    assert isinstance(result["has_warnings"], bool)
+    assert "components_detected" in result
+    assert "planar_faces" in result
+    assert "curved_patches" in result
+

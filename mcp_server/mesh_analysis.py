@@ -1390,9 +1390,30 @@ def _merge_loop_into_outer(outer_vi, inner_vi, welded_verts):
     return new_loops[0]
 
 
+def _count_residual_loop_edges(loops, residual_pairs):
+    """Count occurrences of residual non-manifold edges in vertex-index loops.
+
+    A *residual edge* is an undirected vertex pair whose directed-edge
+    cancellation count ``|net|`` is not 1 — the seam was too wide for
+    snapping to close, leaving an unbalanced boundary edge (R-4).  Each
+    occurrence of such an edge among the consecutive vertex pairs of *loops*
+    is counted once.  Returns 0 when no residual pairs are given.
+    """
+    if not residual_pairs or not loops:
+        return 0
+    count = 0
+    for loop in loops:
+        m = len(loop)
+        for i in range(m):
+            if frozenset((loop[i], loop[(i + 1) % m])) in residual_pairs:
+                count += 1
+    return count
+
+
 def _boundary_loops(tri_indices, welded_tris, remap=None,
                     tri_normals=None, group_normal=None,
-                    welded_verts=None, tjunc_tol=0.0):
+                    welded_verts=None, tjunc_tol=0.0,
+                    residual_out=None):
     """Boundary vertex-index loops of a triangle set via edge cancellation.
 
     Interior edges (shared by two triangles with opposite winding) cancel.
@@ -1462,6 +1483,8 @@ def _boundary_loops(tri_indices, welded_tris, remap=None,
 
     boundary: List[Tuple[int, int]] = []
     seen: set = set()
+    residual_pairs: set = set()
+    pre_pinch_residual_count = 0
     for (a, b), fwd in edge_counts.items():
         if (a, b) in seen:
             continue
@@ -1469,11 +1492,24 @@ def _boundary_loops(tri_indices, welded_tris, remap=None,
         seen.add((a, b))
         seen.add((b, a))
         net = fwd - rev
+        if net != 1 and net != -1:
+            # |net| >= 2: the edge survived cancellation unbalanced — a
+            # residual non-manifold boundary edge (seam too wide to close).
+            residual_pairs.add(frozenset((a, b)))
+            pre_pinch_residual_count += abs(net)
         if net > 0:
             boundary.extend([(a, b)] * net)
         elif net < 0:
             boundary.extend([(b, a)] * (-net))
-    return _split_pinch_loops(_chain_directed_edges(boundary))
+    loops = _split_pinch_loops(_chain_directed_edges(boundary))
+    if residual_out is not None:
+        residual_out.update({
+            "residual_pairs": residual_pairs,
+            "pre_pinch_residual_count": pre_pinch_residual_count,
+            "post_pinch_residual_count":
+                _count_residual_loop_edges(loops, residual_pairs),
+        })
+    return loops
 
 
 def _project_to_2d(points_3d, normal, origin=None):
@@ -1597,10 +1633,12 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
     """Decompose mesh into planar faces and curved patches.
 
     Returns a dict with ``components_detected``, ``planar_faces``, and
-    ``curved_patches``.  Each planar face includes ordered polygon vertices,
-    normal, interior angles, area, and optional ``holes`` (list of inner-loop
-    point lists).  Curved patches report triangle count, area, and a fitted
-    surface classification (cylinder / sphere / cone / freeform).
+    ``curved_patches`` (plus a top-level ``has_warnings`` flag, R-4).  Each
+    planar face includes ordered polygon vertices, normal, interior angles,
+    area, optional ``holes`` (list of inner-loop point lists), and a
+    ``warnings`` list of per-face residual non-manifold edge warnings.
+    Curved patches report triangle count, area, and a fitted surface
+    classification (cylinder / sphere / cone / freeform).
 
     Bug fixes (2026-08-04):
       * **Bug A** – weld vertices FIRST (numpy-safe rounded-key dedupe), then
@@ -1624,7 +1662,7 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
                     for a, b, c in _as_triples(indices)]
         if not raw_tris or not node_list:
             return {"components_detected": 0, "planar_faces": [],
-                    "curved_patches": []}
+                    "curved_patches": [], "has_warnings": False}
 
         # --- Bug A: weld FIRST, then process=False ---
         extent = _max_extent_nodes(node_list)
@@ -1657,6 +1695,7 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
         planar_tri_set: set = set()
         planar_faces: List[Dict] = []
         face_idx = 0
+        has_warnings = False
         simp_tol = max(1e-6, 1e-4 * extent)
         snap_tol = max(1e-5, max(5e-4 * extent, 2 * quant_step))
 
@@ -1669,10 +1708,12 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
 
             remap = _snap_group_vertices(
                 welded_verts, tri_indices, welded_tris, snap_tol)
+            residual_out: Dict = {}
             loops_vi = _boundary_loops(
                 tri_indices, welded_tris, remap,
                 tri_normals=tri_normals, group_normal=normal,
-                welded_verts=welded_verts, tjunc_tol=snap_tol)
+                welded_verts=welded_verts, tjunc_tol=snap_tol,
+                residual_out=residual_out)
             if not loops_vi:
                 continue
 
@@ -1762,6 +1803,15 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
                         [[round(float(c), 6) for c in p]
                          for p in h["pts_3d"]])
 
+                face_loops_vi = [outer["vi"]] + [h["vi"] for h in hole_list]
+                unpaired_edges = _count_residual_loop_edges(
+                    face_loops_vi, residual_out.get("residual_pairs", set()))
+                warnings = ([{"type": "unpaired_boundary_edges",
+                              "count": unpaired_edges}]
+                            if unpaired_edges > 0 else [])
+                if warnings:
+                    has_warnings = True
+
                 planar_faces.append({
                     "component": comp,
                     "face_index": face_idx,
@@ -1773,6 +1823,7 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
                     "angles_deg": angles,
                     "area": round(total_area, 6),
                     "holes": holes_out,
+                    "warnings": warnings,
                 })
                 face_idx += 1
 
@@ -1784,12 +1835,14 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
             "components_detected": n_components,
             "planar_faces": planar_faces,
             "curved_patches": curved_patches,
+            "has_warnings": has_warnings,
         }
     except Exception as e:
         return {
             "components_detected": 0,
             "planar_faces": [],
             "curved_patches": [],
+            "has_warnings": False,
             "error": str(e),
         }
 
