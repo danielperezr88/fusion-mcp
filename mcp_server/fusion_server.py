@@ -12,6 +12,8 @@ import base64
 import importlib.util
 import os
 import math
+import re
+from decimal import Decimal
 import networkx as nx
 from mcp.server.fastmcp import FastMCP, Image
 
@@ -1589,6 +1591,165 @@ def structure_graph(mesh: str = "0", units: str = "cm") -> str:
         return json.dumps({"error": f"structure graph failed: {e}"},
                           indent=2)
     return json.dumps(summary, indent=2)
+
+
+def _assert_read_only_sql(sql):
+    """Reject any SQL that is not a single read-only SELECT/WITH statement.
+
+    duckdb 1.5.5 cannot flip a RUNNING in-memory connection to read-only
+    (``SET access_mode='read_only'`` raises InvalidInputException, and
+    ``connect(":memory:", read_only=True)`` / ``ATTACH ... (READ_ONLY)``
+    both raise CatalogException), so read-only is enforced here at the
+    STATEMENT level: SQL comments (``-- ...`` line and ``/* ... */`` block)
+    are stripped, the statement must then start with SELECT or WITH
+    (case-insensitive), and at most ONE trailing semicolon is allowed --
+    multi-statement injection such as ``SELECT 1; DROP TABLE nodes`` is
+    rejected because any remaining ``;`` is a fatal error.
+
+    Returns the comment-stripped, semicolon-normalised SQL so callers can
+    re-use it (e.g. for ORDER BY detection).  Raises
+    ``ValueError("only SELECT queries are allowed")`` for non-read-only
+    input.
+    """
+    stripped = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    stripped = re.sub(r"--[^\n]*", "", stripped)
+    stripped = stripped.strip()
+    if stripped.endswith(";"):
+        stripped = stripped[:-1].strip()
+    if ";" in stripped:
+        raise ValueError("only SELECT queries are allowed")
+    first_word = re.split(r"\s+", stripped, maxsplit=1)[0].lower()
+    # The first word must be a PREFIX of SELECT or WITH (case-insensitive).
+    # A truncated keyword like ``selec`` is tolerated so it reaches the SQL
+    # parser, which rejects it -- a strict prefix can never begin a valid
+    # non-read statement, so only exact SELECT/WITH statements execute.
+    if not ("select".startswith(first_word) or "with".startswith(first_word)):
+        raise ValueError("only SELECT queries are allowed")
+    return stripped
+
+
+def _json_safe_cell(value):
+    """Convert a DuckDB cell to a JSON-serialisable Python value.
+
+    bytes -> utf-8 str; Decimal -> float; everything else passes through
+    natively (int, float, bool, str, None).  List/dict attrs (centroid,
+    interior_angles, ...) were stored as JSON TEXT at persist time, so they
+    already arrive here as plain strings.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
+@mcp.tool()
+def query_structure_graph(mesh: str = "0", sql: str = "") -> str:
+    """
+    Run a READ-ONLY SQL query against the persisted structure graph.
+
+    Queries the in-memory DuckDB database that `structure_graph` persisted
+    for `mesh`.  Call `structure_graph(mesh=...)` FIRST -- graphs are
+    ephemeral: an MCP server restart drops them.  Returns only the query
+    results as JSON (``{mesh, columns, rows, row_count}``); the full graph
+    never leaves the server.
+
+    READ-ONLY: only a single SELECT/WITH statement is allowed.  SQL
+    comments are stripped, the statement must start with SELECT or WITH
+    (case-insensitive), and multi-statement SQL (any inner semicolon, e.g.
+    ``SELECT 1; DROP TABLE nodes``) is rejected with
+    ``{"error": "only SELECT queries are allowed"}``.
+
+    Deterministic ordering: when the query has NO ORDER BY clause the rows
+    are sorted by the first column before being returned (NULLs last); with
+    an ORDER BY clause the SQL ordering is preserved.
+
+    DuckDB table schema -- column set = the fixed core + the SORTED UNION of
+    every node/edge attribute present, so a column only appears when at
+    least one row carries that attribute (e.g. hole-only columns exist only
+    for meshes with holes; the box carries no VERTEX_TOUCH/SAME_ORIENTATION
+    edges).  List attrs (centroid, interior_angles, ...) come back as JSON
+    strings.
+
+    ``nodes`` (node_id TEXT PRIMARY KEY, label TEXT, then):
+      area_cm2              DOUBLE    -- face/area in cm^2
+      centroid              TEXT      -- JSON "[x, y, z]"
+      component_id          INTEGER   -- owning component index
+      containing_face_id    TEXT      -- Hole: owning Face node id
+      convexity             TEXT      -- 'convex' | 'concave'
+      curve_type            TEXT      -- 'planar' | curved-patch surface type
+      face_count            INTEGER   -- Component: faces it owns
+      face_index            INTEGER   -- Face: index in the decompose output
+      interior_angles       TEXT      -- JSON list of angles in degrees
+      is_articulation_point BOOLEAN   -- Face articulation-point flag
+      is_base_candidate     BOOLEAN   -- Face base-candidate flag
+      is_filled             BOOLEAN   -- Hole: False while the hole is open
+      mean_curvature        DOUBLE    -- 0.0 for planar faces
+      normal_x/y/z          DOUBLE    -- face plane normal (canonical)
+      plane_id              TEXT      -- "nx|ny|nz|offset"
+      triangle_count        INTEGER
+      vertex_count          INTEGER
+
+    ``edges`` (source TEXT, target TEXT, relation TEXT, then):
+      convexity           TEXT      -- 'convex' | 'concave' (EDGE_ADJACENT)
+      dihedral_angle_deg  DOUBLE    -- 0-180 deg (EDGE_ADJACENT)
+      extrusion_direction TEXT      -- JSON "[x, y, z]" (EXTRUSION_ALIGNED)
+      normal_dot          DOUBLE    -- COPLANAR/PARALLEL/PERPENDICULAR
+      normal_x/y/z        DOUBLE    -- SAME_ORIENTATION canonical normal
+      orientation         TEXT      -- EDGE_ADJACENT shared-edge orientation
+      shared_edge_length  DOUBLE    -- EDGE_ADJACENT shared edge length (cm)
+      shared_vertex       TEXT      -- VERTEX_TOUCH shared vertex
+      shared_vertex_count INTEGER   -- VERTEX_TOUCH shared vertex count
+
+    ``relation`` is one of: COMPONENT_OF, CONTAINS, COPLANAR, EDGE_ADJACENT,
+    EXTRUSION_ALIGNED, HAS_BASE, PARALLEL, PERPENDICULAR, SAME_ORIENTATION,
+    VERTEX_TOUCH.
+
+    Query examples:
+      SELECT COUNT(*) FROM nodes;
+      SELECT node_id, area_cm2 FROM nodes
+        WHERE label='Face' AND convexity='concave';   -- concave faces only
+      -- recursive CTE: 2-hop face traversal over EDGE_ADJACENT edges
+      WITH RECURSIVE adj(u, v) AS (
+        SELECT source, target FROM edges WHERE relation='EDGE_ADJACENT'
+        UNION ALL
+        SELECT target, source FROM edges WHERE relation='EDGE_ADJACENT'
+      ), hops(node_id, depth) AS (
+        SELECT 'face:0', 0
+        UNION ALL
+        SELECT a.v, h.depth + 1 FROM hops h
+        JOIN adj a ON a.u = h.node_id WHERE h.depth < 2
+      )
+      SELECT DISTINCT node_id FROM hops ORDER BY node_id;
+
+    Args:
+        mesh: Body name or index whose graph was persisted by
+              `structure_graph` (default "0").
+        sql:  The read-only SQL query to run (default "" -> error).
+    """
+    if not (sql or "").strip():
+        return json.dumps({"error": "sql parameter is required"}, indent=2)
+    try:
+        mesh_graph = _load_mesh_graph()
+        conn = mesh_graph._get_graph_db(mesh)
+    except KeyError:
+        return json.dumps({"error": f"no graph built for mesh '{mesh}'. "
+                                    "Call structure_graph first."}, indent=2)
+    try:
+        cleaned = _assert_read_only_sql(sql)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    try:
+        cur = conn.execute(sql)
+        columns = [d[0] for d in (cur.description or [])]
+        rows = [tuple(_json_safe_cell(c) for c in row)
+                for row in cur.fetchall()]
+    except Exception as e:
+        return json.dumps({"error": f"SQL error: {e}"}, indent=2)
+    if "order by" not in cleaned.lower():
+        rows.sort(key=lambda r: (r[0] is None, r[0]))
+    return json.dumps({"mesh": mesh, "columns": columns, "rows": rows,
+                       "row_count": len(rows)}, indent=2)
 
 
 @mcp.tool()
