@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import copy
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -874,6 +874,42 @@ def _max_extent_nodes(node_list):
                for k in range(3))
 
 
+_QUANT_REL_CAP = 1e-3   # quantization steps are tiny relative to model extent
+
+
+def _detect_quantization_step(node_list):
+    """Most frequent small nonzero coordinate delta (exporter rounding step).
+
+    STL / OBJ exporters round every coordinate to a fixed decimal count
+    (6 decimals -> 1e-6, 4 decimals -> 1e-4).  Adjacent sorted unique
+    coordinate values then differ by small integer multiples of that step,
+    so the quantization step is the most frequent *small* delta, where small
+    means at most ``max(1e-4, 1e-3 * extent)``.  A genuine global rounding
+    grid recurs across many deltas (count > 1), while a one-off seam gap does
+    not, so single-occurrence deltas are ignored.
+
+    Deterministic: ``Counter`` over per-axis deltas rounded to 9 decimals,
+    most-frequent-first with smallest-step tie-break (no set-iteration-order
+    dependence).
+
+    Returns ``0.0`` when no recurring small step exists (uniform coordinates,
+    integer-coordinate fixtures) so callers fall back to their extent-based
+    floors: ``eps >= max(1e-9, 1e-7 * extent)`` and ``snap_tol >= 1e-5``.
+    """
+    extent = _max_extent_nodes(node_list)
+    cap = max(1e-4, _QUANT_REL_CAP * extent)
+    steps = Counter()
+    for k in range(3):
+        vals = sorted({p[k] for p in node_list})
+        for a, b in zip(vals, vals[1:]):
+            d = round(abs(b - a), 9)
+            if 0 < d <= cap:
+                steps[d] += 1
+    if not steps or max(steps.values()) < 2:
+        return 0.0
+    return max(steps, key=lambda d: (steps[d], -d))
+
+
 def _detect_components(welded_tris):
     """Connected-component IDs for triangles via shared-edge union-find.
 
@@ -1408,7 +1444,8 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
 
         # --- Bug A: weld FIRST, then process=False ---
         extent = _max_extent_nodes(node_list)
-        eps = max(1e-9, 1e-7 * extent)
+        quant_step = _detect_quantization_step(node_list)
+        eps = max(max(1e-9, 1e-7 * extent), 3 * quant_step)
         welded_verts, welded_tris = _weld_vertices(node_list, raw_tris, eps)
 
         v_arr = np.array(welded_verts, dtype=np.float64)
@@ -1437,7 +1474,7 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
         planar_faces: List[Dict] = []
         face_idx = 0
         simp_tol = max(1e-6, 1e-4 * extent)
-        snap_tol = max(1e-5, 5e-4 * extent)
+        snap_tol = max(1e-5, max(5e-4 * extent, 2 * quant_step))
 
         for g in planar_groups:
             tri_indices = g["tri_indices"]
@@ -1626,8 +1663,10 @@ def analyze_mesh_data(nodes: Sequence, indices: Sequence,
 
     extent = max(max(p[k] for p in node_list) - min(p[k] for p in node_list)
                  for k in range(3))
+    quant_step = _detect_quantization_step(node_list)
     node_list, tri_list = _weld_vertices(
-        node_list, tri_list, max(1e-9, 1e-7 * extent))
+        node_list, tri_list,
+        max(max(1e-9, 1e-7 * extent), 3 * quant_step))
     vertex_count = len(node_list)
 
     edge_counts = defaultdict(int)

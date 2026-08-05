@@ -33,6 +33,8 @@ from mcp_server.mesh_analysis import (
     _shoelace_area_2d,
     _project_to_2d,
     _detect_components,
+    _detect_quantization_step,
+    _max_extent_nodes,
 )
 
 
@@ -510,3 +512,121 @@ def test_genuinely_separated_quads_no_hole_no_merge():
     for f in planar:
         assert f["holes"] == []
         assert f["area"] == pytest.approx(1.0, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# R-1: quantization-step-derived weld / snap tolerances
+# ---------------------------------------------------------------------------
+
+def test_detect_quantization_step_6decimal():
+    """Six collinear vertices on a 1e-6 grid (typical 6-decimal STL exporter)
+    -> the recurring delta is 1e-6."""
+    nodes = [
+        (0.0, 0.0, 0.0),
+        (0.000001, 0.0, 0.0),
+        (0.000002, 0.0, 0.0),
+        (0.000003, 0.0, 0.0),
+        (0.000004, 0.0, 0.0),
+        (0.000005, 0.0, 0.0),
+    ]
+    assert _detect_quantization_step(nodes) == pytest.approx(1e-6)
+
+
+def test_detect_quantization_step_4decimal():
+    """Five collinear vertices on a 1e-4 grid (4-decimal exporter) -> 1e-4."""
+    nodes = [
+        (0.0, 0.0, 0.0),
+        (0.0001, 0.0, 0.0),
+        (0.0002, 0.0, 0.0),
+        (0.0003, 0.0, 0.0),
+        (0.0004, 0.0, 0.0),
+    ]
+    assert _detect_quantization_step(nodes) == pytest.approx(1e-4)
+
+
+def test_detect_quantization_step_uniform():
+    """All coordinates identical -> safe default 0.0, and the derived
+    tolerances still meet their floors (no empty-histogram crash)."""
+    nodes = [(1.5, 2.5, 3.5)] * 6
+    quant = _detect_quantization_step(nodes)
+    assert quant == 0.0
+    extent = _max_extent_nodes(nodes)
+    assert extent == 0.0
+    eps = max(max(1e-9, 1e-7 * extent), 3 * quant)
+    snap_tol = max(1e-5, max(5e-4 * extent, 2 * quant))
+    assert eps >= max(1e-9, 1e-7 * extent)
+    assert snap_tol >= 1e-5
+
+
+def test_detect_quantization_step_integer_coords():
+    """Integer-coordinate fixture (geometry deltas, not rounding) -> 0.0,
+    so weld/snap fall back to their extent-based floors."""
+    nodes = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+    assert _detect_quantization_step(nodes) == 0.0
+
+
+def test_weld_with_quant_step():
+    """Weld eps derived from the detected quantization step (k=3) merges
+    displayMesh duplicates AND a hub vertex written at three adjacent
+    1e-6-grid points (6-decimal STL seam)."""
+    nodes = [
+        (0.0, 0.0, 0.0),        # 0
+        (1.0, 0.0, 0.0),        # 1
+        (1.0, 0.5, 0.0),        # 2
+        (0.0, 0.5, 0.0),        # 3
+        (0.5, 0.25, 0.0),       # 4  hub (fan center)
+        (0.0, 0.0, 0.0),        # 5  dup of 0
+        (0.500001, 0.25, 0.0),  # 6  hub at adjacent 1e-6 grid point
+        (0.500002, 0.25, 0.0),  # 7  hub at next adjacent grid point
+    ]
+    tris = [
+        (0, 1, 4),
+        (1, 2, 6),
+        (2, 3, 7),
+        (5, 3, 4),
+    ]
+
+    quant = _detect_quantization_step(nodes)
+    assert quant == pytest.approx(1e-6)
+
+    extent = _max_extent_nodes(nodes)
+    assert 3 * quant > max(1e-9, 1e-7 * extent)  # quant term is the binder
+    eps = max(max(1e-9, 1e-7 * extent), 3 * quant)
+    welded_v, welded_t = _weld_vertices(nodes, tris, eps)
+
+    # 4 corners + 1 merged hub, no leftover duplicates.
+    assert len(welded_v) == 5
+    assert welded_t == [(0, 1, 2), (1, 3, 2), (3, 4, 2), (0, 4, 2)]
+
+    snap_tol = max(1e-5, max(5e-4 * extent, 2 * quant))
+    assert snap_tol >= 1e-5
+    assert snap_tol >= 2 * quant
+
+
+def test_decompose_faces_quantized_quad():
+    """End-to-end: a quantized quad fan decomposes to ONE face of the right
+    area after quantization-bridged welding."""
+    nodes = [
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 0.5, 0.0),
+        (0.0, 0.5, 0.0),
+        (0.5, 0.25, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.500001, 0.25, 0.0),
+        (0.500002, 0.25, 0.0),
+    ]
+    tris = [
+        (0, 1, 4),
+        (1, 2, 6),
+        (2, 3, 7),
+        (5, 3, 4),
+    ]
+    result = decompose_mesh_faces(nodes, tris)
+    planar = result["planar_faces"]
+    assert len(planar) == 1, f"expected 1 face, got {len(planar)}"
+    face = planar[0]
+    assert face["area"] == pytest.approx(0.5, abs=1e-3)
+    assert face["vertex_count"] == 4
+    assert face["holes"] == []
+
