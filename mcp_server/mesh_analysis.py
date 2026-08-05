@@ -2298,16 +2298,46 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
                 })
                 face_idx += 1
 
+        # R-8: Voxel/SDF fallback detection — total unpaired edge count
+        # across all faces vs 5% of total triangle edges.
+        if planar_faces:
+            unpaired_total = sum(
+                face["warnings"][0]["count"]
+                for face in planar_faces
+                if face.get("warnings")
+            )
+            n_welded_tris = len(welded_tris)
+            total_tri_edges = 3 * n_welded_tris
+            if total_tri_edges > 0:
+                ratio = unpaired_total / total_tri_edges
+                if ratio > 0.05:
+                    unpaired_pct = round(
+                        100.0 * unpaired_total / total_tri_edges, 1)
+                    strategy_fallback_suggested = "organic"
+                else:
+                    strategy_fallback_suggested = None
+                    unpaired_pct = None
+            else:
+                strategy_fallback_suggested = None
+                unpaired_pct = None
+        else:
+            strategy_fallback_suggested = None
+            unpaired_pct = None
+
         # Curved patches: triangles not in any planar group
         curved_patches = _extract_curved_patches(
             welded_verts, welded_tris, planar_tri_set, comp_ids, v_arr, f_arr)
 
-        return {
+        result = {
             "components_detected": n_components,
             "planar_faces": planar_faces,
             "curved_patches": curved_patches,
             "has_warnings": has_warnings,
         }
+        if strategy_fallback_suggested is not None:
+            result["strategy_fallback_suggested"] = strategy_fallback_suggested
+            result["unpaired_pct"] = unpaired_pct
+        return result
     except Exception as e:
         return {
             "components_detected": 0,

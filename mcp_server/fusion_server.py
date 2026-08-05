@@ -1615,6 +1615,13 @@ def structure_graph(mesh: str = "0", units: str = "cm") -> str:
             "connected_component_count": len(components),
             "workstream": workstream,
         }
+        if decompose_result.get("strategy_fallback_suggested"):
+            summary["fallback_strategy"] = {
+                "strategy": "organic",
+                "reason": ("high residual non-manifold edge count "
+                           "(>5% of triangle edges)"),
+                "unpaired_pct": decompose_result["unpaired_pct"],
+            }
     except Exception as e:
         return json.dumps({"error": f"structure graph failed: {e}"},
                           indent=2)
