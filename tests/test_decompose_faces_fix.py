@@ -19,6 +19,7 @@ import math
 import os
 import sys
 
+import numpy as np
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,6 +28,7 @@ if REPO_ROOT not in sys.path:
 
 from mcp_server.mesh_analysis import (
     decompose_mesh_faces,
+    _as_triples,
     _weld_vertices,
     _boundary_loops,
     _simplify_2d_keep,
@@ -35,6 +37,7 @@ from mcp_server.mesh_analysis import (
     _detect_components,
     _detect_quantization_step,
     _max_extent_nodes,
+    _group_planar_triangles,
 )
 
 
@@ -629,4 +632,66 @@ def test_decompose_faces_quantized_quad():
     assert face["area"] == pytest.approx(0.5, abs=1e-3)
     assert face["vertex_count"] == 4
     assert face["holes"] == []
+
+
+# ---------------------------------------------------------------------------
+# R-2: connectivity-constrained grouping (primary), global first-match fallback
+# ---------------------------------------------------------------------------
+
+def _planar_groups_of(nodes, indices):
+    """Grouping-level view of a fixture: weld, vectorise, then call the
+    R-2 grouping directly (the public API hides the group structure)."""
+    node_list = list(_as_triples(nodes))
+    raw_tris = [(int(a), int(b), int(c)) for a, b, c in _as_triples(indices)]
+    extent = _max_extent_nodes(node_list)
+    quant_step = _detect_quantization_step(node_list)
+    eps = max(max(1e-9, 1e-7 * extent), 3 * quant_step)
+    welded_verts, welded_tris = _weld_vertices(node_list, raw_tris, eps)
+    v_arr = np.array(welded_verts, dtype=np.float64)
+    f_arr = np.array([[a, b, c] for a, b, c in welded_tris], dtype=np.int64)
+    if f_arr.ndim == 1 and len(f_arr) >= 3:
+        f_arr = f_arr.reshape(-1, 3)
+    v0v = v_arr[f_arr[:, 0]]
+    v1v = v_arr[f_arr[:, 1]]
+    v2v = v_arr[f_arr[:, 2]]
+    crosses = np.cross(v1v - v0v, v2v - v0v)
+    cross_norms = np.linalg.norm(crosses, axis=1)
+    safe_norms = np.where(cross_norms > 1e-15, cross_norms, 1.0)
+    tri_normals = crosses / safe_norms[:, None]
+    return _group_planar_triangles(v_arr, f_arr, tri_normals, 0.5, extent)
+
+
+def test_connectivity_constrained_touching_coplanar():
+    """Two coplanar face patches sharing an actual edge -> merged into
+    ONE group (the connectivity pass must not split touching patches)."""
+    nodes = [0, 0, 0,  2, 0, 0,  1, 1, 0,  3, 0, 0]
+    indices = [0, 1, 2,  1, 3, 2]
+    groups = _planar_groups_of(nodes, indices)
+    memberships = sorted(sorted(g["tri_indices"]) for g in groups)
+    assert memberships == [[0, 1]], (
+        f"expected one merged group, got {memberships}")
+
+
+def test_connectivity_constrained_separated_coplanar():
+    """Two coplanar patches on the same plane but disconnected (no shared
+    edge) -> TWO separate groups: the connectivity constraint prevents the
+    global-path over-merge of separated patches."""
+    nodes = [0, 0, 0,  1, 0, 0,  0.5, 1, 0,
+             3, 0, 0,  4, 0, 0,  3.5, 1, 0]
+    indices = [0, 1, 2,  3, 4, 5]
+    groups = _planar_groups_of(nodes, indices)
+    memberships = sorted(sorted(g["tri_indices"]) for g in groups)
+    assert memberships == [[0], [1]], (
+        f"expected two separate groups, got {memberships}")
+
+
+def test_connectivity_constrained_non_coplanar_adjacent():
+    """Edge-adjacent triangles with different normals -> NOT grouped
+    (region growing stops at the coplanarity predicate)."""
+    nodes = [0, 0, 0,  1, 0, 0,  0, 1, 0,  0, 0, 1]
+    indices = [0, 1, 2,  1, 3, 0]
+    groups = _planar_groups_of(nodes, indices)
+    memberships = sorted(sorted(g["tri_indices"]) for g in groups)
+    assert memberships == [[0], [1]], (
+        f"expected two separate groups, got {memberships}")
 

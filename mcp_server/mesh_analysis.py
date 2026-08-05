@@ -955,17 +955,109 @@ def _detect_components(welded_tris):
     return result
 
 
+def _coplanar_with_region(face_plane, region_plane, cos_tol, offset_tol):
+    """Coplanarity predicate between a face's canonical plane and a region's.
+
+    Each plane is ``(unit_normal, offset)``, canonicalised so the dominant
+    normal component is positive.  Returns True iff the normals agree within
+    *cos_tol* (absolute dot product) and the offsets differ by less than
+    *offset_tol*.  This is exactly the predicate the global first-match path
+    uses; R-2 keeps it as a clearly-isolated helper so R-7 can swap in a
+    running plane-fit.
+    """
+    nu, offset = face_plane
+    gn, goffset = region_plane
+    dot = abs(float(nu[0] * gn[0] + nu[1] * gn[1] + nu[2] * gn[2]))
+    return dot >= cos_tol and abs(offset - goffset) < offset_tol
+
+
+def _cluster_near_vertices(v_arr, tol):
+    """Union-find clusters of vertices nearer than *tol* to each other.
+
+    Deterministic grid-based clustering: each vertex probes the 27 cells
+    around its ``round(coord / tol)`` key (any two vertices within *tol* sit
+    in the same or an adjacent cell) and unions with earlier vertices found
+    closer than *tol*.  Returns ``{vertex_index: cluster_id}`` with cluster
+    ids assigned in ascending first-member index order.
+
+    R-2 uses this to recover edge-adjacency across exporter seams that
+    welding (eps) cannot bridge but snapping (snap_tol) would: the seam
+    fixtures duplicate a shared edge at ~1e-4 offsets, so a strict welded
+    edge map would split a touching face pair the rest of the pipeline
+    merges.
+    """
+    n = len(v_arr)
+    parent = list(range(n))
+
+    def _find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    tol2 = tol * tol
+    cells: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+    for vi in range(n):
+        p = v_arr[vi]
+        cell = (round(p[0] / tol), round(p[1] / tol), round(p[2] / tol))
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for u in cells.get((cell[0] + dx, cell[1] + dy,
+                                        cell[2] + dz), ()):
+                        q = v_arr[u]
+                        d2 = ((p[0] - q[0]) * (p[0] - q[0])
+                              + (p[1] - q[1]) * (p[1] - q[1])
+                              + (p[2] - q[2]) * (p[2] - q[2]))
+                        if d2 < tol2:
+                            ru, rv = _find(u), _find(vi)
+                            if ru != rv:
+                                parent[ru] = rv
+        cells[cell].append(vi)
+
+    clusters: Dict[int, int] = {}
+    out: Dict[int, int] = {}
+    for vi in range(n):
+        r = _find(vi)
+        cid = clusters.get(r)
+        if cid is None:
+            cid = len(clusters)
+            clusters[r] = cid
+        out[vi] = cid
+    return out
+
+
 def _group_planar_triangles(v_arr, f_arr, tri_normals, angle_tol_deg, extent):
     """Greedy-group triangles by coplanarity (normal within *angle_tol_deg*,
     plane offset within tol).
 
     Returns a list of dicts: ``{"normal": np.ndarray(3), "offset": float,
-    "tri_indices": List[int]}``.  Deterministic first-match assignment.
+    "tri_indices": List[int]}``.
+
+    R-2: a connectivity-constrained region-growing FIRST PASS is the primary
+    path.  Regions are grown from the largest-area unassigned triangle over
+    edge-adjacent faces (edge map over the welded soup, with near-coincident
+    seam vertices clustered first) using the same coplanarity predicate as
+    the global path.  Any triangle the connectivity pass cannot place falls
+    through to the unchanged global first-match path.  Deterministic: seeds
+    by largest area (smallest index on ties), neighbors traversed in sorted
+    index order, groups emitted in seed order.
     """
     cos_tol = math.cos(math.radians(angle_tol_deg))
     offset_tol = max(1e-6, 1e-4 * extent)
-    groups: List[Dict] = []
-    for ti in range(len(f_arr)):
+    # Edge-coincidence tolerance = extent-based floor of snap_tol: edges
+    # closer than this are the same seam edge (duplicated at exporter
+    # precision) and must merge here, or touching seam faces would split.
+    edge_adj_tol = max(1e-5, 5e-4 * extent)
+
+    n_faces = len(f_arr)
+
+    # Canonical per-face plane + area (degenerate faces -> None plane, ~0 area)
+    face_planes: List[Optional[Tuple[np.ndarray, float]]] = [None] * n_faces
+    face_areas: List[float] = [0.0] * n_faces
+    for ti in range(n_faces):
         n = tri_normals[ti]
         nn = float(np.linalg.norm(n))
         if nn < 1e-12:
@@ -978,8 +1070,79 @@ def _group_planar_triangles(v_arr, f_arr, tri_normals, angle_tol_deg, extent):
         if nu[dom] < 0:
             nu = -nu
             offset = -offset
+        face_planes[ti] = (nu, offset)
+        a = v_arr[f_arr[ti, 0]]
+        b = v_arr[f_arr[ti, 1]]
+        c = v_arr[f_arr[ti, 2]]
+        face_areas[ti] = 0.5 * float(np.linalg.norm(np.cross(b - a, c - a)))
+
+    # Face adjacency via an O(F) edge -> face-set map over the welded soup,
+    # keyed by cluster ids so seam-coincident edges count as shared.
+    cluster = _cluster_near_vertices(v_arr, edge_adj_tol)
+    edge_faces: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for ti in range(n_faces):
+        a = cluster[int(f_arr[ti, 0])]
+        b = cluster[int(f_arr[ti, 1])]
+        c = cluster[int(f_arr[ti, 2])]
+        for e in ((min(a, b), max(a, b)),
+                  (min(b, c), max(b, c)),
+                  (min(a, c), max(a, c))):
+            if e[0] != e[1]:
+                edge_faces[e].append(ti)
+    adj: List[set] = [set() for _ in range(n_faces)]
+    for faces in edge_faces.values():
+        m = len(faces)
+        for i in range(m):
+            fi = faces[i]
+            for j in range(i + 1, m):
+                fj = faces[j]
+                adj[fi].add(fj)
+                adj[fj].add(fi)
+
+    assigned = [False] * n_faces
+    groups: List[Dict] = []
+
+    # --- Connectivity-constrained first pass (primary) ---
+    seed_order = sorted(
+        (ti for ti in range(n_faces) if face_planes[ti] is not None),
+        key=lambda ti: (-face_areas[ti], ti))
+    for seed in seed_order:
+        if assigned[seed]:
+            continue
+        gn, goffset = face_planes[seed]
+        region: List[int] = []
+        queue = [seed]
+        seen = {seed}
+        qi = 0
+        while qi < len(queue):
+            cur = queue[qi]
+            qi += 1
+            region.append(cur)
+            for nbr in sorted(adj[cur]):
+                if nbr in seen or face_planes[nbr] is None:
+                    continue
+                if not _coplanar_with_region(
+                        face_planes[nbr], (gn, goffset),
+                        cos_tol, offset_tol):
+                    continue
+                seen.add(nbr)
+                queue.append(nbr)
+        for ti in region:
+            assigned[ti] = True
+        groups.append({"normal": gn.copy(), "offset": goffset,
+                       "tri_indices": sorted(region)})
+
+    # --- Global fallback (unchanged first-match path) ---
+    fallback_groups: List[Dict] = []
+    for ti in range(n_faces):
+        if assigned[ti]:
+            continue
+        plane = face_planes[ti]
+        if plane is None:
+            continue                       # degenerate normal -> skip
+        nu, offset = plane
         placed = False
-        for g in groups:
+        for g in fallback_groups:
             gn = g["normal"]
             dot = abs(float(nu[0] * gn[0] + nu[1] * gn[1] + nu[2] * gn[2]))
             if dot >= cos_tol and abs(offset - g["offset"]) < offset_tol:
@@ -987,8 +1150,9 @@ def _group_planar_triangles(v_arr, f_arr, tri_normals, angle_tol_deg, extent):
                 placed = True
                 break
         if not placed:
-            groups.append({"normal": nu.copy(), "offset": offset,
-                           "tri_indices": [ti]})
+            fallback_groups.append({"normal": nu.copy(), "offset": offset,
+                                    "tri_indices": [ti]})
+    groups.extend(fallback_groups)
     return groups
 
 
