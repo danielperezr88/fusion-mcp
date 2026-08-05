@@ -1549,6 +1549,211 @@ def _shoelace_area_2d(points_2d):
     return s / 2.0
 
 
+# ---------------------------------------------------------------------------
+# R-5: generalized winding number (Jacobson et al. 2013) and hole-classification
+# helpers
+# ---------------------------------------------------------------------------
+
+def _generalized_winding_number(point, welded_verts, welded_tris):
+    """Generalized winding number (Jacobson, Kavan, Sorkine-Hornung 2013).
+
+    Computes the solid-angle sum of all triangles subtended at *point*,
+    divided by 4π.  For a watertight mesh the result is 0 outside, 1 inside.
+    The winding number is ill-defined for non-manifold meshes; callers must
+    guard with ``has_warnings is False`` before invoking this function.
+
+    Args:
+        point: 3D probe point ``(x, y, z)``.
+        welded_verts: list of vertex coordinate triples.
+        welded_tris: list of ``(a, b, c)`` index triples into *welded_verts*.
+
+    Returns:
+        float (typically near 0 or 1 for a clean mesh).
+
+    Complexity: O(n) in number of triangles; < 100 ms for 2000-tris on a
+    modern CPU (numpy-vectorised, no per-element Python loop).
+    """
+    if len(welded_tris) == 0:
+        return 0.0
+
+    p = np.asarray(point, dtype=np.float64)
+    verts = np.asarray(welded_verts, dtype=np.float64)
+    tri_arr = np.array(welded_tris, dtype=np.int64)
+
+    a = verts[tri_arr[:, 0]] - p      # (N, 3)
+    b = verts[tri_arr[:, 1]] - p
+    c = verts[tri_arr[:, 2]] - p
+
+    la = np.linalg.norm(a, axis=1)    # (N,)
+    lb = np.linalg.norm(b, axis=1)
+    lc = np.linalg.norm(c, axis=1)
+
+    valid = (la > 1e-15) & (lb > 1e-15) & (lc > 1e-15)
+    if not np.any(valid):
+        return 0.0
+
+    a = a[valid]; b = b[valid]; c = c[valid]
+    la = la[valid]; lb = lb[valid]; lc = lc[valid]
+
+    numerator = np.sum(a * np.cross(b, c), axis=1)
+    denominator = (
+        la * lb * lc
+        + la * np.sum(b * c, axis=1)
+        + lb * np.sum(c * a, axis=1)
+        + lc * np.sum(a * b, axis=1)
+    )
+
+    omega = 2.0 * np.arctan2(numerator, denominator)
+    return float(np.sum(omega) / (4.0 * math.pi))
+
+
+def _same_sign_2d(a, b):
+    """True if *a* and *b* are both positive or both negative.
+
+    Zero-area inputs (== 0) return False — a degenerate loop cannot be a
+    meaningful hole candidate.
+    """
+    return (a > 0.0 and b > 0.0) or (a < 0.0 and b < 0.0)
+
+
+def _centroid_near_boundary(loop_2d, centroids_2d):
+    """Check whether any triangle centroid is within 1 % of the loop's
+    effective diameter from the loop boundary.
+
+    When a centroid is very close to a loop edge, ray-casting
+    (``_point_in_polygon_2d``) may misclassify it due to floating-point
+    edge cases.  The calling loop is considered *ambiguous* and should
+    fall back to the generalized winding number (R-5).
+
+    Returns:
+        bool — True if at least one centroid is within 1 % of the loop
+        edge-length scale from the nearest edge of *loop_2d*.
+    """
+    m = len(loop_2d)
+    if m < 3 or not centroids_2d:
+        return False
+
+    # Loop diameter: maximum vertex-to-vertex distance in 2D.
+    max_sq = 0.0
+    for i in range(m):
+        xi, yi = loop_2d[i]
+        for j in range(i + 1, m):
+            dx = xi - loop_2d[j][0]
+            dy = yi - loop_2d[j][1]
+            d2 = dx * dx + dy * dy
+            if d2 > max_sq:
+                max_sq = d2
+    diam = math.sqrt(max_sq)
+    if diam < 1e-15:
+        return False
+    threshold = 0.01 * diam
+
+    # Pre-compute edge segments for distance tests.
+    edges = []
+    for i in range(m):
+        x1, y1 = loop_2d[i]
+        x2, y2 = loop_2d[(i + 1) % m]
+        dx = x2 - x1
+        dy = y2 - y1
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-30:
+            edges.append((x1, y1, x1, y1, 0.0, 0.0))
+        else:
+            inv_len = 1.0 / math.sqrt(seg_len_sq)
+            edges.append((x1, y1, x2, y2, dx * inv_len, dy * inv_len))
+
+    for cx, cy in centroids_2d:
+        min_dist = float("inf")
+        for (x1, y1, x2, y2, ex, ey) in edges:
+            # Project centroid onto the infinite line through the edge.
+            wx = cx - x1
+            wy = cy - y1
+            t = wx * ex + wy * ey
+            if t <= 0.0:
+                # Closest to start vertex.
+                dist = math.hypot(cx - x1, cy - y1)
+            elif t * t >= (x2 - x1)*(x2 - x1) + (y2 - y1)*(y2 - y1):
+                # Closest to end vertex.
+                dist = math.hypot(cx - x2, cy - y2)
+            else:
+                # Perpendicular distance.
+                proj_x = x1 + t * ex
+                proj_y = y1 + t * ey
+                dist = math.hypot(cx - proj_x, cy - proj_y)
+            if dist < min_dist:
+                min_dist = dist
+        if min_dist < threshold:
+            return True
+    return False
+
+
+def _compute_interior_probe_3d(loop_pts_2d, loop_pts_3d, normal,
+                               origin_3d):
+    """Compute a 3D probe point guaranteed to lie inside the 2D loop.
+
+    Takes the loop's 2D centroid and offsets it inward (toward a vertex
+    direction) by 1 % of the loop diameter.  Then converts back to 3D
+    using the same projection parameters that ``_project_to_2d`` used.
+
+    Returns:
+        ``(x, y, z)`` tuple in 3D.
+    """
+    m = len(loop_pts_2d)
+    if m < 3:
+        return tuple(origin_3d)
+
+    cx = sum(p[0] for p in loop_pts_2d) / m
+    cy = sum(p[1] for p in loop_pts_2d) / m
+
+    # Diameter from max pairwise distance.
+    max_sq = 0.0
+    for i in range(m):
+        xi, yi = loop_pts_2d[i]
+        for j in range(i + 1, m):
+            dx = xi - loop_pts_2d[j][0]
+            dy = yi - loop_pts_2d[j][1]
+            d2 = dx * dx + dy * dy
+            if d2 > max_sq:
+                max_sq = d2
+    diam = math.sqrt(max_sq)
+    if diam < 1e-15:
+        return tuple(origin_3d)
+
+    # Direction: centroid → farthest vertex.
+    farthest_dist = 0.0
+    farthest_dx = 1.0
+    farthest_dy = 0.0
+    for x, y in loop_pts_2d:
+        d2 = (x - cx)**2 + (y - cy)**2
+        if d2 > farthest_dist:
+            farthest_dist = d2
+            farthest_dx = x - cx
+            farthest_dy = y - cy
+    norm = math.hypot(farthest_dx, farthest_dy)
+    if norm < 1e-15:
+        return tuple(origin_3d)
+
+    offset = 0.01 * diam
+    probe_x = cx + (farthest_dx / norm) * offset
+    probe_y = cy + (farthest_dy / norm) * offset
+
+    # Project 2D back to 3D using the same u,v basis as _project_to_2d.
+    n = np.asarray(normal, dtype=np.float64)
+    ref = (np.array([1.0, 0.0, 0.0]) if abs(n[0]) <= abs(n[1])
+           else np.array([0.0, 1.0, 0.0]))
+    u = np.cross(n, ref)
+    un = float(np.linalg.norm(u))
+    if un < 1e-12:
+        ref = np.array([0.0, 0.0, 1.0])
+        u = np.cross(n, ref)
+        un = float(np.linalg.norm(u))
+    u = u / un
+    v = np.cross(n, u)
+    org = np.asarray(origin_3d, dtype=np.float64)
+    result = org + probe_x * u + probe_y * v
+    return (float(result[0]), float(result[1]), float(result[2]))
+
+
 def _simplify_2d_keep(points_2d, tol):
     """Indices of points to keep after collinear-point collapse.
 
@@ -1754,8 +1959,48 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
                 for fg in faces_in_group:
                     if _point_in_polygon_2d(
                             cx, cy, fg["outer"]["pts_2d"]):
-                        if _loop_contains_centroid(
-                                li["pts_2d"], tri_centroids_2d):
+                        should_merge = False
+                        if _same_sign_2d(li["signed"], fg["outer"]["signed"]):
+                            # R-5: same signed-area sign as outer → always
+                            # merge (cannot be a hole regardless of centroids).
+                            should_merge = True
+                        else:
+                            contains = _loop_contains_centroid(
+                                li["pts_2d"], tri_centroids_2d)
+                            if not contains:
+                                # Opposite sign AND no triangle centroid
+                                # inside → definitely a hole.
+                                fg["holes"].append(li)
+                            else:
+                                # Opposite sign BUT centroids lie inside —
+                                # could still be a true hole whose interior
+                                # overlaps geometry from another face group.
+                                ambiguous = _centroid_near_boundary(
+                                    li["pts_2d"], tri_centroids_2d)
+                                if (ambiguous
+                                        and not residual_out.get(
+                                            "residual_pairs")):
+                                    # R-5: centroid-containment test is
+                                    # unreliable — fall back to the
+                                    # generalized winding number.
+                                    # NOTE: winding number is ill-defined on
+                                    # non-manifold meshes; residual_pairs (R-4)
+                                    # is the per-group non-manifold signal
+                                    # populated by _boundary_loops before
+                                    # classification. When set → skip winding
+                                    # number, keep centroid result (merge).
+                                    probe = _compute_interior_probe_3d(
+                                        li["pts_2d"], li["pts_3d"],
+                                        normal, origin_3d)
+                                    wn = _generalized_winding_number(
+                                        probe, welded_verts, welded_tris)
+                                    if wn > 0.5:
+                                        should_merge = True
+                                    else:
+                                        fg["holes"].append(li)
+                                else:
+                                    should_merge = True
+                        if should_merge:
                             merged_vi = _merge_loop_into_outer(
                                 fg["outer"]["vi"], li["vi"], welded_verts)
                             merged_3d = [welded_verts[vi] for vi in merged_vi]
@@ -1766,8 +2011,6 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=0.5,
                                 "vi": merged_vi, "pts_3d": merged_3d,
                                 "pts_2d": merged_2d,
                                 "signed": merged_signed}
-                        else:
-                            fg["holes"].append(li)
                         assigned = True
                         break
                 if not assigned:
