@@ -134,6 +134,7 @@ def test_structure_graph_summary_keys(fs):
         "mesh", "units", "component_count", "face_count", "edge_type_counts",
         "base_face_candidates", "has_warnings", "duckdb_table_schema",
         "query_example", "articulation_points", "connected_component_count",
+        "workstream",
     }
     assert summary["mesh"] == "0"
     assert summary["units"] == "cm"
@@ -206,6 +207,63 @@ def test_structure_graph_rebuild_overwrites(fs):
     assert "error" not in summary1 and "error" not in summary2
     assert summary2["face_count"] == 6
     assert conn2.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] == 7
+
+
+def test_structure_graph_workstream_summary(fs):
+    summary, _ = _run(fs)
+    ws = summary["workstream"]
+    assert set(ws) == {
+        "base_face_per_component", "unit_types", "rebuild_order",
+        "dag_has_cycles",
+    }
+    assert ws["base_face_per_component"] == {"0": "face:0"}
+    assert ws["unit_types"] == {"0": "base"}
+    assert ws["rebuild_order"] == ["component:0"]
+    assert ws["dag_has_cycles"] is False
+    assert isinstance(ws["rebuild_order"], list)
+    assert all(isinstance(s, str) for s in ws["rebuild_order"])
+
+
+def test_structure_graph_workstream_sql_agrees(fs):
+    summary, _ = _run(fs)
+    ws = summary["workstream"]
+    conn = mesh_graph._get_graph_db("0")
+
+    sql_rows = conn.execute(
+        "SELECT node_id, base_score FROM nodes "
+        "WHERE is_base_candidate = TRUE "
+        "ORDER BY node_id"
+    ).fetchall()
+    assert len(sql_rows) == 1
+    assert sql_rows[0][0] == "face:0"
+    assert pytest.approx(sql_rows[0][1], abs=1e-6) == 0.85
+
+    comp_rows = conn.execute(
+        "SELECT node_id, unit_type, rebuild_order FROM nodes "
+        "WHERE label = 'Component' "
+        "ORDER BY rebuild_order"
+    ).fetchall()
+    assert comp_rows == [("component:0", "base", 0)]
+
+    assert ws["base_face_per_component"] == {"0": "face:0"}
+    assert ws["unit_types"] == {"0": "base"}
+    assert ws["rebuild_order"] == ["component:0"]
+    assert ws["dag_has_cycles"] is False
+
+
+def test_structure_graph_workstream_raises(fs, monkeypatch):
+    import mcp_server.mesh_graph as mg
+
+    def _fail(*a, **k):
+        raise RuntimeError("simulated T9 failure")
+
+    monkeypatch.setattr(mg, "_build_dependency_order", _fail)
+    try:
+        summary, _ = _run(fs)
+        assert "error" in summary
+        assert "structure graph failed" in summary["error"]
+    finally:
+        monkeypatch.undo()
 
 
 # ---------------------------------------------------------------------------

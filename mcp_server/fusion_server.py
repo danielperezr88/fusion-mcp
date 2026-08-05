@@ -1516,9 +1516,11 @@ def structure_graph(mesh: str = "0", units: str = "cm") -> str:
     PRELIMINARY base-face candidates, the persisted table schema, and a
     ready-to-run query example) helps the agent decide the first query.
 
-    NOTE: ``base_face_candidates`` is a PRELIMINARY heuristic (the
-    largest-area face per component); real scored base-face selection lands
-    in a later milestone.
+    NOTE: ``base_face_candidates`` is retained as a legacy preliminary key
+    (largest-area face per component).  The real scored analysis (composite
+    base-face scoring, unit classification, dependency ordering) is in the
+    ``workstream`` section of the summary — see that for
+    ``base_face_per_component`` / ``unit_types`` / ``rebuild_order``.
 
     Args:
         mesh:  Body name or index of a mesh body.
@@ -1569,6 +1571,31 @@ def structure_graph(mesh: str = "0", units: str = "cm") -> str:
             return [row[1] for row in
                     conn.execute(f"PRAGMA table_info({table})").fetchall()]
 
+        # T10: build workstream summary from attrs set by T9 functions
+        # (_score_base_faces / _classify_units / _build_dependency_order
+        # already called inside build_structure_graph — just READ here).
+        base_face_per_component = {}
+        for n, d in graph.nodes(data=True):
+            if d.get("label") == "Face" and d.get("is_base_candidate"):
+                cid = str(int(d.get("component_id", 0)))
+                base_face_per_component[cid] = n
+        base_face_per_component = dict(
+            sorted(base_face_per_component.items(),
+                   key=lambda kv: int(kv[0])))
+        unit_types = {}
+        for n, d in graph.nodes(data=True):
+            if d.get("label") == "Component":
+                cid = str(int(d.get("component_id", 0)))
+                unit_types[cid] = d.get("unit_type", "freeform")
+        unit_types = dict(
+            sorted(unit_types.items(), key=lambda kv: int(kv[0])))
+        workstream = {
+            "base_face_per_component": base_face_per_component,
+            "unit_types": unit_types,
+            "rebuild_order": list(graph.graph.get("rebuild_order", [])),
+            "dag_has_cycles": bool(graph.graph.get("dag_has_cycles", False)),
+        }
+
         summary = {
             "mesh": data.get("mesh", mesh),
             "units": units,
@@ -1586,6 +1613,7 @@ def structure_graph(mesh: str = "0", units: str = "cm") -> str:
                               "WHERE label='Face' ORDER BY area_cm2 DESC"),
             "articulation_points": articulation_points,
             "connected_component_count": len(components),
+            "workstream": workstream,
         }
     except Exception as e:
         return json.dumps({"error": f"structure graph failed: {e}"},
