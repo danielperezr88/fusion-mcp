@@ -12,6 +12,7 @@ import base64
 import importlib.util
 import os
 import math
+import networkx as nx
 from mcp.server.fastmcp import FastMCP, Image
 
 FUSION_URL = "http://127.0.0.1:7432"
@@ -80,6 +81,36 @@ def _load_mesh_analysis():
     raise FileNotFoundError(
         "mcp_server/mesh_analysis.py could not be found. Keep the fusion-mcp "
         "repository importable so analyze_mesh can run mesh analysis.")
+
+
+def _load_mesh_graph():
+    """Import mcp_server.mesh_graph from the repo, wherever it lives.
+
+    Same fallback-by-file-location strategy as _load_mesh_analysis: works
+    both when the repo root is on sys.path and when fusion_server.py is
+    launched directly by an MCP client.
+    """
+    try:
+        from mcp_server import mesh_graph
+        return mesh_graph
+    except ImportError:
+        pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(here, "mesh_graph.py"),
+        os.path.join(here, os.pardir, "mcp_server", "mesh_graph.py"),
+    )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            "fusionmcp_mesh_graph", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError(
+        "mcp_server/mesh_graph.py could not be found. Keep the fusion-mcp "
+        "repository importable so structure_graph can run graph analysis.")
 
 
 def _load_mesh_slicer():
@@ -1437,6 +1468,127 @@ def analyze_mesh(mesh: str = "0", units: str = "cm") -> str:
     report["mesh"] = data.get("mesh", mesh)
     report["units"] = units
     return json.dumps(report, indent=2)
+
+
+_GRAPH_EDGE_RELATIONS = (
+    "COMPONENT_OF", "CONTAINS", "COPLANAR", "EDGE_ADJACENT",
+    "EXTRUSION_ALIGNED", "HAS_BASE", "PARALLEL", "PERPENDICULAR",
+    "SAME_ORIENTATION", "VERTEX_TOUCH",
+)
+"""The 10 edge relation types the structure graph can carry (sorted)."""
+
+
+def _base_face_candidates(graph):
+    """PRELIMINARY base-face heuristic: the largest-area Face per component.
+
+    T9 replaces this with real scored candidates (unit classification,
+    dependency ordering); the summary key stays stable until then.
+    """
+    best = {}
+    for n, d in graph.nodes(data=True):
+        if d.get("label") != "Face":
+            continue
+        comp = d.get("component_id")
+        area = d.get("area_cm2", 0.0)
+        if comp not in best or area > best[comp][1]:
+            best[comp] = (n, area)
+    return [{"component_id": comp, "face_id": fid, "area_cm2": area}
+            for comp, (fid, area) in sorted(best.items())]
+
+
+@mcp.tool()
+def structure_graph(mesh: str = "0", units: str = "cm") -> str:
+    """
+    Build the structure graph of a mesh body and persist it to DuckDB.
+
+    Fetches the mesh triangle data (nodes/indices) from Fusion, decomposes it
+    into planar faces / curved patches (mesh_analysis), builds the NetworkX
+    property graph (face/hole/curved/component nodes; 10 edge relation types)
+    via mesh_graph.build_structure_graph, runs graph algorithms (articulation
+    points, connected components), and persists the FULL graph into an
+    in-memory DuckDB database (nodes/edges tables) so later queries can run
+    SQL against it (mesh_graph._get_graph_db).
+
+    Returns a JSON summary -- NOT the full graph.  The full graph stays
+    server-side in DuckDB; the summary (counts, edge-type histogram,
+    PRELIMINARY base-face candidates, the persisted table schema, and a
+    ready-to-run query example) helps the agent decide the first query.
+
+    NOTE: ``base_face_candidates`` is a PRELIMINARY heuristic (the
+    largest-area face per component); real scored base-face selection lands
+    in a later milestone.
+
+    Args:
+        mesh:  Body name or index of a mesh body.
+        units: Units for the report: mm, cm, or in (default cm).
+    """
+    try:
+        _cm_to_unit_factor(units)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    raw = _call("extract_mesh_data", {"mesh": mesh})
+    if raw.startswith("Error: "):
+        return json.dumps({"error": raw[len("Error: "):]}, indent=2)
+    if raw.startswith(("Cannot reach", "Unexpected error")):
+        return raw
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return raw
+    if "error" in data:
+        return json.dumps({"error": data["error"]}, indent=2)
+    try:
+        mesh_analysis = _load_mesh_analysis()
+        mesh_graph = _load_mesh_graph()
+        decompose_result = mesh_analysis.decompose_mesh_faces(
+            data.get("nodes", []), data.get("indices", []))
+        graph = mesh_graph.build_structure_graph(decompose_result)
+
+        articulation_points = sorted(nx.articulation_points(graph))
+        components = list(nx.connected_components(graph))
+        graph.graph["articulation_points"] = articulation_points
+        graph.graph["connected_components"] = [sorted(c) for c in components]
+        for fid in articulation_points:
+            if fid in graph.nodes and graph.nodes[fid].get("label") == "Face":
+                graph.nodes[fid]["is_articulation_point"] = True
+
+        conn = mesh_graph._persist_to_duckdb(graph, mesh)
+
+        face_count = sum(1 for n, d in graph.nodes(data=True)
+                         if d.get("label") == "Face")
+        relation_counts = {r: 0 for r in _GRAPH_EDGE_RELATIONS}
+        for _, _, d in graph.edges(data=True):
+            rel = d.get("relation")
+            if rel in relation_counts:
+                relation_counts[rel] += 1
+        edge_type_counts = dict(sorted(relation_counts.items()))
+
+        def _table_columns(conn, table):
+            return [row[1] for row in
+                    conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+        summary = {
+            "mesh": data.get("mesh", mesh),
+            "units": units,
+            "component_count": int(
+                decompose_result.get("components_detected", 0)),
+            "face_count": face_count,
+            "edge_type_counts": edge_type_counts,
+            "base_face_candidates": _base_face_candidates(graph),
+            "has_warnings": bool(decompose_result.get("has_warnings", False)),
+            "duckdb_table_schema": {
+                "nodes": _table_columns(conn, "nodes"),
+                "edges": _table_columns(conn, "edges"),
+            },
+            "query_example": ("SELECT node_id, area_cm2 FROM nodes "
+                              "WHERE label='Face' ORDER BY area_cm2 DESC"),
+            "articulation_points": articulation_points,
+            "connected_component_count": len(components),
+        }
+    except Exception as e:
+        return json.dumps({"error": f"structure graph failed: {e}"},
+                          indent=2)
+    return json.dumps(summary, indent=2)
 
 
 @mcp.tool()
