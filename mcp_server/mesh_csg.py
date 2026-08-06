@@ -43,7 +43,10 @@ import math
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from mcp_server.mesh_slicer import slice_mesh_at
+try:
+    from mcp_server.mesh_slicer import slice_mesh_at
+except ImportError:
+    from mesh_slicer import slice_mesh_at
 
 Float3 = Tuple[float, float, float]
 

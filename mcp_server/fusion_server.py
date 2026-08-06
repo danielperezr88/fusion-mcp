@@ -13,6 +13,7 @@ import importlib.util
 import os
 import math
 import re
+import sys
 from decimal import Decimal
 from typing import Optional
 import networkx as nx
@@ -20,6 +21,33 @@ from mcp.server.fastmcp import FastMCP, Image
 
 FUSION_URL = "http://127.0.0.1:7432"
 mcp = FastMCP("Fusion 360")
+
+
+_LOADER_CACHE = {}
+
+
+def _spec_load(name, path):
+    """Spec-load a module by file location, register it, and cache it.
+
+    ``spec_from_file_location`` alone leaves the module unregistered in
+    ``sys.modules``. Python 3.13's ``dataclasses._is_type`` resolves
+    ``cls.__module__`` through ``sys.modules`` (mesh_analysis defines a
+    ``@dataclass(frozen=True)`` class), so an unregistered spec-loaded module
+    crashes at class-definition time. Register the module under the EXACT name
+    passed to ``spec_from_file_location`` BEFORE executing it. The module-level
+    cache also guarantees the (heavy) exec runs at most once per process -- the
+    first exec imports numpy/trimesh, which hangs in an anyio tool-call worker
+    thread, so it must happen on the main thread at startup instead.
+    """
+    cached = _LOADER_CACHE.get(name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    _LOADER_CACHE[name] = module
+    return module
 
 
 def _load_scad_translator():
@@ -32,8 +60,12 @@ def _load_scad_translator():
     MCP client) the script dir is on sys.path instead, so fall back to loading
     the module by file location.
     """
+    cached = _LOADER_CACHE.get("fusionmcp_scad_translator")
+    if cached is not None:
+        return cached
     try:
         from mcp_server import scad_translator
+        _LOADER_CACHE["fusionmcp_scad_translator"] = scad_translator
         return scad_translator
     except ImportError:
         pass
@@ -46,11 +78,7 @@ def _load_scad_translator():
     for path in candidates:
         if not os.path.isfile(path):
             continue
-        spec = importlib.util.spec_from_file_location(
-            "fusionmcp_scad_translator", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return _spec_load("fusionmcp_scad_translator", path)
     raise FileNotFoundError(
         "mcp_server/scad_translator.py could not be found. Keep the fusion-mcp "
         "repository importable so create_from_scad can resolve SCAD code.")
@@ -63,8 +91,12 @@ def _load_mesh_analysis():
     both when the repo root is on sys.path and when fusion_server.py is
     launched directly by an MCP client.
     """
+    cached = _LOADER_CACHE.get("fusionmcp_mesh_analysis")
+    if cached is not None:
+        return cached
     try:
         from mcp_server import mesh_analysis
+        _LOADER_CACHE["fusionmcp_mesh_analysis"] = mesh_analysis
         return mesh_analysis
     except ImportError:
         pass
@@ -76,11 +108,7 @@ def _load_mesh_analysis():
     for path in candidates:
         if not os.path.isfile(path):
             continue
-        spec = importlib.util.spec_from_file_location(
-            "fusionmcp_mesh_analysis", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return _spec_load("fusionmcp_mesh_analysis", path)
     raise FileNotFoundError(
         "mcp_server/mesh_analysis.py could not be found. Keep the fusion-mcp "
         "repository importable so analyze_mesh can run mesh analysis.")
@@ -93,8 +121,12 @@ def _load_mesh_graph():
     both when the repo root is on sys.path and when fusion_server.py is
     launched directly by an MCP client.
     """
+    cached = _LOADER_CACHE.get("fusionmcp_mesh_graph")
+    if cached is not None:
+        return cached
     try:
         from mcp_server import mesh_graph
+        _LOADER_CACHE["fusionmcp_mesh_graph"] = mesh_graph
         return mesh_graph
     except ImportError:
         pass
@@ -106,11 +138,7 @@ def _load_mesh_graph():
     for path in candidates:
         if not os.path.isfile(path):
             continue
-        spec = importlib.util.spec_from_file_location(
-            "fusionmcp_mesh_graph", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return _spec_load("fusionmcp_mesh_graph", path)
     raise FileNotFoundError(
         "mcp_server/mesh_graph.py could not be found. Keep the fusion-mcp "
         "repository importable so structure_graph can run graph analysis.")
@@ -123,8 +151,12 @@ def _load_mesh_slicer():
     both when the repo root is on sys.path and when fusion_server.py is
     launched directly by an MCP client.
     """
+    cached = _LOADER_CACHE.get("fusionmcp_mesh_slicer")
+    if cached is not None:
+        return cached
     try:
         from mcp_server import mesh_slicer
+        _LOADER_CACHE["fusionmcp_mesh_slicer"] = mesh_slicer
         return mesh_slicer
     except ImportError:
         pass
@@ -136,11 +168,7 @@ def _load_mesh_slicer():
     for path in candidates:
         if not os.path.isfile(path):
             continue
-        spec = importlib.util.spec_from_file_location(
-            "fusionmcp_mesh_slicer", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return _spec_load("fusionmcp_mesh_slicer", path)
     raise FileNotFoundError(
         "mcp_server/mesh_slicer.py could not be found. Keep the fusion-mcp "
         "repository importable so slice_mesh can run plane intersection.")
@@ -153,8 +181,12 @@ def _load_mesh_csg():
     when the repo root is on sys.path and when fusion_server.py is launched
     directly by an MCP client.
     """
+    cached = _LOADER_CACHE.get("fusionmcp_mesh_csg")
+    if cached is not None:
+        return cached
     try:
         from mcp_server import mesh_csg
+        _LOADER_CACHE["fusionmcp_mesh_csg"] = mesh_csg
         return mesh_csg
     except ImportError:
         pass
@@ -166,11 +198,7 @@ def _load_mesh_csg():
     for path in candidates:
         if not os.path.isfile(path):
             continue
-        spec = importlib.util.spec_from_file_location(
-            "fusionmcp_mesh_csg", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return _spec_load("fusionmcp_mesh_csg", path)
     raise FileNotFoundError(
         "mcp_server/mesh_csg.py could not be found. Keep the fusion-mcp "
         "repository importable so reconstruct_mesh can build CSG trees.")
@@ -183,8 +211,12 @@ def _load_parameter_schemas():
     both when the repo root is on sys.path and when fusion_server.py is
     launched directly by an MCP client.
     """
+    cached = _LOADER_CACHE.get("fusionmcp_parameter_schemas")
+    if cached is not None:
+        return cached
     try:
         from mcp_server import parameter_schemas
+        _LOADER_CACHE["fusionmcp_parameter_schemas"] = parameter_schemas
         return parameter_schemas
     except ImportError:
         pass
@@ -196,11 +228,7 @@ def _load_parameter_schemas():
     for path in candidates:
         if not os.path.isfile(path):
             continue
-        spec = importlib.util.spec_from_file_location(
-            "fusionmcp_parameter_schemas", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return _spec_load("fusionmcp_parameter_schemas", path)
     raise FileNotFoundError(
         "mcp_server/parameter_schemas.py could not be found. Keep the "
         "fusion-mcp repository importable so select_parameter_schema can "
@@ -214,8 +242,12 @@ def _load_workflow_guide():
     works both when the repo root is on sys.path and when fusion_server.py
     is launched directly by an MCP client.
     """
+    cached = _LOADER_CACHE.get("fusionmcp_workflow_guide")
+    if cached is not None:
+        return cached
     try:
         from mcp_server import workflow_guide
+        _LOADER_CACHE["fusionmcp_workflow_guide"] = workflow_guide
         return workflow_guide
     except ImportError:
         pass
@@ -227,11 +259,7 @@ def _load_workflow_guide():
     for path in candidates:
         if not os.path.isfile(path):
             continue
-        spec = importlib.util.spec_from_file_location(
-            "fusionmcp_workflow_guide", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return _spec_load("fusionmcp_workflow_guide", path)
     raise FileNotFoundError(
         "mcp_server/workflow_guide.py could not be found. Keep the "
         "fusion-mcp repository importable so get_workflow_guide can serve "
@@ -2827,5 +2855,26 @@ def save_as(name: str = "My Design", description: str = "Saved") -> str:
 if __name__ == "__main__":
     print("Fusion 360 MCP Server starting...")
     print(f"Connecting to Fusion add-in at {FUSION_URL}")
+    # Pre-load the spec-loaded mesh/scad modules ONCE on the main thread before
+    # mcp.run(). The first exec imports numpy/trimesh/openscad-evaluator, which
+    # hangs (>120s) inside an anyio tool-call worker thread; on the main thread
+    # the identical import completes in well under a second. The loaders cache
+    # their result, so tool calls afterwards are cheap cache hits. Each load is
+    # non-fatal: a missing optional dependency must not prevent server start --
+    # the loader retries at call time and returns its normal graceful error.
+    for _loader_name in (
+            "_load_mesh_analysis",
+            "_load_mesh_graph",
+            "_load_mesh_slicer",
+            "_load_scad_translator",
+            "_load_parameter_schemas",
+            "_load_workflow_guide",
+    ):
+        try:
+            globals()[_loader_name]()
+            print(f"Pre-loaded {_loader_name} (OK)")
+        except Exception as _load_err:
+            print(f"NOTE: could not pre-load {_loader_name}: {_load_err} "
+                  f"(will retry at call time)")
     print("Waiting for MCP client to connect via stdio...")
     mcp.run(transport="stdio")
