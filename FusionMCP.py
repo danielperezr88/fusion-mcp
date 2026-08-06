@@ -32,6 +32,7 @@ _result_events: dict = {}
 
 CUSTOM_EVENT_ID = "FusionMCPTickV4"
 PORT = 7432
+ADDIN_CMD_TIMEOUT = 300
 
 
 # ---- HTTP Handler ----
@@ -64,8 +65,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         _cmd_queue.put(data)
         if app:
             app.fireCustomEvent(CUSTOM_EVENT_ID, cmd_id)
-        event.wait(timeout=30)
-        result = _results.pop(cmd_id, {"error": "Timeout - Fusion did not respond in 30s"})
+        event.wait(timeout=ADDIN_CMD_TIMEOUT)
+        result = _results.pop(cmd_id, {"error": f"Timeout - Fusion did not respond in {ADDIN_CMD_TIMEOUT}s"})
         _result_events.pop(cmd_id, None)
         return result
 

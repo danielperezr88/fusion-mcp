@@ -355,7 +355,8 @@ def test_review_reconstruction_server_path_happy(bridge, monkeypatch):
 
     monkeypatch.setattr(fs.requests, "post", fake_post)
 
-    out = fs.review_reconstruction(mesh=mesh, body=body, views=views)
+    out = fs.review_reconstruction(mesh=mesh, body=body, views=views,
+                                   job_id="sync")
 
     assert isinstance(out, list), f"expected list, got {out!r}"
     assert len(out) == 7, f"expected [text, Image x6], got {len(out)} items"
@@ -443,7 +444,8 @@ def test_review_reconstruction_server_path_failure(bridge, monkeypatch):
 
     monkeypatch.setattr(fs.requests, "post", fake_post)
 
-    out = fs.review_reconstruction(mesh="999", body="0", views=["isometric"])
+    out = fs.review_reconstruction(mesh="999", body="0", views=["isometric"],
+                                   job_id="sync")
     assert isinstance(out, str), f"expected error string, got {out!r}"
     data = json.loads(out)
     assert "error" in data, data

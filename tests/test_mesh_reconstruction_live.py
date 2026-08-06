@@ -498,7 +498,8 @@ def check_2_slice():
 def check_3_prismatic():
     call("clear_design")
     _import_cube("t12_prism_cube")
-    out = _FS.reconstruct_mesh(mesh="0", strategy="prismatic", units="mm")
+    out = _FS.reconstruct_mesh(mesh="0", strategy="prismatic", units="mm",
+                               job_id="sync")
     data = _parse_ok(out, "reconstruct_mesh prismatic")
     if data.get("strategy") != "prismatic":
         raise AssertionError(f"strategy={data.get('strategy')}, expected prismatic")
@@ -530,7 +531,8 @@ def check_4_revolved():
     if isinstance(imp, str) and imp.startswith("Error: "):
         raise AssertionError(f"import_mesh_data cylinder: {imp}")
     _parse_ok(imp, "import_mesh_data cylinder")
-    out = _FS.reconstruct_mesh(mesh="0", strategy="revolved", units="mm")
+    out = _FS.reconstruct_mesh(mesh="0", strategy="revolved", units="mm",
+                               job_id="sync")
     data = _parse_ok(out, "reconstruct_mesh revolved")
     if data.get("strategy") != "revolved":
         raise AssertionError(f"strategy={data.get('strategy')}, expected revolved")
@@ -582,12 +584,14 @@ def check_6_annotate():
             out = _FS.annotate_mesh_parameters(
                 mesh="0",
                 views=["isometric", "front", "top", "right"],
-                units="cm")
+                units="cm",
+                job_id="sync")
         finally:
             requests.post = _real_post
     else:
         out = _FS.annotate_mesh_parameters(
-            mesh="0", views=["isometric", "front", "top", "right"], units="cm")
+            mesh="0", views=["isometric", "front", "top", "right"], units="cm",
+            job_id="sync")
     if not isinstance(out, list):
         raise AssertionError(f"expected [text, Image x4], got {out!r}")
     if len(out) != 5:
@@ -619,7 +623,8 @@ def check_6_annotate():
 def check_7_compare():
     call("clear_design")
     _import_cube("t12_compare_cube")
-    rec = _FS.reconstruct_mesh(mesh="0", strategy="prismatic", units="mm")
+    rec = _FS.reconstruct_mesh(mesh="0", strategy="prismatic", units="mm",
+                               job_id="sync")
     rdata = _parse_ok(rec, "reconstruct_mesh (compare setup)")
     if rdata.get("method") != "csg_translation":
         raise AssertionError(f"method={rdata.get('method')} for compare setup")
@@ -659,7 +664,7 @@ def check_8_workflow_guide():
 def check_9_organic():
     call("clear_design")
     _import_cube("t12_organic_cube")
-    out = _FS.reconstruct_mesh(mesh="0", strategy="organic")
+    out = _FS.reconstruct_mesh(mesh="0", strategy="organic", job_id="sync")
     # The not-available error surfaces EITHER as a JSON {"error": ...}
     # envelope OR as the raw "Error: " string from _call (_envelope_organic
     # returns the _call prefix verbatim when json.loads fails) -- both are
@@ -703,7 +708,7 @@ def check_10_failures():
     if data != {"error": "Axis must be X, Y, or Z"}:
         raise AssertionError(f"slice_mesh(axis=W): {data!r}")
     # 10c: unknown strategy -> EXACT error.
-    out = _FS.reconstruct_mesh(strategy="bogus")
+    out = _FS.reconstruct_mesh(strategy="bogus", job_id="sync")
     data = json.loads(out)
     if data != {"error": "Unknown strategy 'bogus'. Supported: auto, "
                          "prismatic, revolved, csg_decompose, organic"}:

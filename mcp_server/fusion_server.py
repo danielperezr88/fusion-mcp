@@ -282,6 +282,28 @@ def _call(command: str, params: dict = None, timeout: int = 30) -> str:
         return f"Unexpected error: {e}"
 
 
+def _job_status(job_id: str) -> dict:
+    """Poll envelope for a launched job id (lazy sibling import like bundle)."""
+    from jobs import get_job  # lazy: script-dir import in prod, sys.path in tests
+    record = get_job(job_id)
+    if record is None:
+        return {"job_id": job_id, "status": "not_found"}
+    if record["status"] == "running":
+        return {"job_id": job_id, "status": "running"}
+    if record["status"] == "completed":
+        return {"job_id": job_id, "status": "completed",
+                "result": record["result"]}
+    return {"job_id": job_id, "status": "error", "error": record["error"]}
+
+
+def _launch_job(fn, *args, **kwargs) -> str:
+    """Launch ``fn(*args, **kwargs)`` on a background thread and return the
+    launch envelope (lazy sibling import like bundle)."""
+    from jobs import launch_job  # lazy: script-dir import in prod, sys.path in tests
+    return json.dumps({"job_id": launch_job(fn, *args, **kwargs),
+                       "status": "running"}, indent=2)
+
+
 # ---- Status & Info ----
 
 @mcp.tool()
@@ -1361,8 +1383,8 @@ def import_sketch_file(path: str, format: str = "", plane: str = "XY") -> str:
 
 # ---- OpenSCAD Pipeline ----
 
-@mcp.tool()
-def run_scad(code: str, params: str = "", quality: int = 100, units: str = "mm") -> str:
+def _run_scad_sync(code: str, params: str = "", quality: int = 100,
+                   units: str = "mm") -> str:
     """
     Render OpenSCAD code to a mesh body using the bundled OpenSCAD + BOSL2.
 
@@ -1382,7 +1404,34 @@ def run_scad(code: str, params: str = "", quality: int = 100, units: str = "mm")
 
 
 @mcp.tool()
-def update_scad_body(body: str = "0", params: str = "", code: str = "") -> str:
+def run_scad(code: str, params: str = "", quality: int = 100, units: str = "mm",
+             job_id: str = "") -> str:
+    """
+    Render OpenSCAD code to a mesh body using the bundled OpenSCAD + BOSL2.
+
+    Writes the code to a temp .scad file, renders it to STL with the bundled
+    OpenSCAD (BOSL2 available via include <BOSL2/std.scad>), imports the STL
+    as a mesh body, and stores the source in the body's 'scad_source'
+    attribute so it can be re-run later with update_scad_body.
+
+    Args:
+        code:    Raw OpenSCAD source, e.g. 'cube([10, 10, 10]);' or
+                 'include <BOSL2/std.scad>\\ncuboid([10,10,10]);'.
+        params:  Optional '-D' variable overrides, e.g. 'Grid_Pitch=50;Frame_Depth=12'.
+        quality: Sets '$fn' (facet count) prepended to the code. 0 = leave code unchanged.
+        units:   Units of the OpenSCAD model: mm, cm, or in.
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _run_scad_sync(code, params, quality, units)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_run_scad_sync, code, params, quality, units)
+
+
+def _update_scad_body_sync(body: str = "0", params: str = "",
+                           code: str = "") -> str:
     """
     Re-run a stored .scad source on a mesh body with new parameters.
 
@@ -1396,6 +1445,30 @@ def update_scad_body(body: str = "0", params: str = "", code: str = "") -> str:
         code:   Optional replacement OpenSCAD source; overrides the stored source when provided.
     """
     return _call("update_scad_body", {"body": body, "params": params, "code": code}, timeout=330)
+
+
+@mcp.tool()
+def update_scad_body(body: str = "0", params: str = "", code: str = "",
+                     job_id: str = "") -> str:
+    """
+    Re-run a stored .scad source on a mesh body with new parameters.
+
+    Reads the 'scad_source' attribute stored by run_scad, deletes the old mesh
+    body, re-renders, and creates a new mesh body. The new body is renamed to
+    the original body's name.
+
+    Args:
+        body:   Body name or index of a mesh body created by run_scad.
+        params: Optional '-D' variable overrides for the re-render.
+        code:   Optional replacement OpenSCAD source; overrides the stored source when provided.
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _update_scad_body_sync(body, params, code)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_update_scad_body_sync, body, params, code)
 
 
 @mcp.tool()
@@ -1491,6 +1564,10 @@ def analyze_mesh(mesh: str = "0", units: str = "cm",
             angle_tolerance_deg=angle_tolerance_deg,
             offset_tol=offset_tol, snap_tol=snap_tol,
             simplify_vertices=simplify_vertices, preset=preset)
+        decompose_error = (report.get("face_decomposition") or {}).get("error")
+        if decompose_error:
+            return json.dumps({"error": f"analysis failed: {decompose_error}"},
+                              indent=2)
         report = mesh_analysis.scale_report(report, factor)
     except Exception as e:
         return json.dumps({"error": f"analysis failed: {e}"}, indent=2)
@@ -1599,6 +1676,11 @@ def structure_graph(mesh: str = "0", units: str = "cm",
             angle_tolerance_deg=angle_tolerance_deg,
             simplify_vertices=simplify_vertices,
             offset_tol=offset_tol, snap_tol=snap_tol, preset=preset)
+        decompose_error = decompose_result.get("error")
+        if decompose_error:
+            return json.dumps(
+                {"error": f"structure graph failed: {decompose_error}"},
+                indent=2)
         graph = mesh_graph.build_structure_graph(decompose_result)
 
         articulation_points = sorted(nx.articulation_points(graph))
@@ -1949,9 +2031,8 @@ def _envelope_organic(result, operation):
     }, indent=2)
 
 
-@mcp.tool()
-def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
-                     params: dict = None) -> str:
+def _reconstruct_mesh_sync(mesh: str = "0", strategy: str = "auto",
+                           units: str = "mm", params: dict = None) -> str:
     """
     Reconstruct a mesh body as parametric CAD features (CSG tree or revolve).
 
@@ -2054,7 +2135,49 @@ def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
 
 
 @mcp.tool()
-def reconstruct_from_faces(mesh: str = "0", units: str = "mm") -> str:
+def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
+                     params: dict = None, job_id: str = "") -> str:
+    """
+    Reconstruct a mesh body as parametric CAD features (CSG tree or revolve).
+
+    Fetches the mesh triangle data from Fusion and runs pure-Python
+    reconstruction: `prismatic` slices the mesh at interior heights along an
+    axis and emits ONE linear_extrude of the constant cross-section (holes
+    become polygon paths); `revolved` computes the half cross-section profile
+    through the Z-containing plane and revolves it around the Z axis;
+    `csg_decompose` fits boxes/cylinders to planar face regions and emits a
+    union tree.  The CSG trees / revolve profiles are scaled cm -> units and
+    handed to the add-in's create_from_csg_tree / revolve_cross_section
+    handlers, which turn them into native Fusion timeline features.
+
+    `organic` uses Fusion's PREVIEW MeshConvertFeature API instead: the mesh
+    is converted in-place by Fusion and the result may be a dumb BaseFeature
+    body rather than a parameterized solid (see the envelope's `note`).
+    PREVIEW CAVEAT: the API is only present on recent Fusion builds and is
+    additionally gated by the license; when unavailable the tool returns a
+    graceful not-available error instead of a converted body.
+
+    Stage 6 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:     Body name or index of a mesh body.
+        strategy: auto (routes via the analysis recommendation), prismatic,
+                  revolved, csg_decompose, or organic (PREVIEW API).
+        units:    Units for the reconstructed model: mm, cm, or in (default mm).
+        params:   Optional strategy params, e.g. {"axis": "Z",
+                  "num_slices": 3, "angle_deg": 360}.  For organic also
+                  {"operation": "parametric"|"base"} (default parametric).
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _reconstruct_mesh_sync(mesh, strategy, units, params)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_reconstruct_mesh_sync, mesh, strategy, units, params)
+
+
+def _reconstruct_from_faces_sync(mesh: str = "0", units: str = "mm") -> str:
     """Reconstruct a mesh body using exact face polygon boundaries.
 
     Analyzes the mesh, extracts planar face decomposition, identifies the
@@ -2201,6 +2324,30 @@ def reconstruct_from_faces(mesh: str = "0", units: str = "mm") -> str:
 
 
 @mcp.tool()
+def reconstruct_from_faces(mesh: str = "0", units: str = "mm",
+                           job_id: str = "") -> str:
+    """Reconstruct a mesh body using exact face polygon boundaries.
+
+    Analyzes the mesh, extracts planar face decomposition, identifies the
+    dominant extrusion direction, and creates native Fusion sketches +
+    extrudes from the actual polygon vertices (not box-fitted
+    approximations).  Best for prismatic parts with planar faces.
+
+    Args:
+        mesh:  Body name or index of a mesh body.
+        units: Units for the reconstructed model: mm, cm, or in
+               (default mm).
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _reconstruct_from_faces_sync(mesh, units)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_reconstruct_from_faces_sync, mesh, units)
+
+
+@mcp.tool()
 def compare_mesh_to_brep(mesh: str = "0", body: str = "0") -> str:
     """
     Compare a mesh body against a BRep body (vision-free fidelity QA).
@@ -2273,10 +2420,9 @@ def select_parameter_schema(object_class: str = "generic",
     return json.dumps(result, indent=2)
 
 
-@mcp.tool()
-def annotate_mesh_parameters(mesh: str = "0",
-                             views: list = ["isometric", "front", "top", "right"],
-                             units: str = "cm") -> list:
+def _annotate_mesh_parameters_sync(mesh: str = "0",
+                                   views: list = ["isometric", "front", "top", "right"],
+                                   units: str = "cm") -> dict:
     """
     Capture 4 viewport screenshots of a mesh + measured facts for vision
     classification (stage 4 of the mesh-to-parametric workflow).
@@ -2352,17 +2498,62 @@ def annotate_mesh_parameters(mesh: str = "0",
         },
     }
     text_envelope = json.dumps(envelope, indent=2)
-    out = [text_envelope]
-    for v in cap.get("views", []):
-        b64 = v.get("image_base64", "")
-        if b64:
-            out.append(Image(data=base64.b64decode(b64), format="png"))
-    return out
+    return {
+        "text": text_envelope,
+        "views": [{"view": v.get("view"),
+                   "image_base64": v.get("image_base64", "")}
+                  for v in cap.get("views", [])],
+    }
 
 
 @mcp.tool()
-def review_reconstruction(mesh: str = "0", body: str = "0",
-                          views: list = ["isometric", "front", "top"]) -> list:
+def annotate_mesh_parameters(mesh: str = "0",
+                             views: list = ["isometric", "front", "top", "right"],
+                             units: str = "cm", job_id: str = "") -> list:
+    """
+    Capture 4 viewport screenshots of a mesh + measured facts for vision
+    classification (stage 4 of the mesh-to-parametric workflow).
+
+    Fetches the mesh triangle data from Fusion and runs the pure-Python
+    analysis (watertightness, volume, bounding box, symmetry, primitive
+    hints, recommended strategy) as `measured_facts`, then orients the
+    viewport to each requested view (isometric / front / top / right),
+    fits the view, and captures a PNG.  Returns a text envelope with the
+    mesh name, the 4 base64 views, the measured facts, and the workflow
+    pointer -- followed by the 4 decoded PNG image blocks for the model.
+
+    Classification happens on the MODEL side, not here: the model inspects
+    the returned views + measured_facts, picks an object class, and calls
+    `select_parameter_schema` with that class and the facts. This tool never
+    invokes the matcher.
+
+    Stage 4 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:  Body name or index of a mesh body.
+        views: View names to capture, e.g. ['isometric', 'front', 'top',
+               'right']. Valid names: isometric, front, top, right.
+        units: Units for the measured facts: mm, cm, or in (default cm).
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        safe = _annotate_mesh_parameters_sync(mesh, views, units)
+        if isinstance(safe, str):
+            return safe
+        out = [safe["text"]]
+        for v in safe["views"]:
+            b64 = v.get("image_base64", "")
+            if b64:
+                out.append(Image(data=base64.b64decode(b64), format="png"))
+        return out
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_annotate_mesh_parameters_sync, mesh, views, units)
+
+
+def _review_reconstruction_sync(mesh: str = "0", body: str = "0",
+                                views: list = ["isometric", "front", "top"]) -> dict:
     """
     Capture side-by-side mesh vs reconstructed BRep views for vision QA review.
 
@@ -2442,15 +2633,58 @@ def review_reconstruction(mesh: str = "0", body: str = "0",
         },
     }
     text_envelope = json.dumps(envelope, indent=2)
-    out = [text_envelope]
+    out_views = []
     for v in views:
         for cap in (mesh_cap, brep_cap):
             for vv in cap.get("views", []):
                 if vv.get("view") == v and vv.get("image_base64"):
-                    out.append(
-                        Image(data=base64.b64decode(vv["image_base64"]),
-                              format="png"))
-    return out
+                    out_views.append(
+                        {"view": v, "image_base64": vv["image_base64"]})
+    return {"text": text_envelope, "views": out_views}
+
+
+@mcp.tool()
+def review_reconstruction(mesh: str = "0", body: str = "0",
+                          views: list = ["isometric", "front", "top"],
+                          job_id: str = "") -> list:
+    """
+    Capture side-by-side mesh vs reconstructed BRep views for vision QA review.
+
+    Captures viewport screenshots of the ORIGINAL mesh and the RECONSTRUCTED
+    BRep body for each requested view (isometric / front / top / right) and
+    pairs them per view. Returns a text envelope with the per-view base64
+    image pairs, a local compare_mesh_to_brep geometry summary, and the
+    workflow pointer -- followed by the decoded PNG image blocks interleaved
+    per view (mesh image, then brep image).
+
+    The comparison happens on the MODEL side, not here: the model inspects
+    each mesh/brep pair + geometry summary, decides whether features are
+    missing, and either calls `reconstruct_mesh` again with feedback or
+    accepts with `select_parameter_schema`.
+
+    Stage 8 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:  Body name or index of the ORIGINAL mesh body.
+        body:  Body name or index of the RECONSTRUCTED BRep body.
+        views: View names to capture, e.g. ['isometric', 'front', 'top'].
+               Valid names: isometric, front, top, right.
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        safe = _review_reconstruction_sync(mesh, body, views)
+        if isinstance(safe, str):
+            return safe
+        out = [safe["text"]]
+        for v in safe["views"]:
+            b64 = v.get("image_base64", "")
+            if b64:
+                out.append(Image(data=base64.b64decode(b64), format="png"))
+        return out
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_review_reconstruction_sync, mesh, body, views)
 
 
 @mcp.tool()
@@ -2488,8 +2722,8 @@ def get_workflow_guide(step: str = "") -> str:
     return json.dumps(found, indent=2)
 
 
-@mcp.tool()
-def create_from_scad(code: str, units: str = "mm", fallback_to_mesh: bool = True) -> str:
+def _create_from_scad_sync(code: str, units: str = "mm",
+                           fallback_to_mesh: bool = True) -> str:
     """
     Translate OpenSCAD/BOSL2 code into native parametric Fusion features.
 
@@ -2525,6 +2759,38 @@ def create_from_scad(code: str, units: str = "mm", fallback_to_mesh: bool = True
         "csg_tree": csg_tree, "code": code,
         "units": units, "fallback_to_mesh": fallback_to_mesh,
     }, timeout=330)
+
+
+@mcp.tool()
+def create_from_scad(code: str, units: str = "mm", fallback_to_mesh: bool = True,
+                     job_id: str = "") -> str:
+    """
+    Translate OpenSCAD/BOSL2 code into native parametric Fusion features.
+
+    Resolves the .scad source into a CSG tree (openscad-evaluator primary path,
+    OpenSCAD-binary CSG export fallback) in this server process, then sends the
+    tree to Fusion, where it becomes real BRep bodies via native sketch/extrude/
+    revolve/combine features (visible in the timeline). If a node cannot be
+    translated to native features and fallback_to_mesh is True, any partially
+    created bodies are deleted and the whole model is rendered as a mesh body
+    instead (same path as run_scad).
+
+    Args:
+        code:             Raw OpenSCAD source, e.g.
+                          'difference() { cube([20,20,20]); cylinder(r=5, h=30); }'
+                          or 'include <BOSL2/std.scad>\\ncuboid([10,10,10]);'.
+        units:            Units of the OpenSCAD model: mm, cm, or in.
+        fallback_to_mesh: If a CSG node is unsupported, delete partial bodies
+                          and fall back to a mesh render (True) or return an
+                          error listing the unsupported nodes (False).
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _create_from_scad_sync(code, units, fallback_to_mesh)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_create_from_scad_sync, code, units, fallback_to_mesh)
 
 
 # ---- History & File ----

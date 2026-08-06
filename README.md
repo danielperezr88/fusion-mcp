@@ -75,6 +75,8 @@ Claude Desktop  ──stdio──▶  MCP Server (Python)  ──HTTP──▶  
 - `reconstruct_mesh` — rebuild the mesh as native parametric Fusion timeline features: `prismatic` (one linear extrude of the constant cross-section), `revolved` (half cross-section revolved around an axis), `csg_decompose` (union tree of fitted boxes/cylinders), or `organic` (Fusion's PREVIEW `MeshConvertFeature` API)
 - `compare_mesh_to_brep` — vision-free fidelity QA between the original mesh and the reconstructed BRep: volume ratio, per-axis bounding-box deviation, and a sampled surface deviation (mean/max)
 - `review_reconstruction` — capture side-by-side mesh vs reconstructed-BRep screenshots per view, paired with a local geometry summary, for the final QA pass
+- `structure_graph` — build the structure graph of a mesh body and persist it to an in-memory DuckDB database: fetches the mesh triangle data from Fusion, decomposes it into planar faces and curved patches (mesh_analysis), builds the NetworkX property graph (face/hole/curved-patch/component nodes; 10 edge relation types), runs graph algorithms (articulation points, connected components), and persists the full graph to `nodes`/`edges` tables for later SQL queries; returns a JSON summary — not the full graph — with component_count, face_count, edge_type_counts, base_face_candidates, the persisted DuckDB table schema, and a ready-to-run query example, plus a workstream section (base_face_per_component, unit_types, rebuild_order, dag_has_cycles) from the scored base-face analysis; accepts optional tolerance params — angle_tolerance_deg, offset_tol, snap_tol, simplify_vertices, and a preset ("accurate" | "balanced" | "coarse")
+- `query_structure_graph` — run arbitrary read-only SQL against the persisted structure graph: queries the in-memory DuckDB database that `structure_graph` persisted for the mesh (call `structure_graph(mesh=...)` first — graphs are ephemeral and an MCP server restart drops them); only a single SELECT/WITH statement is allowed (comments stripped, multi-statement SQL rejected) and rows sort by the first column when no ORDER BY is present; supports recursive CTE queries for graph traversal (e.g. `SELECT node_id, area_cm2 FROM nodes WHERE label='Face' ORDER BY area_cm2 DESC` or a `WITH RECURSIVE` query walking connected faces); returns the result set as JSON (`{mesh, columns, rows, row_count}`) — the full graph never leaves the server
 
 Classification happens on the **model side** — no server-side vision API calls. `annotate_mesh_parameters` and `review_reconstruction` return screenshots as MCP Image blocks (base64 PNG) via `image_base64`, and `select_parameter_schema` maps the measured facts to parameters deterministically.
 
@@ -89,6 +91,27 @@ Example workflow:
 4. compare_mesh_to_brep(mesh="0", body="0")
 5. review_reconstruction(mesh="0", body="0")
 ```
+
+### Long-running tools & job polling
+
+Seven long-running tools accept a `job_id` parameter so heavy work (OpenSCAD rendering, mesh reconstruction, screenshot capture) never blocks the caller: `run_scad`, `update_scad_body`, `reconstruct_mesh`, `reconstruct_from_faces`, `create_from_scad`, `annotate_mesh_parameters`, `review_reconstruction`.
+
+The `job_id` parameter has three modes:
+
+- `job_id=""` (default): launches the job in the background and returns `{"job_id": "<id>", "status": "running"}` immediately
+- `job_id="<id>"`: polls the job, returning `running`, `completed` (with `result`), `error` (with `error`), or `not_found`
+- `job_id="sync"`: runs in the foreground and returns the full result exactly as before
+
+```text
+run_scad(code="cube([10,10,10]);")            -> {"job_id": "...", "status": "running"}     # launch
+run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "running"}     # poll
+run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "completed", "result": "{...}"}
+```
+
+Notes:
+- Jobs are in-memory only and are lost when the MCP server restarts, so keep polling until a job reaches `completed` or `error`.
+- The Fusion add-in command cap is 300s: each polled job runs to completion or returns its own timeout error.
+- The result of a polled `run_scad` is the same JSON string the tool normally returns; `annotate_mesh_parameters` and `review_reconstruction` return their screenshots as base64 image data.
 
 ### Other
 - Execute arbitrary Python scripts inside Fusion 360

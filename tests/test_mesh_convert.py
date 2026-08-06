@@ -110,7 +110,7 @@ def _run_organic(fs, strategy, params=None, convert_payload=None, fake=None):
     monkeypatch.setattr(fs, "_call", fake)
     try:
         raw = fs.reconstruct_mesh(mesh="0", strategy=strategy, units="mm",
-                                  params=params)
+                                  params=params, job_id="sync")
     finally:
         monkeypatch.undo()
     return json.loads(raw), fake
@@ -157,7 +157,8 @@ def test_auto_routing_to_organic_calls_mesh_convert(fs):
     monkeypatch.setattr(fs, "_call", fake)
     monkeypatch.setattr(fs, "_load_mesh_analysis", lambda: FakeAnalysis())
     try:
-        raw = fs.reconstruct_mesh(mesh="0", strategy="auto", units="mm")
+        raw = fs.reconstruct_mesh(mesh="0", strategy="auto", units="mm",
+                                  job_id="sync")
     finally:
         monkeypatch.undo()
     envelope = json.loads(raw)
@@ -174,7 +175,8 @@ def test_unknown_strategy_error_lists_organic(fs):
     monkeypatch.setattr(fs, "_call", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("_call must not fire for an unknown strategy")))
     try:
-        raw = fs.reconstruct_mesh(mesh="0", strategy="bogus", units="mm")
+        raw = fs.reconstruct_mesh(mesh="0", strategy="bogus", units="mm",
+                                  job_id="sync")
     finally:
         monkeypatch.undo()
     envelope = json.loads(raw)
@@ -191,7 +193,8 @@ def test_organic_skips_csg_building(fs):
                         lambda: (_ for _ in ()).throw(
                             AssertionError("organic must not build a CSG tree")))
     try:
-        raw = fs.reconstruct_mesh(mesh="0", strategy="organic", units="mm")
+        raw = fs.reconstruct_mesh(mesh="0", strategy="organic", units="mm",
+                                  job_id="sync")
     finally:
         monkeypatch.undo()
     envelope = json.loads(raw)

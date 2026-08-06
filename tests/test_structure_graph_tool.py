@@ -181,6 +181,42 @@ def test_structure_graph_error_envelope(fs):
     assert fake.calls == []
 
 
+def test_analyze_mesh_invalid_preset_error_envelope(fs):
+    # decompose-level failure (unknown preset) must surface as a TOP-LEVEL
+    # {"error": ...} from analyze_mesh, not a buried face_decomposition.error
+    fake = _FakeCall()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(fs, "_call", fake)
+    try:
+        raw = fs.analyze_mesh(mesh="0", units="cm", preset="ultra")
+    finally:
+        monkeypatch.undo()
+    result = json.loads(raw)
+    assert set(result) == {"error"}
+    assert "unknown preset" in result["error"]
+    assert "analysis failed" in result["error"]
+    for preset in ("accurate", "balanced", "coarse"):
+        assert preset in result["error"]
+
+
+def test_structure_graph_invalid_preset_error_envelope(fs):
+    # decompose-level failure (unknown preset) must surface as a TOP-LEVEL
+    # {"error": ...} from structure_graph, not an empty graph build
+    fake = _FakeCall()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(fs, "_call", fake)
+    try:
+        raw = fs.structure_graph(mesh="0", units="cm", preset="ultra")
+    finally:
+        monkeypatch.undo()
+    result = json.loads(raw)
+    assert set(result) == {"error"}
+    assert "unknown preset" in result["error"]
+    assert "structure graph failed" in result["error"]
+    for preset in ("accurate", "balanced", "coarse"):
+        assert preset in result["error"]
+
+
 def test_structure_graph_articulation_points(fs):
     summary, _ = _run(fs)
     # key present with list type (a closed box has no articulation points)

@@ -394,7 +394,8 @@ def test_annotate_mesh_parameters_server_path(bridge, monkeypatch):
     monkeypatch.setattr(fs.requests, "post", fake_post)
 
     out = fs.annotate_mesh_parameters(
-        mesh=mesh, views=["isometric", "front", "top", "right"], units="cm")
+        mesh=mesh, views=["isometric", "front", "top", "right"], units="cm",
+        job_id="sync")
 
     assert isinstance(out, list), f"expected list, got {out!r}"
     assert len(out) == 5, f"expected [text, Image x4], got {len(out)} items"
