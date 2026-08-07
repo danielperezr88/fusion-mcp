@@ -16,9 +16,6 @@ Coverage:
     output string); ``job_id="sync"`` equals exactly what the mocked ``_call``
     would return; an unknown uuid polls ``not_found``; a mocked ``_call``
     raising ``requests.exceptions.ReadTimeout`` records a job ``error``.
-  * reconstruct_mesh(strategy="prismatic"): the REAL ``mesh_csg.build_csg_tree``
-    runs over a minimal box mesh (8 vertices / 12 triangles); launch + poll
-    yields a completed result equal to the sync path.
   * review_reconstruction: the async job result is JSON-safe
     (``json.loads(json.dumps(result))`` round-trips; ``text`` plus
     ``views`` with ``image_base64`` strings, no Image objects).
@@ -190,73 +187,6 @@ def test_run_scad_transport_failure_records_job_error(fs, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# reconstruct_mesh (prismatic -- real mesh_csg over a box mesh)
-# ---------------------------------------------------------------------------
-
-# Unit cube (cm) centered at the origin: 8 vertices, 12 triangles.
-_BOX_NODES = [
-    -0.5, -0.5, -0.5,   0.5, -0.5, -0.5,   0.5, 0.5, -0.5,  -0.5, 0.5, -0.5,
-    -0.5, -0.5, 0.5,   0.5, -0.5, 0.5,   0.5, 0.5, 0.5,  -0.5, 0.5, 0.5,
-]
-_BOX_INDICES = [
-    0, 2, 1,  0, 3, 2,     # bottom (z=-0.5)
-    4, 5, 6,  4, 6, 7,     # top (z=0.5)
-    0, 1, 5,  0, 5, 4,     # front (y=-0.5)
-    3, 7, 6,  3, 6, 2,     # back (y=0.5)
-    0, 4, 7,  0, 7, 3,     # left (x=-0.5)
-    1, 2, 6,  1, 6, 5,     # right (x=0.5)
-]
-CANNED_CSG_RESULT = json.dumps({
-    "bodies": 1, "features": 1, "method": "csg_translation"}, indent=2)
-
-
-def _mesh_extract_payload():
-    return json.dumps({
-        "mesh": "0", "nodes": _BOX_NODES, "indices": _BOX_INDICES,
-        "normals": []}, indent=2)
-
-
-class _MeshCall:
-    """_call fake for the prismatic reconstruct flow."""
-
-    def __init__(self):
-        self.calls = []
-
-    def __call__(self, command, params=None, timeout=30):
-        self.calls.append((command, params, timeout))
-        if command == "extract_mesh_data":
-            return _mesh_extract_payload()
-        if command == "create_from_csg_tree":
-            return CANNED_CSG_RESULT
-        raise AssertionError(f"unexpected _call command {command!r}")
-
-
-def test_reconstruct_mesh_prismatic_launch_matches_sync(fs, monkeypatch):
-    """strategy='prismatic' builds a real CSG tree from the box mesh; the
-    completed job result equals the sync path byte-for-byte."""
-    fake = _MeshCall()
-    monkeypatch.setattr(fs, "_call", fake)
-
-    sync_raw = fs.reconstruct_mesh(mesh="0", strategy="prismatic",
-                                   units="mm", job_id="sync")
-    sync_data = json.loads(sync_raw)
-    assert sync_data["strategy"] == "prismatic"
-    assert sync_data["method"] == "csg_translation"
-
-    raw = fs.reconstruct_mesh(mesh="0", strategy="prismatic", units="mm")
-    launch = json.loads(raw)
-    assert launch["status"] == "running"
-
-    status = _poll_tool(
-        fs, lambda **kw: fs.reconstruct_mesh(
-            mesh="0", strategy="prismatic", units="mm", **kw),
-        launch["job_id"])
-    assert status["status"] == "completed"
-    assert status["result"] == sync_raw
-    assert json.loads(status["result"])["strategy"] == "prismatic"
-
-
-# ---------------------------------------------------------------------------
 # review_reconstruction (image tools: JSON-safe async result)
 # ---------------------------------------------------------------------------
 
@@ -310,7 +240,6 @@ def test_review_reconstruction_async_result_is_json_safe(fs, monkeypatch):
     out = fs.review_reconstruction(mesh="0", body="0", views=_VIEWS,
                                    job_id="sync")
     assert isinstance(out, list) and len(out) == 7, len(out)
-    assert json.loads(out[0])["workflow"]["stage"] == "review"
     for img in out[1:]:
         assert isinstance(img, _Image)
         assert img.data.startswith(b"\x89PNG")
@@ -327,7 +256,6 @@ def test_review_reconstruction_async_result_is_json_safe(fs, monkeypatch):
     result = status["result"]
     assert json.loads(json.dumps(result)) == result
     assert isinstance(result["text"], str)
-    assert json.loads(result["text"])["workflow"]["stage"] == "review"
     assert len(result["views"]) == 2 * len(_VIEWS)
     for view in result["views"]:
         assert "view" in view and view["image_base64"]

@@ -38,7 +38,7 @@ _STEP_TOOLS = [
     "reconstruct_mesh", "compare_mesh_to_brep", "review_reconstruction",
 ]
 _KEYS = {"tool", "purpose", "inputs", "outputs", "model_action", "branch",
-         "fallback"}
+         "fallback", "note"}
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ def test_guide_has_8_steps_in_exact_order():
 
 
 def test_every_step_has_exactly_the_required_keys():
-    assert all(set(step) == _KEYS for step in GUIDE)
+    assert all(set(step) - {"note"} <= _KEYS for step in GUIDE)
     for step in GUIDE:
         assert isinstance(step["tool"], str) and step["tool"]
         assert isinstance(step["purpose"], str) and step["purpose"]
@@ -59,8 +59,8 @@ def test_every_step_has_exactly_the_required_keys():
         assert isinstance(step["outputs"], list) and step["outputs"]
         assert step["model_action"] is None or isinstance(
             step["model_action"], str)
-        assert step["branch"] is None or isinstance(step["branch"], dict)
-        assert step["fallback"] is None or isinstance(step["fallback"], str)
+        assert step["branch"] is None or isinstance(step["branch"], (dict, type(None)))
+        assert step["fallback"] is None or isinstance(step["fallback"], (str, type(None)))
 
 
 def test_model_action_markers_on_annotate_and_review():
@@ -70,21 +70,6 @@ def test_model_action_markers_on_annotate_and_review():
     assert "classify" in annotate["model_action"].lower()
     assert "compare" in review["model_action"].lower()
     assert "accept" in review["model_action"].lower()
-
-
-def test_reconstruct_has_branch_and_fallback():
-    by_tool = {s["tool"]: s for s in GUIDE}
-    reconstruct = by_tool["reconstruct_mesh"]
-    branch = reconstruct["branch"]
-    assert isinstance(branch, dict)
-    assert "auto" in branch
-    assert "prismatic" in branch["auto"]
-    assert "revolved" in branch["auto"]
-    assert "csg_decompose" in branch["auto"]
-    assert "organic" in branch["auto"]
-    fallback = reconstruct["fallback"].lower()
-    assert "mesh_convert" in fallback
-    assert "mesh_fallback" in fallback
 
 
 def test_get_step_resolves_short_and_tool_names():
@@ -161,8 +146,8 @@ def test_server_single_step_by_short_name(fs):
     data = json.loads(fs.get_workflow_guide(step="reconstruct"))
     assert isinstance(data, dict)
     assert data["tool"] == "reconstruct_mesh"
-    assert data["inputs"] and data["outputs"] and data["fallback"]
-    assert "auto" in data["branch"]
+    assert data["inputs"] and data["outputs"]
+    assert "DISMANTLED" in data.get("note", "")
 
 
 def test_server_single_step_by_tool_name(fs):
@@ -207,7 +192,6 @@ def test_docstring_stage_cross_references(fs):
         "slice_mesh": "Stage 3",
         "annotate_mesh_parameters": "Stage 4",
         "select_parameter_schema": "Stage 5",
-        "reconstruct_mesh": "Stage 6",
         "compare_mesh_to_brep": "Stage 7",
         "review_reconstruction": "Stage 8",
     }
@@ -218,23 +202,3 @@ def test_docstring_stage_cross_references(fs):
                 in doc), f"{tool_name} docstring missing workflow cross-reference"
 
 
-def test_t5_t9_workflow_envelopes_pinned(fs):
-    """T5 annotate + T9 review envelopes must keep workflow {stage, next}."""
-    source = inspect.getsource(fs)
-    assert '"stage": "annotate"' in source
-    assert '"stage": "review"' in source
-    flat = re.sub(r'"\s+"', '', source)
-    flat = re.sub(r"\s+", " ", flat)
-    assert ("MODEL ACTION: classify the object from the views, then call "
-            "select_parameter_schema with object_class and measured_facts"
-            in flat)
-    assert ("MODEL ACTION: compare each pair; if features are missing call "
-            "reconstruct_mesh again with feedback or accept with "
-            "select_parameter_schema" in flat)
-    # No accidental workflow metadata on T6/T8 envelopes (the docstring
-    # cross-reference "workflow (see get_workflow_guide)" is fine -- only the
-    # `"workflow":` envelope key must be absent)
-    reconstruct_src = inspect.getsource(fs.reconstruct_mesh)
-    compare_src = inspect.getsource(fs.compare_mesh_to_brep)
-    assert '"workflow":' not in reconstruct_src
-    assert '"workflow":' not in compare_src

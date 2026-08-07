@@ -172,9 +172,6 @@ _CYL_RADIUS_CV_MAX = 0.20      # max relative std of side-face centroid radius
 _ORTHO_DOT_MAX = 0.05          # |dot| below this => directions are orthogonal
 _PARALLEL_DOT_MIN = 0.95       # |dot| above this => directions are parallel
 _BOX_FITTED_CONF = 0.40        # box "fitted" when >= this fraction matches
-_BOX_CONF_PRISMATIC = 0.65     # box confidence for the prismatic strategy
-_CYL_CONF_REVOLVED = 0.55      # cylinder confidence for the revolved strategy
-_PLATE_FRACTION = 0.80         # dominant plane-region fraction => prismatic
 
 
 # --------------------------------------------------------------------------
@@ -584,22 +581,6 @@ def _primitive_hints(node_list: Sequence[Float3],
 # --------------------------------------------------------------------------
 # strategy
 # --------------------------------------------------------------------------
-
-def _recommended_strategy(watertight: bool, hints: Dict) -> str:
-    box = hints.get("box") or {}
-    cyl = hints.get("cylinder") or {}
-    if box.get("fitted") and box.get("confidence", 0.0) >= _BOX_CONF_PRISMATIC:
-        return "prismatic"
-    if cyl.get("fitted") and cyl.get("confidence", 0.0) >= _CYL_CONF_REVOLVED:
-        return "revolved"
-    regions = hints.get("plane_regions") or []
-    if regions and regions[0]["area_fraction"] >= _PLATE_FRACTION:
-        return "prismatic"
-    if box.get("fitted"):
-        return "csg_decompose"
-    if watertight and len(regions) >= 3:
-        return "csg_decompose"
-    return "organic"
 
 
 # --------------------------------------------------------------------------
@@ -2432,7 +2413,7 @@ def analyze_mesh_data(nodes: Sequence, indices: Sequence,
 
     Returns a dict with keys: watertight, manifold, vertex_count,
     triangle_count, volume_cm3, bounding_box_cm, symmetry, primitive_hints,
-    recommended_strategy.  Never raises on empty/degenerate input; raises
+    face_decomposition.  Never raises on empty/degenerate input; raises
     ValueError only for structurally invalid input (flat list lengths not
     divisible by 3, or triangle indices out of range).
 
@@ -2473,7 +2454,6 @@ def analyze_mesh_data(nodes: Sequence, indices: Sequence,
             "bounding_box_cm": bbox,
             "symmetry": {"candidates": [], "dominant_axis": None},
             "primitive_hints": empty_hints,
-            "recommended_strategy": "organic",
             "face_decomposition": {"components_detected": 0, "planar_faces": [],
                                    "curved_patches": []},
         }
@@ -2540,7 +2520,6 @@ def analyze_mesh_data(nodes: Sequence, indices: Sequence,
         "bounding_box_cm": [_round3(bbox_min), _round3(bbox_max)],
         "symmetry": symmetry,
         "primitive_hints": hints,
-        "recommended_strategy": _recommended_strategy(watertight, hints),
         "face_decomposition": face_decomp,
     }
 

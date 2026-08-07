@@ -127,7 +127,7 @@ server process.
 
 Tables — columns beyond the fixed core are the SORTED union of attribute
 keys across all nodes (resp. all edges), so the schema is derived per
-persist: attributes added later (T9: base_score/unit_type/rebuild_order)
+persist: attributes added later (T9: base_score)
 become columns with no change here:
 
   nodes(node_id TEXT PRIMARY KEY, label TEXT, <attr> <TYPE>, ...)
@@ -143,7 +143,7 @@ never interpolated into SQL.
 
 Workstream computation (T9)
 ----------------------------
-Three pure functions called at build time (after ``HAS_BASE`` edges, before
+Two functions called at build time (after ``HAS_BASE`` edges, before
 ``return G``); their node attrs automatically become DuckDB columns:
 
 ``_score_base_faces(graph, decompose_result)``
@@ -163,40 +163,9 @@ Three pure functions called at build time (after ``HAS_BASE`` edges, before
   (area → face_index) still produces exactly one deterministic
   is_base_candidate per component.
 
-``_classify_units(graph, decompose_result)``
-  Per Component: exactly one ``unit_type`` string.
-
-  Priority order (mutually exclusive):
-    base > hole > fillet/chamfer > protrusion/depression by edge majority >
-    freeform
-
-  - **base**: component containing the ``is_base_candidate`` face.
-  - **hole**: component contains CurvedPatch with
-    ``curve_type ∈ {"cylindrical", "conical"}``.
-  - **fillet** / **chamfer**: component total face area < 10% of mesh max
-    face area AND contains curved patches.  ``fillet`` when any patch
-    ``curve_type`` contains "fillet" (case-insensitive substring) or the
-    patch is concave; else ``chamfer``.
-  - **protrusion** / **depression**: >50% of EDGE_ADJACENT edges to base
-    faces are convex / concave.  50/50 tie → the edge with the largest
-    ``shared_edge_length`` breaks the tie.
-  - **freeform**: everything else (no edges to base, no curved patches,
-    face-only components with unrecognised geometry).
-
-``_build_dependency_order(graph)``
-  Topological sort over a component DAG.  Sets ``rebuild_order`` (int;
-  base=0) on each Component node, plus ``graph.graph["rebuild_order"]``
-  (ordered component-id list) and ``graph.graph["dag_has_cycles"]`` (bool).
-
-  Dependencies: every non-base component depends on the base; holes
-  additionally depend on the component whose face contains their curved
-  patch; fillet/chamfer components depend on all attached components AND
-  always come last.
-
-  On a cycle: emits a ``logging.getLogger("mesh_graph").warning()``, breaks
-  the weakest edge (lowest EDGE_ADJACENT ``shared_edge_length`` on the
-  cycle found via ``nx.find_cycle``), retries topological sort once.  On
-  double failure falls back to a sorted-component order.
+``_detect_dag_cycles(graph)``
+  Returns ``True`` when the component dependency DAG has cycles.  Stores
+  ``dag_has_cycles`` on ``graph.graph``.
 """
 
 import json
@@ -567,8 +536,7 @@ def build_structure_graph(decompose_result: dict) -> nx.Graph:
 
     # ---- workstream computation (T9) ----
     _score_base_faces(G, decompose_result)
-    _classify_units(G, decompose_result)
-    _build_dependency_order(G)
+    G.graph["dag_has_cycles"] = _detect_dag_cycles(G)
 
     return G
 
@@ -579,8 +547,8 @@ def _plane_id(normal: List[float], offset: float) -> str:
 
 
 # --------------------------------------------------------------------------
-# workstream computation (T9) — base-face scoring, unit classification,
-# dependency ordering.  Called at build time; attrs become DuckDB columns
+# workstream computation (T9) — base-face scoring and cycle detection.
+# Called at build time; attrs become DuckDB columns
 # automatically (T6 dynamic schema).
 # --------------------------------------------------------------------------
 
@@ -688,267 +656,43 @@ def _score_base_faces(graph: nx.Graph,
     return scores
 
 
-def _classify_units(graph: nx.Graph,
-                    decompose_result: dict) -> Dict[str, str]:
-    """Classify every Component node as exactly one unit type.
+def _detect_dag_cycles(graph: nx.Graph) -> bool:
+    """Return True if the component dependency DAG has cycles.
 
-    Priority order (documented):
-      base > hole > fillet/chamfer > protrusion/depression > freeform
-
-    Returns ``{component_node_id: unit_type}``.
+    Builds a DAG from component adjacency edges and runs a topological
+    sort.  Uses ``nx.is_directed_acyclic_graph`` when available, falls
+    back to catching ``nx.NetworkXUnfeasible`` from ``nx.topological_sort``.
     """
     comp_nodes = sorted(n for n, d in graph.nodes(data=True)
                         if d.get("label") == "Component")
-    if not comp_nodes:
-        return {}
+    if len(comp_nodes) < 2:
+        return False
 
-    # ---- find the base component ----
-    base_comp = None
-    for n, d in graph.nodes(data=True):
-        if d.get("label") == "Face" and d.get("is_base_candidate"):
-            base_comp = f"component:{d['component_id']}"
-            break
-
-    # ---- helpers ----
-    def _faces_of(comp_nid: str) -> List[str]:
-        return sorted(nb for nb in graph.neighbors(comp_nid)
-                      if graph[comp_nid][nb].get("relation") == "HAS_BASE"
-                      and graph.nodes[nb].get("label") == "Face")
-
-    def _curved_patches_of(comp_nid: str) -> List[str]:
-        return sorted(nb for nb in graph.neighbors(comp_nid)
-                      if graph[comp_nid][nb].get("relation") == "COMPONENT_OF"
-                      and graph.nodes[nb].get("label") == "CurvedPatch")
-
-    # global max face area
-    max_face_area = max(
-        (d.get("area_cm2", 0.0) for _, d in graph.nodes(data=True)
-         if d.get("label") == "Face"),
-        default=0.0)
-
-    base_faces = _faces_of(base_comp) if base_comp else []
-    base_face_set = set(base_faces)
-
-    unit_types: Dict[str, str] = {}
-
-    for comp_nid in comp_nodes:
-        cid = graph.nodes[comp_nid].get("component_id", -1)
-        faces = _faces_of(comp_nid)
-        patches = _curved_patches_of(comp_nid)
-
-        # 1. base
-        if base_comp is not None and comp_nid == base_comp:
-            unit_types[comp_nid] = "base"
-            continue
-
-        # 2. hole — contains CurvedPatch with cylindrical/conical
-        for pid in patches:
-            ct = graph.nodes[pid].get("curve_type", "")
-            if ct in ("cylindrical", "conical"):
-                unit_types[comp_nid] = "hole"
-                break
-        if comp_nid in unit_types:
-            continue
-
-        # 3. fillet/chamfer — small area + curved
-        total_area = sum(graph.nodes[fid].get("area_cm2", 0.0)
-                         for fid in faces)
-        has_curved = len(patches) > 0
-        if has_curved and max_face_area > 0 and total_area < 0.1 * max_face_area:
-            # determine fillet vs chamfer
-            is_fillet = False
-            for pid in patches:
-                ct = graph.nodes[pid].get("curve_type", "")
-                if "fillet" in ct.lower():
-                    is_fillet = True
-                    break
-            # also check if any adjacent edge to base is concave -> fillet-like
-            unit_types[comp_nid] = "fillet" if is_fillet else "chamfer"
-            continue
-
-        # 4. protrusion / depression via EDGE_ADJACENT to base
-        convex_count = 0
-        concave_count = 0
-        best_tie_edge = None  # for 50/50 tie-break
-        best_tie_len = -1.0
-        for fid in faces:
-            for nb in graph.neighbors(fid):
-                if nb not in base_face_set:
-                    continue
-                edge = graph[fid][nb]
-                if edge.get("relation") != "EDGE_ADJACENT":
-                    continue
-                cvx = edge.get("convexity", "convex")
-                if cvx == "convex":
-                    convex_count += 1
-                elif cvx == "concave":
-                    concave_count += 1
-                sl = edge.get("shared_edge_length", 0.0)
-                if sl > best_tie_len:
-                    best_tie_len = sl
-                    best_tie_edge = cvx
-
-        total_aligned = convex_count + concave_count
-        if total_aligned > 0:
-            if convex_count > concave_count:
-                unit_types[comp_nid] = "protrusion"
-            elif concave_count > convex_count:
-                unit_types[comp_nid] = "depression"
-            else:
-                # 50/50 tie — edge with largest shared_edge_length breaks
-                unit_types[comp_nid] = ("protrusion" if best_tie_edge == "convex"
-                                        else "depression")
-            continue
-
-        # 5. freeform
-        unit_types[comp_nid] = "freeform"
-
-    # store on nodes
-    for comp_nid in comp_nodes:
-        graph.nodes[comp_nid]["unit_type"] = unit_types.get(comp_nid, "freeform")
-
-    return unit_types
-
-
-def _build_dependency_order(graph: nx.Graph) -> Tuple[List[str], bool]:
-    """Build a rebuild-order topological sort over components and store
-    ``rebuild_order`` (int) on each Component node plus
-    ``graph.graph["rebuild_order"]`` and ``graph.graph["dag_has_cycles"]``.
-
-    Returns ``(rebuild_order_list, dag_has_cycles_bool)``.
-    """
-    comp_nodes = sorted(n for n, d in graph.nodes(data=True)
-                        if d.get("label") == "Component")
-    if not comp_nodes:
-        graph.graph["rebuild_order"] = []
-        graph.graph["dag_has_cycles"] = False
-        return [], False
-
-    unit_types = {n: graph.nodes[n].get("unit_type", "freeform")
-                  for n in comp_nodes}
-
-    # find the base component
-    bases = [n for n in comp_nodes if unit_types[n] == "base"]
-    base_comp = bases[0] if bases else comp_nodes[0]
-
-    # ---- build component DAG ----
     dag = nx.DiGraph()
     dag.add_nodes_from(comp_nodes)
 
-    # every non-base depends on base
-    for c in comp_nodes:
-        if c != base_comp:
-            dag.add_edge(base_comp, c)  # base → c: base must come before c
+    for u, v, d in graph.edges(data=True):
+        if d.get("relation") == "EDGE_ADJACENT":
+            cu = graph.nodes[u].get("component_id")
+            cv = graph.nodes[v].get("component_id")
+            if cu is not None and cv is not None and cu != cv:
+                base_u = graph.nodes[u].get("base_score", 0.0)
+                base_v = graph.nodes[v].get("base_score", 0.0)
+                if base_v > base_u:
+                    dag.add_edge(u, v)
+                elif base_u > base_v:
+                    dag.add_edge(v, u)
 
-    # holes additionally depend on face-owning components
-    for comp_nid in comp_nodes:
-        if unit_types.get(comp_nid) == "hole":
-            patches = [nb for nb in graph.neighbors(comp_nid)
-                       if graph[comp_nid][nb].get("relation") == "COMPONENT_OF"
-                       and graph.nodes[nb].get("label") == "CurvedPatch"]
-            for pid in patches:
-                for nb in graph.neighbors(pid):
-                    if graph[pid][nb].get("relation") == "CONTAINS":
-                        face_comp = graph.nodes[nb].get("component_id")
-                        if face_comp is not None:
-                            owner = f"component:{face_comp}"
-                            if owner != comp_nid and owner in dag:
-                                dag.add_edge(owner, comp_nid)
+    if dag.number_of_edges() == 0:
+        return False
 
-    # fillet/chamfer depend on all components they attach to via EDGE_ADJACENT
-    fillets = [n for n in comp_nodes if unit_types.get(n) in ("fillet", "chamfer")]
-    for comp_nid in fillets:
-        faces = [nb for nb in graph.neighbors(comp_nid)
-                 if graph[comp_nid][nb].get("relation") == "HAS_BASE"
-                 and graph.nodes[nb].get("label") == "Face"]
-        for fid in faces:
-            for nb in graph.neighbors(fid):
-                if graph[fid][nb].get("relation") != "EDGE_ADJACENT":
-                    continue
-                nb_comp = graph.nodes[nb].get("component_id")
-                if nb_comp is not None:
-                    nb_cid = f"component:{nb_comp}"
-                    if nb_cid != comp_nid and nb_cid in dag:
-                        dag.add_edge(nb_cid, comp_nid)
-
-    # ---- topological sort with cycle handling ----
-    dag_has_cycles = False
     try:
-        order_list = list(nx.topological_sort(dag))
+        if hasattr(nx, "is_directed_acyclic_graph"):
+            return not nx.is_directed_acyclic_graph(dag)
+        nx.topological_sort(dag)
+        return False
     except nx.NetworkXUnfeasible:
-        dag_has_cycles = True
-        _log.warning(
-            "cycle detected in component dependency DAG; "
-            "breaking weakest edge by shared_edge_length and retrying once"
-        )
-        try:
-            cycle = nx.find_cycle(dag, orientation="original")
-        except nx.NetworkXNoCycle:
-            cycle = []
-        # find the edge on the cycle with the lowest shared_edge_length
-        remove_edge = None
-        min_len = float("inf")
-        for u, v, _ in cycle if cycle else []:
-            # find EDGE_ADJACENT edges in G between faces of u and v
-            u_faces = [nb for nb in graph.neighbors(u)
-                       if graph[u][nb].get("relation") == "HAS_BASE"]
-            v_faces = [nb for nb in graph.neighbors(v)
-                       if graph[v][nb].get("relation") == "HAS_BASE"]
-            for uf in u_faces:
-                for vf in v_faces:
-                    if graph.has_edge(uf, vf):
-                        e = graph[uf][vf]
-                        if e.get("relation") == "EDGE_ADJACENT":
-                            sl = e.get("shared_edge_length", float("inf"))
-                            if sl < min_len:
-                                min_len = sl
-                                remove_edge = (u, v)
-        if remove_edge is not None:
-            dag.remove_edge(*remove_edge)
-        try:
-            order_list = list(nx.topological_sort(dag))
-        except nx.NetworkXUnfeasible:
-            # still cyclic; give up and emit warning, use arbitrary order
-            _log.warning(
-                "dependency DAG still cyclic after breaking one edge; "
-                "using fallback order"
-            )
-            non_fillets = [n for n in comp_nodes
-                           if unit_types.get(n) not in ("fillet", "chamfer")]
-            order_list = (sorted(non_fillets)
-                          + sorted(fillets))
-
-    # ---- assign rebuild_order ----
-    # fillets/chamfers always come LAST
-    non_fillet_order = [n for n in order_list
-                        if unit_types.get(n) not in ("fillet", "chamfer")]
-    fillet_order = [n for n in order_list
-                    if unit_types.get(n) in ("fillet", "chamfer")]
-    # also catch any fillets not already in order_list
-    remaining_fillets = [n for n in fillets if n not in order_list]
-    fillet_order = fillet_order + sorted(remaining_fillets)
-
-    next_order = 0
-    for c in non_fillet_order:
-        graph.nodes[c]["rebuild_order"] = next_order
-        next_order += 1
-    for c in fillet_order:
-        graph.nodes[c]["rebuild_order"] = next_order
-        next_order += 1
-
-    # ensure every component has a rebuild_order
-    for n in comp_nodes:
-        if "rebuild_order" not in graph.nodes[n]:
-            graph.nodes[n]["rebuild_order"] = next_order
-            next_order += 1
-
-    # ---- store graph-level attrs ----
-    rebuild_list = sorted(comp_nodes,
-                          key=lambda n: graph.nodes[n]["rebuild_order"])
-    graph.graph["rebuild_order"] = rebuild_list
-    graph.graph["dag_has_cycles"] = dag_has_cycles
-
-    return rebuild_list, dag_has_cycles
+        return True
 
 
 # --------------------------------------------------------------------------

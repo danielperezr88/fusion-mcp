@@ -67,34 +67,31 @@ Claude Desktop  ──stdio──▶  MCP Server (Python)  ──HTTP──▶  
 - `create_from_scad` — translate `.scad`/BOSL2 source into native parametric Fusion features (sketch/extrude/revolve/combine) visible in the timeline, resolving the source via the CSG translator (mm/cm/in units); falls back to a mesh body when a construct is unsupported (hull, surface, text, import, arbitrary polyhedra) or `fallback_to_mesh` is enabled
 
 ### Mesh Reconstruction
-- `get_workflow_guide` — the pipeline map and entry point: returns the 8-step mesh-to-parametric workflow as JSON — import -> analyze -> slice -> annotate -> select_parameter_schema -> reconstruct -> compare -> review — with each step's tool name, purpose, inputs/outputs, the model action to take, the strategy branch at reconstruct, and fallbacks; pass a step name (e.g. "annotate") to get a single step
-- `analyze_mesh` — analyze a mesh body and report measured facts plus a recommended reconstruction strategy: watertightness, manifoldness, vertex/triangle counts, enclosed volume, bounding box, mirror symmetry, primitive hints, and a recommended strategy (prismatic | revolved | csg_decompose | organic)
+- `get_workflow_guide` — the pipeline map and entry point: returns the 8-step mesh-to-parametric workflow as JSON — import -> analyze -> slice -> annotate -> select_parameter_schema -> reconstruct -> compare -> review — with each step's tool name, purpose, inputs/outputs, the model action to take, the reconstruct step's note (DISMANTLED — agent composes with primitives), and fallbacks; pass a step name (e.g. "annotate") to get a single step
+- `analyze_mesh` — analyze a mesh body and report measured facts: watertightness, manifoldness, vertex/triangle counts, enclosed volume, bounding box, mirror symmetry, primitive hints (plane regions, box, cylinder)
 - `slice_mesh` — slice a mesh body with an axis-aligned plane (X/Y/Z + signed height) and return the ordered 2D cross-section loops: outer contours (CCW) and holes (CW)
 - `annotate_mesh_parameters` — capture 4 viewport screenshots (isometric/front/top/right) of a mesh plus its measured facts, returned as base64 PNG image blocks for model-side classification
 - `select_parameter_schema` — pure-data tool: binds measured facts (bbox dims, slice loop diameter, fit params) to stable named parameters for a classified object (20 part classes + generic fallback) with confidence scores; vision-sourced roles return as placeholders for the model to fill
-- `reconstruct_mesh` — rebuild the mesh as native parametric Fusion timeline features: `prismatic` (one linear extrude of the constant cross-section), `revolved` (half cross-section revolved around an axis), `csg_decompose` (union tree of fitted boxes/cylinders), or `organic` (Fusion's PREVIEW `MeshConvertFeature` API)
 - `compare_mesh_to_brep` — vision-free fidelity QA between the original mesh and the reconstructed BRep: volume ratio, per-axis bounding-box deviation, and a sampled surface deviation (mean/max)
 - `review_reconstruction` — capture side-by-side mesh vs reconstructed-BRep screenshots per view, paired with a local geometry summary, for the final QA pass
-- `structure_graph` — build the structure graph of a mesh body and persist it to an in-memory DuckDB database: fetches the mesh triangle data from Fusion, decomposes it into planar faces and curved patches (mesh_analysis), builds the NetworkX property graph (face/hole/curved-patch/component nodes; 10 edge relation types), runs graph algorithms (articulation points, connected components), and persists the full graph to `nodes`/`edges` tables for later SQL queries; returns a JSON summary — not the full graph — with component_count, face_count, edge_type_counts, base_face_candidates, the persisted DuckDB table schema, and a ready-to-run query example, plus a workstream section (base_face_per_component, unit_types, rebuild_order, dag_has_cycles) from the scored base-face analysis; accepts optional tolerance params — angle_tolerance_deg, offset_tol, snap_tol, simplify_vertices, and a preset ("accurate" | "balanced" | "coarse")
+- `structure_graph` — build the structure graph of a mesh body and persist it to an in-memory DuckDB database: fetches the mesh triangle data from Fusion, decomposes it into planar faces and curved patches (mesh_analysis), builds the NetworkX property graph (face/hole/curved-patch/component nodes; 10 edge relation types), runs graph algorithms (articulation points, connected components), and persists the full graph to `nodes`/`edges` tables for later SQL queries; returns a JSON summary — not the full graph — with component_count, face_count, edge_type_counts, base_face_candidates, the persisted DuckDB table schema, and a ready-to-run query example, plus a workstream section (base_face_per_component, dag_has_cycles) from the scored base-face analysis; accepts optional tolerance params — angle_tolerance_deg, offset_tol, snap_tol, simplify_vertices, and a preset ("accurate" | "balanced" | "coarse")
 - `query_structure_graph` — run arbitrary read-only SQL against the persisted structure graph: queries the in-memory DuckDB database that `structure_graph` persisted for the mesh (call `structure_graph(mesh=...)` first — graphs are ephemeral and an MCP server restart drops them); only a single SELECT/WITH statement is allowed (comments stripped, multi-statement SQL rejected) and rows sort by the first column when no ORDER BY is present; supports recursive CTE queries for graph traversal (e.g. `SELECT node_id, area_cm2 FROM nodes WHERE label='Face' ORDER BY area_cm2 DESC` or a `WITH RECURSIVE` query walking connected faces); returns the result set as JSON (`{mesh, columns, rows, row_count}`) — the full graph never leaves the server
 
 Classification happens on the **model side** — no server-side vision API calls. `annotate_mesh_parameters` and `review_reconstruction` return screenshots as MCP Image blocks (base64 PNG) via `image_base64`, and `select_parameter_schema` maps the measured facts to parameters deterministically.
-
-The `organic` strategy uses Fusion's PREVIEW `MeshConvertFeature` API, which is only present on recent Fusion builds and is additionally license-gated; when unavailable, the tool returns a graceful not-available error instead of a converted body.
 
 Example workflow:
 
 ```text
 1. import_mesh_file("bracket.stl")
-2. analyze_mesh(mesh="0")                    # recommended_strategy: prismatic
-3. reconstruct_mesh(mesh="0", strategy="prismatic")
-4. compare_mesh_to_brep(mesh="0", body="0")
-5. review_reconstruction(mesh="0", body="0")
+2. analyze_mesh(mesh="0")                    # measured facts, primitive_hints
+3. structure_graph(mesh="0", preset="accurate")  # surface relationships
+4. query_structure_graph(mesh="0", sql="SELECT node_id, area_cm2 FROM nodes WHERE label='Face' ORDER BY area_cm2 DESC")
+5. # Agent composes with sketch/feature/boolean MCP tools from graph insights
 ```
 
 ### Long-running tools & job polling
 
-Seven long-running tools accept a `job_id` parameter so heavy work (OpenSCAD rendering, mesh reconstruction, screenshot capture) never blocks the caller: `run_scad`, `update_scad_body`, `reconstruct_mesh`, `reconstruct_from_faces`, `create_from_scad`, `annotate_mesh_parameters`, `review_reconstruction`.
+Five long-running tools accept a `job_id` parameter so heavy work (OpenSCAD rendering, screenshot capture) never blocks the caller: `run_scad`, `update_scad_body`, `create_from_scad`, `annotate_mesh_parameters`, `review_reconstruction`.
 
 The `job_id` parameter has three modes:
 

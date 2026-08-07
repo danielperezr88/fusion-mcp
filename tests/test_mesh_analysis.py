@@ -3,7 +3,7 @@
 
 Pure-Python geometry analysis: topology (watertight/manifold), volume via the
 divergence theorem, bounding box, mirror symmetry, primitive hints (plane
-regions / cylinder / box), and the recommended reconstruction strategy.  All
+regions / cylinder / box).  All
 math is stdlib-only (no numpy) and fully deterministic (no random module in
 the clustering / RANSAC-style fitting), so identical input always yields an
 identical report.
@@ -120,7 +120,6 @@ def test_unit_cube_watertight_volume_bbox():
     assert report["triangle_count"] == 12
     assert report["volume_cm3"] == pytest.approx(1.0, abs=1e-6)
     assert report["bounding_box_cm"] == [[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
-    assert report["recommended_strategy"] == "prismatic"
 
 
 def test_unit_cube_primitive_hints_box():
@@ -152,7 +151,6 @@ def test_unit_cube_geometric_normals_fallback():
     b = analyze_mesh_data(nodes, indices, [])
     assert a["watertight"] is True
     assert a["volume_cm3"] == pytest.approx(1.0, abs=1e-6)
-    assert a["recommended_strategy"] == "prismatic"
     assert a == b
 
 
@@ -165,7 +163,6 @@ def test_unit_cube_per_corner_normals_averaged():
     report = analyze_mesh_data(nodes, indices, per_corner)
     assert report["watertight"] is True
     assert report["volume_cm3"] == pytest.approx(1.0, abs=1e-6)
-    assert report["recommended_strategy"] == "prismatic"
 
 
 def test_nested_triple_input_accepted():
@@ -180,7 +177,6 @@ def test_nested_triple_input_accepted():
     report = analyze_mesh_data(node_t, idx_t, norm_t)
     assert report["watertight"] is True
     assert report["volume_cm3"] == pytest.approx(1.0, abs=1e-6)
-    assert report["recommended_strategy"] == "prismatic"
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +208,6 @@ def test_cylinder_revolved_strategy():
     assert hints["cylinder"]["fitted"] is True
     assert hints["cylinder"]["radius_cm"] == pytest.approx(1.0, abs=0.05)
     assert hints["cylinder"]["height_cm"] == pytest.approx(2.0, abs=1e-6)
-    assert report["recommended_strategy"] == "revolved"
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +220,6 @@ def test_empty_input_organic_fallback():
     assert report["manifold"] is False
     assert report["triangle_count"] == 0
     assert report["volume_cm3"] == 0.0
-    assert report["recommended_strategy"] == "organic"
 
 
 def test_deterministic_repeatable():
@@ -250,7 +244,6 @@ def test_scale_report_mm():
     scaled = scale_report(report, 10.0)
     assert scaled["bounding_box_cm"] == [[0.0, 0.0, 0.0], [10.0, 10.0, 10.0]]
     assert scaled["volume_cm3"] == pytest.approx(1000.0, abs=1e-3)
-    assert scaled["recommended_strategy"] == "prismatic"
     assert scaled["watertight"] is True
     assert scaled["vertex_count"] == report["vertex_count"]
 

@@ -1,15 +1,17 @@
 """
 Mesh-to-parametric workflow guide (pure data, served locally).
 
-Ordered 8-step pipeline that chains the mesh tools into a complete
-reconstruction flow:
+Ordered 8-step pipeline that chains the mesh tools into a discovery-and-
+decomposition flow (the reconstruct_mesh step is DISMANTLED — the agent
+composes with primitives instead of a single server-side reconstruction):
 
     import -> analyze -> slice -> annotate -> select_parameter_schema
            -> reconstruct -> compare -> review
 
 Each step describes the server tool to call, what it needs, what it returns,
 the MODEL ACTION the assistant must take (where the loop is interactive),
-the strategy branch (reconstruct's auto routing), and any fallback.
+the strategy branch (reconstruct's auto routing, now dismantled), and any
+fallback.
 
 Pure stdlib (json only). No numpy, no requests, no Fusion imports -- this
 module is headless-importable and deterministic, which keeps the guide
@@ -42,9 +44,9 @@ GUIDE = [
         "tool": "analyze_mesh",
         "purpose": ("Analyze the mesh geometry and report measured facts "
                     "(watertightness, volume, bounding box, symmetry, primitive "
-                    "hints) plus a recommended reconstruction strategy."),
+                    "hints)."),
         "inputs": ["mesh", "units"],
-        "outputs": ["analysis report incl. recommended_strategy"],
+        "outputs": ["analysis report (measured facts, primitive_hints)"],
         "model_action": None,
         "branch": None,
         "fallback": None,
@@ -70,7 +72,7 @@ GUIDE = [
                     "the object and bind its parameters."),
         "inputs": ["mesh", "views", "units"],
         "outputs": [
-            "text envelope (mesh, views, measured_facts, workflow)",
+            "text envelope (mesh, views, measured_facts)",
             "4 PNG images (one per view)",
         ],
         "model_action": ("classify the object from the views, then call "
@@ -94,20 +96,16 @@ GUIDE = [
     },
     {
         "tool": "reconstruct_mesh",
-        "purpose": ("Reconstruct the mesh as native parametric CAD features: "
-                    "prismatic emits a linear_extrude of the sliced profile, "
-                    "revolved revolves the half cross-section, csg_decompose "
-                    "fits boxes/cylinders into a union tree, and organic uses "
-                    "Fusion's PREVIEW MeshConvertFeature API."),
-        "inputs": ["mesh", "strategy", "units", "params"],
-        "outputs": [
-            "reconstruction envelope (strategy, method, bodies, features, "
-            "csg_nodes)",
-        ],
+        "note": "DISMANTLED — no server-side reconstruction tool; agent composes with primitives (analyze_mesh primitive_hints + structure_graph / query_structure_graph / slice_mesh / compare_mesh_to_brep + sketch/feature/boolean tools)",
+        "purpose": ("Agent-driven discovery pipeline: use analyze_mesh for measured facts, "
+                    "structure_graph / query_structure_graph for surface relationships, "
+                    "slice_mesh for cross-sections, then compose with native sketch/feature/boolean "
+                    "MCP tools to reconstruct iteratively."),
+        "inputs": ["analyze_mesh output", "structure_graph output", "sketch/feature/boolean MCP tools"],
+        "outputs": ["parametric BRep body (agent-composed)"],
         "model_action": None,
-        "branch": {"auto": "prismatic | revolved | csg_decompose | organic"},
-        "fallback": ("organic -> mesh_convert; unsupported -> mesh_fallback "
-                     "(mesh body instead of parametric features)"),
+        "branch": None,
+        "fallback": None,
     },
     {
         "tool": "compare_mesh_to_brep",
@@ -131,12 +129,10 @@ GUIDE = [
                     "is faithful or needs another pass."),
         "inputs": ["mesh", "body", "views"],
         "outputs": [
-            "text envelope (pairs, geometry, workflow)",
+            "text envelope (pairs, geometry)",
             "PNG images interleaved per view (mesh then brep)",
         ],
-        "model_action": ("compare each pair; if features are missing call "
-                         "reconstruct_mesh again with feedback or accept with "
-                         "select_parameter_schema"),
+        "model_action": "compare each pair + geometry summary; accept or iterate with primitives",
         "branch": None,
         "fallback": None,
     },

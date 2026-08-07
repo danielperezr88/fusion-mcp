@@ -15,9 +15,8 @@ reachable (so the headless `py -m pytest tests -v` run stays green), and runs
 the real assertions when Fusion is live.
 
 Checks:
-  * happy path  -- fresh doc: unit cube mesh (import_mesh_data) + prismatic
-                   BRep cube (extract_mesh_data -> build_csg_tree ->
-                   scale_tree x10 -> create_from_csg_tree); capture_body_views
+   * happy path  -- fresh doc: unit cube mesh (import_mesh_data) + prismatic
+                    BRep cube (create_from_csg_tree); capture_body_views
                    returns 3 views, every image_base64 decodes to PNG magic,
                    handler returns {"body": str, "views": [...]}
   * failure paths -- unknown view name -> EXACT error string (same as T5);
@@ -25,8 +24,8 @@ Checks:
   * server path -- review_reconstruction returns
                    [text_envelope, Image x6] interleaved per view (mesh then
                    brep); envelope pairs have view/mesh_image_base64/
-                   brep_image_base64 all PNG-magic, geometry summary present,
-                   workflow.stage == "review"; validated headless with a
+                    brep_image_base64 all PNG-magic, geometry summary present;
+                    validated headless with a
                    stubbed mcp.server.fastmcp and the REAL fresh-module
                    payloads injected at the _call and inline requests.post
                    boundaries. Failure path: mesh=999 -> {"error": ...}
@@ -49,8 +48,6 @@ FUSIONMCP_PATH = os.path.join(REPO_ROOT, "FusionMCP.py")
 SERVER_PATH = os.path.join(REPO_ROOT, "mcp_server", "fusion_server.py")
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
-
-from mcp_server import mesh_csg  # noqa: E402  (pure-Python, importable headless)
 
 VALID_VIEWS = {"isometric", "front", "top", "right"}
 
@@ -218,12 +215,9 @@ def _fresh_setup_mesh_and_brep(bridge):
     })
     assert "error" not in resp, f"import_mesh_data failed: {resp.get('error')}"
     mesh = "0"
-    data = fresh_dispatch("extract_mesh_data", {"mesh": mesh})
-    assert "error" not in data, f"extract_mesh_data failed: {data.get('error')}"
-    tree = mesh_csg.build_csg_tree(data, "prismatic", {})
-    tree = mesh_csg.scale_tree(tree, 10.0)  # cm -> mm (reconstruct units=mm)
+    tree = [{"kind": "cube", "params": {"size": [10, 10, 10]}}]
     resp = fresh_dispatch("create_from_csg_tree", {"csg_tree": tree,
-                                                   "units": "mm"})
+                                                    "units": "mm"})
     assert "error" not in resp, \
         f"create_from_csg_tree failed: {resp.get('error')}"
     assert resp.get("bodies", 0) >= 1, resp
@@ -375,9 +369,9 @@ def test_review_reconstruction_server_path_happy(bridge, monkeypatch):
     assert isinstance(geo, dict) and "error" not in geo, geo
     assert "volume_ratio" in geo, geo
     assert "bbox_max_deviation_cm" in geo, geo
-    assert env["workflow"]["stage"] == "review", env["workflow"]
-    assert "reconstruct_mesh" in env["workflow"]["next"], env["workflow"]
-    assert "select_parameter_schema" in env["workflow"]["next"], env["workflow"]
+    assert "pairs" in env
+    assert "geometry" in env
+    assert "workflow" not in env
     # Interleave order: mesh then brep, per view, in views order.
     mesh_by_view = {v["view"]: base64.b64decode(v["image_base64"])
                     for v in real_mesh_cap["views"]}

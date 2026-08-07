@@ -249,15 +249,10 @@ def test_structure_graph_workstream_summary(fs):
     summary, _ = _run(fs)
     ws = summary["workstream"]
     assert set(ws) == {
-        "base_face_per_component", "unit_types", "rebuild_order",
-        "dag_has_cycles",
+        "base_face_per_component", "dag_has_cycles",
     }
     assert ws["base_face_per_component"] == {"0": "face:0"}
-    assert ws["unit_types"] == {"0": "base"}
-    assert ws["rebuild_order"] == ["component:0"]
     assert ws["dag_has_cycles"] is False
-    assert isinstance(ws["rebuild_order"], list)
-    assert all(isinstance(s, str) for s in ws["rebuild_order"])
 
 
 def test_structure_graph_workstream_sql_agrees(fs):
@@ -274,16 +269,7 @@ def test_structure_graph_workstream_sql_agrees(fs):
     assert sql_rows[0][0] == "face:0"
     assert pytest.approx(sql_rows[0][1], abs=1e-6) == 0.85
 
-    comp_rows = conn.execute(
-        "SELECT node_id, unit_type, rebuild_order FROM nodes "
-        "WHERE label = 'Component' "
-        "ORDER BY rebuild_order"
-    ).fetchall()
-    assert comp_rows == [("component:0", "base", 0)]
-
     assert ws["base_face_per_component"] == {"0": "face:0"}
-    assert ws["unit_types"] == {"0": "base"}
-    assert ws["rebuild_order"] == ["component:0"]
     assert ws["dag_has_cycles"] is False
 
 
@@ -293,7 +279,7 @@ def test_structure_graph_workstream_raises(fs, monkeypatch):
     def _fail(*a, **k):
         raise RuntimeError("simulated T9 failure")
 
-    monkeypatch.setattr(mg, "_build_dependency_order", _fail)
+    monkeypatch.setattr(mg, "_detect_dag_cycles", _fail)
     try:
         summary, _ = _run(fs)
         assert "error" in summary

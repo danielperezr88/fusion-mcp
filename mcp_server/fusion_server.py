@@ -201,7 +201,7 @@ def _load_mesh_csg():
         return _spec_load("fusionmcp_mesh_csg", path)
     raise FileNotFoundError(
         "mcp_server/mesh_csg.py could not be found. Keep the fusion-mcp "
-        "repository importable so reconstruct_mesh can build CSG trees.")
+        "repository importable so mesh CSG operations can build CSG trees.")
 
 
 def _load_parameter_schemas():
@@ -1655,9 +1655,9 @@ def structure_graph(mesh: str = "0", units: str = "cm",
 
     NOTE: ``base_face_candidates`` is retained as a legacy preliminary key
     (largest-area face per component).  The real scored analysis (composite
-    base-face scoring, unit classification, dependency ordering) is in the
-    ``workstream`` section of the summary — see that for
-    ``base_face_per_component`` / ``unit_types`` / ``rebuild_order``.
+    base-face scoring and cycle detection) is in the ``workstream`` section
+    of the summary — see that for
+    ``base_face_per_component`` / ``dag_has_cycles``.
 
     Args:
         mesh:  Body name or index of a mesh body.
@@ -1735,7 +1735,7 @@ def structure_graph(mesh: str = "0", units: str = "cm",
                     conn.execute(f"PRAGMA table_info({table})").fetchall()]
 
         # T10: build workstream summary from attrs set by T9 functions
-        # (_score_base_faces / _classify_units / _build_dependency_order
+        # (_score_base_faces / _detect_dag_cycles
         # already called inside build_structure_graph — just READ here).
         base_face_per_component = {}
         for n, d in graph.nodes(data=True):
@@ -1745,17 +1745,8 @@ def structure_graph(mesh: str = "0", units: str = "cm",
         base_face_per_component = dict(
             sorted(base_face_per_component.items(),
                    key=lambda kv: int(kv[0])))
-        unit_types = {}
-        for n, d in graph.nodes(data=True):
-            if d.get("label") == "Component":
-                cid = str(int(d.get("component_id", 0)))
-                unit_types[cid] = d.get("unit_type", "freeform")
-        unit_types = dict(
-            sorted(unit_types.items(), key=lambda kv: int(kv[0])))
         workstream = {
             "base_face_per_component": base_face_per_component,
-            "unit_types": unit_types,
-            "rebuild_order": list(graph.graph.get("rebuild_order", [])),
             "dag_has_cycles": bool(graph.graph.get("dag_has_cycles", False)),
         }
 
@@ -2004,377 +1995,6 @@ def slice_mesh(mesh: str = "0", axis: str = "Z", height_cm: float = 0.0,
     return json.dumps(result, indent=2)
 
 
-def _count_csg_nodes(nodes):
-    """Recursively count the nodes in a CSG tree (reconstruction envelope)."""
-    total = 0
-    for node in nodes or []:
-        total += 1
-        total += _count_csg_nodes(node.get("children", []))
-    return total
-
-
-def _envelope_reconstruction(result, strategy, method, csg_nodes):
-    """Wrap a handler result in the T6 reconstruct_mesh envelope.
-
-    Handler errors pass through verbatim; successes are normalized to
-    {"strategy", "method", "bodies", "features", "csg_nodes"}.
-    """
-    try:
-        data = json.loads(result)
-    except ValueError:
-        return result
-    if not isinstance(data, dict):
-        return result
-    if "error" in data:
-        return json.dumps({"error": data["error"]}, indent=2)
-    return json.dumps({
-        "strategy": strategy,
-        "method": data.get("method", method),
-        "bodies": data.get("bodies", 0),
-        "features": data.get("features", 0),
-        "csg_nodes": csg_nodes,
-    }, indent=2)
-
-
-def _envelope_organic(result, operation):
-    """Wrap a mesh_convert handler result in the T7 organic envelope.
-
-    Handler errors pass through verbatim; successes become the PREVIEW-caveat
-    envelope {"strategy", "method", "preview_api", "parametric", "note"}.
-    """
-    try:
-        data = json.loads(result)
-    except ValueError:
-        return result
-    if not isinstance(data, dict):
-        return result
-    if "error" in data:
-        return json.dumps({"error": data["error"]}, indent=2)
-    return json.dumps({
-        "strategy": "organic",
-        "method": "mesh_convert",
-        "preview_api": True,
-        "parametric": bool(operation == "parametric"),
-        "note": "Organic conversion is a PREVIEW API result, not a parameterized solid.",
-    }, indent=2)
-
-
-def _reconstruct_mesh_sync(mesh: str = "0", strategy: str = "auto",
-                           units: str = "mm", params: dict = None) -> str:
-    """
-    Reconstruct a mesh body as parametric CAD features (CSG tree or revolve).
-
-    Fetches the mesh triangle data from Fusion and runs pure-Python
-    reconstruction: `prismatic` slices the mesh at interior heights along an
-    axis and emits ONE linear_extrude of the constant cross-section (holes
-    become polygon paths); `revolved` computes the half cross-section profile
-    through the Z-containing plane and revolves it around the Z axis;
-    `csg_decompose` fits boxes/cylinders to planar face regions and emits a
-    union tree.  The CSG trees / revolve profiles are scaled cm -> units and
-    handed to the add-in's create_from_csg_tree / revolve_cross_section
-    handlers, which turn them into native Fusion timeline features.
-
-    `organic` uses Fusion's PREVIEW MeshConvertFeature API instead: the mesh
-    is converted in-place by Fusion and the result may be a dumb BaseFeature
-    body rather than a parameterized solid (see the envelope's `note`).
-    PREVIEW CAVEAT: the API is only present on recent Fusion builds and is
-    additionally gated by the license; when unavailable the tool returns a
-    graceful not-available error instead of a converted body.
-
-    Stage 6 of the mesh-to-parametric workflow (see get_workflow_guide).
-
-    Args:
-        mesh:     Body name or index of a mesh body.
-        strategy: auto (routes via the analysis recommendation), prismatic,
-                  revolved, csg_decompose, or organic (PREVIEW API).
-        units:    Units for the reconstructed model: mm, cm, or in (default mm).
-        params:   Optional strategy params, e.g. {"axis": "Z",
-                  "num_slices": 3, "angle_deg": 360}.  For organic also
-                  {"operation": "parametric"|"base"} (default parametric).
-    """
-    strategy = str(strategy or "auto").strip().lower()
-    if strategy not in ("auto", "prismatic", "revolved", "csg_decompose", "organic"):
-        return json.dumps({
-            "error": f"Unknown strategy '{strategy}'. Supported: auto, "
-                     "prismatic, revolved, csg_decompose, organic"}, indent=2)
-    try:
-        factor = _cm_to_unit_factor(units)
-    except ValueError as e:
-        return json.dumps({"error": str(e)}, indent=2)
-    raw = _call("extract_mesh_data", {"mesh": mesh})
-    if raw.startswith("Error: "):
-        return json.dumps({"error": raw[len("Error: "):]}, indent=2)
-    if raw.startswith(("Cannot reach", "Unexpected error")):
-        return raw
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return raw
-    if "error" in data:
-        return json.dumps({"error": data["error"]}, indent=2)
-    params = dict(params or {})
-    try:
-        chosen = strategy
-        if strategy == "auto":
-            try:
-                mesh_analysis = _load_mesh_analysis()
-                report = mesh_analysis.analyze_mesh_data(
-                    data.get("nodes", []), data.get("indices", []),
-                    data.get("normals", []))
-                chosen = report.get("recommended_strategy", "prismatic")
-            except Exception:
-                chosen = "prismatic"
-        if chosen == "organic":
-            operation = str(params.get("operation", "parametric") or "parametric").strip().lower()
-            result = _call(
-                "mesh_convert",
-                {"mesh": mesh, "method": "organic", "operation": operation},
-                timeout=330)
-            return _envelope_organic(result, operation)
-        mesh_csg = _load_mesh_csg()
-        if chosen == "revolved":
-            try:
-                profile = mesh_csg.compute_revolved_profile(data, params)
-            except Exception as e:
-                return json.dumps({"error": f"revolve profile failed: {e}"},
-                                  indent=2)
-            profile = [[round(x * factor, 6), round(z * factor, 6)]
-                       for x, z in profile]
-            result = _call(
-                "revolve_cross_section",
-                {"profile_pts": profile, "angle": params.get("angle", 360.0),
-                 "units": units},
-                timeout=330)
-            return _envelope_reconstruction(result, "revolved", "revolve", 0)
-        try:
-            tree = mesh_csg.build_csg_tree(data, chosen, params)
-        except mesh_csg.NotPrismaticError:
-            if strategy != "auto":
-                raise
-            tree = mesh_csg.build_csg_tree(data, "csg_decompose", params)
-            chosen = "csg_decompose"
-        tree = mesh_csg.scale_tree(tree, factor)
-        result = _call("create_from_csg_tree", {"csg_tree": tree, "units": units},
-                       timeout=330)
-        return _envelope_reconstruction(result, chosen, "csg_translation",
-                                        _count_csg_nodes(tree))
-    except Exception as e:
-        return json.dumps({"error": f"reconstruction failed: {e}"}, indent=2)
-
-
-@mcp.tool()
-def reconstruct_mesh(mesh: str = "0", strategy: str = "auto", units: str = "mm",
-                     params: dict = None, job_id: str = "") -> str:
-    """
-    Reconstruct a mesh body as parametric CAD features (CSG tree or revolve).
-
-    Fetches the mesh triangle data from Fusion and runs pure-Python
-    reconstruction: `prismatic` slices the mesh at interior heights along an
-    axis and emits ONE linear_extrude of the constant cross-section (holes
-    become polygon paths); `revolved` computes the half cross-section profile
-    through the Z-containing plane and revolves it around the Z axis;
-    `csg_decompose` fits boxes/cylinders to planar face regions and emits a
-    union tree.  The CSG trees / revolve profiles are scaled cm -> units and
-    handed to the add-in's create_from_csg_tree / revolve_cross_section
-    handlers, which turn them into native Fusion timeline features.
-
-    `organic` uses Fusion's PREVIEW MeshConvertFeature API instead: the mesh
-    is converted in-place by Fusion and the result may be a dumb BaseFeature
-    body rather than a parameterized solid (see the envelope's `note`).
-    PREVIEW CAVEAT: the API is only present on recent Fusion builds and is
-    additionally gated by the license; when unavailable the tool returns a
-    graceful not-available error instead of a converted body.
-
-    Stage 6 of the mesh-to-parametric workflow (see get_workflow_guide).
-
-    Args:
-        mesh:     Body name or index of a mesh body.
-        strategy: auto (routes via the analysis recommendation), prismatic,
-                  revolved, csg_decompose, or organic (PREVIEW API).
-        units:    Units for the reconstructed model: mm, cm, or in (default mm).
-        params:   Optional strategy params, e.g. {"axis": "Z",
-                  "num_slices": 3, "angle_deg": 360}.  For organic also
-                  {"operation": "parametric"|"base"} (default parametric).
-    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
-    synchronously and returns the full result; a job id polls status/result.
-    """
-    if job_id == "sync":
-        return _reconstruct_mesh_sync(mesh, strategy, units, params)
-    if job_id:
-        return json.dumps(_job_status(job_id), indent=2)
-    return _launch_job(_reconstruct_mesh_sync, mesh, strategy, units, params)
-
-
-def _reconstruct_from_faces_sync(mesh: str = "0", units: str = "mm") -> str:
-    """Reconstruct a mesh body using exact face polygon boundaries.
-
-    Analyzes the mesh, extracts planar face decomposition, identifies the
-    dominant extrusion direction, and creates native Fusion sketches +
-    extrudes from the actual polygon vertices (not box-fitted
-    approximations).  Best for prismatic parts with planar faces.
-
-    Args:
-        mesh:  Body name or index of a mesh body.
-        units: Units for the reconstructed model: mm, cm, or in
-               (default mm).
-    """
-    try:
-        factor = _cm_to_unit_factor(units)
-    except ValueError as e:
-        return json.dumps({"error": str(e)}, indent=2)
-    raw = _call("extract_mesh_data", {"mesh": mesh})
-    if raw.startswith("Error: "):
-        return json.dumps({"error": raw[len("Error: "):]}, indent=2)
-    if raw.startswith(("Cannot reach", "Unexpected error")):
-        return raw
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return raw
-    if "error" in data:
-        return json.dumps({"error": data["error"]}, indent=2)
-    try:
-        mesh_analysis = _load_mesh_analysis()
-        report = mesh_analysis.analyze_mesh_data(
-            data.get("nodes", []), data.get("indices", []),
-            data.get("normals", []))
-    except ImportError:
-        return json.dumps({
-            "error": "Face decomposition requires trimesh. "
-                     "Install it with: pip install trimesh numpy"}, indent=2)
-    except Exception as e:
-        return json.dumps({"error": f"analysis failed: {e}"}, indent=2)
-
-    face_decomp = report.get("face_decomposition") or {}
-    planar_faces = face_decomp.get("planar_faces", [])
-    if not planar_faces:
-        return json.dumps({
-            "error": "No planar faces found in face decomposition. "
-                     "This tool is best for prismatic parts with flat faces."
-        }, indent=2)
-
-    try:
-        axis_areas = {0: 0.0, 1: 0.0, 2: 0.0}
-        for face in planar_faces:
-            normal = face.get("normal", [0, 0, 1])
-            area = float(face.get("area", 0))
-            abs_n = [abs(c) for c in normal]
-            dom_axis = abs_n.index(max(abs_n))
-            axis_areas[dom_axis] += area
-        dominant_axis = max(axis_areas, key=axis_areas.get)
-
-        def axis_value(vertex):
-            return float(vertex[dominant_axis])
-
-        pos_faces = []
-        neg_faces = []
-        for face in planar_faces:
-            normal = face.get("normal", [0, 0, 1])
-            abs_n = [abs(c) for c in normal]
-            face_dom = abs_n.index(max(abs_n))
-            if face_dom != dominant_axis:
-                continue
-            if normal[dominant_axis] >= 0:
-                pos_faces.append(face)
-            else:
-                neg_faces.append(face)
-
-        def mean_axis(face):
-            verts = face.get("vertices", [])
-            if not verts:
-                return 0.0
-            return sum(axis_value(v) for v in verts) / len(verts)
-
-        def best_face(group):
-            if not group:
-                return None
-            return max(group, key=lambda f: float(f.get("area", 0)))
-
-        top_face = best_face(pos_faces)
-        bottom_face = best_face(neg_faces)
-
-        bbox = report.get("bounding_box_cm") or report.get("bbox_cm")
-        bbox_height = None
-        if isinstance(bbox, list) and len(bbox) >= 2:
-            try:
-                bbox_height = abs(float(bbox[1][dominant_axis]) -
-                                 float(bbox[0][dominant_axis]))
-            except (IndexError, TypeError):
-                pass
-
-        if top_face and bottom_face:
-            top_z = mean_axis(top_face)
-            bottom_z = mean_axis(bottom_face)
-            extrude_height_cm = abs(top_z - bottom_z)
-        elif top_face or bottom_face:
-            primary = top_face or bottom_face
-            primary_z = mean_axis(primary)
-            if bbox_height and bbox_height > 0:
-                extrude_height_cm = bbox_height
-            else:
-                verts = primary.get("vertices", [])
-                zs = [axis_value(v) for v in verts]
-                extrude_height_cm = max(zs) - min(zs) if zs else 1.0
-                if extrude_height_cm < 1e-6:
-                    extrude_height_cm = 1.0
-        else:
-            extrude_height_cm = bbox_height or 1.0
-
-        if extrude_height_cm < 1e-6:
-            extrude_height_cm = bbox_height or 1.0
-
-        profile_face = top_face or bottom_face or best_face(planar_faces)
-        if not profile_face:
-            return json.dumps({"error": "Could not select a profile face."}, indent=2)
-
-        axis_map = {0: (1, 2), 1: (0, 2), 2: (0, 1)}
-        sketch_axes = axis_map[dominant_axis]
-        polygon_scaled = []
-        for vertex in profile_face.get("vertices", []):
-            sx = float(vertex[sketch_axes[0]]) * factor
-            sy = float(vertex[sketch_axes[1]]) * factor
-            sz = float(vertex[dominant_axis]) * factor
-            polygon_scaled.append([round(sx, 6), round(sy, 6), round(sz, 6)])
-
-        extrude_height_units = extrude_height_cm * factor
-
-        result = _call("create_sketch_from_polygon", {
-            "polygons": [polygon_scaled],
-            "plane_height": 0,
-            "extrude_height": round(extrude_height_units, 6),
-            "units": units,
-            "operation": "new_body",
-        }, timeout=330)
-        return _envelope_reconstruction(
-            result, "face_reconstruction", "polygon_extrude", 0)
-    except Exception as e:
-        return json.dumps({"error": f"face reconstruction failed: {e}"}, indent=2)
-
-
-@mcp.tool()
-def reconstruct_from_faces(mesh: str = "0", units: str = "mm",
-                           job_id: str = "") -> str:
-    """Reconstruct a mesh body using exact face polygon boundaries.
-
-    Analyzes the mesh, extracts planar face decomposition, identifies the
-    dominant extrusion direction, and creates native Fusion sketches +
-    extrudes from the actual polygon vertices (not box-fitted
-    approximations).  Best for prismatic parts with planar faces.
-
-    Args:
-        mesh:  Body name or index of a mesh body.
-        units: Units for the reconstructed model: mm, cm, or in
-               (default mm).
-    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
-    synchronously and returns the full result; a job id polls status/result.
-    """
-    if job_id == "sync":
-        return _reconstruct_from_faces_sync(mesh, units)
-    if job_id:
-        return json.dumps(_job_status(job_id), indent=2)
-    return _launch_job(_reconstruct_from_faces_sync, mesh, units)
-
-
 @mcp.tool()
 def compare_mesh_to_brep(mesh: str = "0", body: str = "0") -> str:
     """
@@ -2518,12 +2138,6 @@ def _annotate_mesh_parameters_sync(mesh: str = "0",
         "mesh": data.get("mesh", mesh),
         "views": cap.get("views", []),
         "measured_facts": report,
-        "workflow": {
-            "stage": "annotate",
-            "next": ("MODEL ACTION: classify the object from the views, then "
-                     "call select_parameter_schema with object_class and "
-                     "measured_facts"),
-        },
     }
     text_envelope = json.dumps(envelope, indent=2)
     return {
@@ -2547,8 +2161,8 @@ def annotate_mesh_parameters(mesh: str = "0",
     hints, recommended strategy) as `measured_facts`, then orients the
     viewport to each requested view (isometric / front / top / right),
     fits the view, and captures a PNG.  Returns a text envelope with the
-    mesh name, the 4 base64 views, the measured facts, and the workflow
-    pointer -- followed by the 4 decoded PNG image blocks for the model.
+    mesh name, the 4 base64 views, and the measured facts -- followed by
+    the 4 decoded PNG image blocks for the model.
 
     Classification happens on the MODEL side, not here: the model inspects
     the returned views + measured_facts, picks an object class, and calls
@@ -2588,14 +2202,13 @@ def _review_reconstruction_sync(mesh: str = "0", body: str = "0",
     Captures viewport screenshots of the ORIGINAL mesh and the RECONSTRUCTED
     BRep body for each requested view (isometric / front / top / right) and
     pairs them per view. Returns a text envelope with the per-view base64
-    image pairs, a local compare_mesh_to_brep geometry summary, and the
-    workflow pointer -- followed by the decoded PNG image blocks interleaved
-    per view (mesh image, then brep image).
+    image pairs and a local compare_mesh_to_brep geometry summary --
+    followed by the decoded PNG image blocks interleaved per view (mesh
+    image, then brep image).
 
     The comparison happens on the MODEL side, not here: the model inspects
-    each mesh/brep pair + geometry summary, decides whether features are
-    missing, and either calls `reconstruct_mesh` again with feedback or
-    accepts with `select_parameter_schema`.
+    each mesh/brep pair + geometry summary and decides whether features are
+    missing.
 
     Stage 8 of the mesh-to-parametric workflow (see get_workflow_guide).
 
@@ -2653,12 +2266,6 @@ def _review_reconstruction_sync(mesh: str = "0", body: str = "0",
     envelope = {
         "pairs": pairs,
         "geometry": geometry,
-        "workflow": {
-            "stage": "review",
-            "next": ("MODEL ACTION: compare each pair; if features are missing "
-                     "call reconstruct_mesh again with feedback or accept with "
-                     "select_parameter_schema"),
-        },
     }
     text_envelope = json.dumps(envelope, indent=2)
     out_views = []
@@ -2681,14 +2288,13 @@ def review_reconstruction(mesh: str = "0", body: str = "0",
     Captures viewport screenshots of the ORIGINAL mesh and the RECONSTRUCTED
     BRep body for each requested view (isometric / front / top / right) and
     pairs them per view. Returns a text envelope with the per-view base64
-    image pairs, a local compare_mesh_to_brep geometry summary, and the
-    workflow pointer -- followed by the decoded PNG image blocks interleaved
-    per view (mesh image, then brep image).
+    image pairs and a local compare_mesh_to_brep geometry summary --
+    followed by the decoded PNG image blocks interleaved per view (mesh
+    image, then brep image).
 
     The comparison happens on the MODEL side, not here: the model inspects
-    each mesh/brep pair + geometry summary, decides whether features are
-    missing, and either calls `reconstruct_mesh` again with feedback or
-    accepts with `select_parameter_schema`.
+    each mesh/brep pair + geometry summary and decides whether features are
+    missing.
 
     Stage 8 of the mesh-to-parametric workflow (see get_workflow_guide).
 
@@ -2726,13 +2332,13 @@ def get_workflow_guide(step: str = "") -> str:
     carries its tool name, purpose, expected inputs/outputs, the MODEL ACTION
     the assistant must take (annotate: classify the object; review: compare
     each pair and accept or re-run), the strategy branch at reconstruct, and
-    fallbacks. Pass a step name (e.g. "reconstruct" or the tool name
-    "reconstruct_mesh") to get that single step.
+    fallbacks. Pass a step name (e.g. "annotate" or "compare") to get that
+    single step.
 
     Stage 1 of the mesh-to-parametric workflow (see get_workflow_guide).
 
     Args:
-        step: Step name to look up, e.g. "annotate" or "reconstruct_mesh".
+        step: Step name to look up, e.g. "annotate" or "compare".
               Empty string (the default) returns the full guide.
     """
     step = str(step or "").strip()

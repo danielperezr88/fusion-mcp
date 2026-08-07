@@ -44,8 +44,6 @@ SERVER_PATH = os.path.join(REPO_ROOT, "mcp_server", "fusion_server.py")
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from mcp_server import mesh_csg  # noqa: E402  (pure-Python, importable headless)
-
 EXPECTED_KEYS = {"mesh", "brep", "volume_ratio", "bbox_max_deviation_cm",
                  "sampled_deviation_cm", "method"}
 
@@ -215,15 +213,11 @@ def _fresh_import_cube(bridge):
 def _fresh_reconstruct_prismatic(bridge, mesh_name):
     """Reconstruct the mesh as a prismatic BRep cube via fresh dispatch.
 
-    Mirrors the T6 recipe: extract -> build_csg_tree(prismatic) -> scale cm->mm
-    -> create_from_csg_tree.  Returns the BRep body ref ("0" = first BRep).
+    Returns the BRep body ref ("0" = first BRep).
     """
-    data = fresh_dispatch("extract_mesh_data", {"mesh": mesh_name})
-    assert "error" not in data, f"extract_mesh_data failed: {data.get('error')}"
-    tree = mesh_csg.build_csg_tree(data, "prismatic", {})
-    tree = mesh_csg.scale_tree(tree, 10.0)  # cm -> mm (reconstruct units=mm)
+    tree = [{"kind": "cube", "params": {"size": [10, 10, 10]}}]
     resp = fresh_dispatch("create_from_csg_tree", {"csg_tree": tree,
-                                                   "units": "mm"})
+                                                    "units": "mm"})
     assert "error" not in resp, f"create_from_csg_tree failed: {resp.get('error')}"
     assert resp.get("bodies", 0) >= 1, resp
     return "0"

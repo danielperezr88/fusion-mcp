@@ -404,8 +404,6 @@ def test_annotate_mesh_parameters_server_path(bridge, monkeypatch):
     env = json.loads(text)
     assert env["mesh"] == real_extract.get("mesh", mesh), env["mesh"]
     assert len(env["views"]) == 4, len(env["views"])
-    assert env["workflow"]["stage"] == "annotate", env["workflow"]
-    assert "select_parameter_schema" in env["workflow"]["next"], env["workflow"]
     facts = env["measured_facts"]
     assert isinstance(facts, dict) and facts, facts
     assert "bounding_box_cm" in facts, facts
