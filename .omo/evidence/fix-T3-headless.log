@@ -1,0 +1,34 @@
+﻿=== py_compile FusionMCP.py ===
+
+py_compile exit code: 0
+
+=== T3 headless harness ===
+======================================================================
+T3 headless harness: BRep surface UV-grid sampling
+source: C:\Users\danie\fusion-mcp\FusionMCP.py
+======================================================================
+[PASS] all 4 helper functions extracted from FusionMCP.py missing=[]
+[PASS] (a) grid_n(100 cm^2) == 15 got 15
+[PASS] (a) grid_n(0.4 cm^2) floored at 3 
+[PASS] (a) grid_n(None) defaults to 5 
+[PASS] (a) grid_n(area unavailable) defaults to 5 
+[PASS] (b) naive total > 2000 naive=11250
+[PASS] (b) capped total <= 2000 total=1800
+[PASS] (b) per-face grid_n >= 2 after cap min=6
+[PASS] (b) per-face grid_n < naive grid_n 6 < 15
+[PASS] (b) under-cap input returned unchanged 
+[PASS] (b2) sampled point count <= 2000 count=1800
+[PASS] (b2) sampled point count == capped total 1800 == 1800
+[PASS] (c) single 100 cm^2 face yields 225 points count=225
+[PASS] (c) d_surface_samples <= d_any_vertex d_surf=1.1122 d_vert=6.6237
+[PASS] (c) true distance (1.0) <= d_surf <= 1.5 (upper-bound gap) d_surf=1.1122
+[PASS] (c) max deviation well below phantom 2.94 d_surf=1.1122
+[PASS] (d) failing face skipped, good face yields 225 points count=225
+[PASS] (e) paramBounds-absent face still samples 225 points 
+[PASS] (f) area-unavailable face uses default grid 5 (25 points) count=25
+[PASS] (g) zero-face body returns [] 
+[PASS] (h) ret_val=False points skipped count=90
+======================================================================
+RESULT: ALL CHECKS PASSED
+
+harness exit code: 0

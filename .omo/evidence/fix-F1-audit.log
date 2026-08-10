@@ -1,0 +1,138 @@
+# F1 — Plan compliance audit
+# Plan: fix-foundational-tool-rough-edges
+# Verifier: independent (read-only — no edits, no commits)
+# Date: 2026-08-10
+# Verdict: APPROVE (all 12 checks PASS)
+
+Audit target: working tree at C:\Users\danie\fusion-mcp against the 6 fixes
+specified in .omo/plans/fix-foundational-tool-rough-edges.md (Todos 1-7).
+
+================================================================================
+CHECK (a) — _call default timeout 30->60
+  Command: grep -n "def _call" mcp_server/fusion_server.py
+  Result:
+    297: def _call(command: str, params: dict = None, timeout: int = 60) -> str:
+  PASS — default is 60, at L297 (plan ref: L297, zero drift)
+
+CHECK (b) — explicit heavy-tool timeouts, timeout=120
+  Command: grep -rn "timeout=120" mcp_server/fusion_server.py
+  Result: exactly 4 matches
+    489:  return _call("execute_script", {"code": code}, timeout=120)
+    1576: raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)
+    1688: raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)
+    1974: raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)
+  PASS — >=4 required; exactly 4, on the right sites:
+    execute_script L489, analyze_mesh L1576, structure_graph L1688, slice_mesh L1974.
+    All match plan refs exactly.
+
+CHECK (c) — timeout=30 EXACTLY ONE, at capture_screenshot (out of scope, unchanged)
+  Command: grep -rn "timeout=30" mcp_server/fusion_server.py
+  Result: exactly 1 match
+    1350: timeout=30)
+  PASS — the only timeout=30 is the direct requests.post in capture_screenshot.
+
+CHECK (d) — compare_mesh_to_brep docstring: parallel-batch warning + vision-free note
+  Command: grep -n "parallel" mcp_server/fusion_server.py
+  Result (compare docstring region L1999-2016):
+    2014: in parallel with a cut/extrude operation on the same body, it may return
+    2016: feature has completed, not in the same parallel batch.
+  Command: grep -n "vision-free" mcp_server/fusion_server.py
+  Result:
+    2001: Compare a mesh body against a BRep body (vision-free fidelity QA).   [pre-existing]
+    2018: Note: this tool is vision-free and works for any model. For visual QA,  [new T4 note]
+  PASS — parallel warning at L2013-2016 (plan ref L2013-2016), vision-free note at L2018.
+
+CHECK (e) — vision-capable reminders (annotate/review docstrings + workflow_guide steps 4 & 8)
+  Command: grep -n "vision-capable" mcp_server/fusion_server.py mcp_server/workflow_guide.py
+  Result: 4 matches total (>=3 required)
+    fusion_server.py  2183: If the calling model cannot process images, dispatch a vision-capable subagent  [annotate docstring]
+    fusion_server.py  2316: vision-capable subagent to compare each mesh/brep pair and report whether        [review docstring]
+    workflow_guide.py   81: "images, dispatch a vision-capable subagent to inspect "                        [step 4 annotate]
+    workflow_guide.py  139: "process images, dispatch a vision-capable subagent to "                        [step 8 review]
+  PASS — annotate ~L2183, review ~L2316, workflow_guide step 4 (L81) + step 8 (L139).
+
+CHECK (f) — BRep surface UV-grid sampling in _compare_mesh_brep
+  Command: grep -n "getPointAtParameter" FusionMCP.py
+  Result: 5 matches, all in the _compare_mesh_brep region
+    2452: if not hasattr(ev, "getPointAtParameter"):       [helper _sample_brep_surface_points ~L2431+]
+    2473: ret, pt = ev.getPointAtParameter(u, v)            [helper: actual sampling call]
+    2491: only expose getParameterAtPoint / getPointAtParameter / getNormalAtPoint  [docstring]
+    2495: (~1 point per 0.5 cm^2, total capped at 2000) via getPointAtParameter,    [docstring]
+    2545: # evaluators only expose getPointAtParameter (no getClosestPointTo),        [fallback branch ~L2542+]
+  PASS — helper definitions (_surface_grid_n L2382, _cap_grid_ns L2394,
+  _evaluator_uv_bounds L2408, _sample_brep_surface_points L2431) and the fallback
+  branch sample call (L2545) are all present.
+
+CHECK (g) — exec() scope fix in _execute_script
+  Read FusionMCP.py L577-596:
+    591: local_vars["__builtins__"] = __builtins__
+    592: exec(code, local_vars, local_vars)
+  PASS — exec passes local_vars as BOTH globals and locals; __builtins__ merged first.
+
+CHECK (h) — T7 slice research log exists + documents root cause & fix decision
+  Read .omo/evidence/fix-T7-slice-research.log (145 lines, written pre-edit per plan D4)
+  Documents:
+    - chain_loops first-hop vertex drop (PRIMARY bug, Finding 3)
+    - near-plane double-counting in _triangle_plane_segment (latent, Finding 2)
+    - 6-dp rounding interplay with _ONPLANE_EPS_BASE (Finding 1)
+    - fix decision: Fix A clamp on-plane distances to 0.0; Fix B append first-hop
+      vertex; explicitly rejected widening _DEDUP_EPS_BASE / changing onplane eps.
+  Diff confirms both fixes landed in mesh_slicer.py:
+    Fix A: dists = tuple(0.0 if on[k] else raw_dists[k] ...) after on-array computation
+    Fix B: loop.append(reps[cur]) at top of while loop (moved from reps[nxt2] at bottom)
+  PASS
+
+CHECK (i) — git diff --stat scope
+  Command: git diff --stat
+  Result:
+     .omo/plans/mesh-graph-pipeline.md |  14 ++---   [FLAGGED: pre-existing unrelated change from a DIFFERENT plan — excluded from scope per task instructions]
+     FusionMCP.py                     | 124 +++++++++++++---
+     mcp_server/fusion_server.py      |  28 ++++---
+     mcp_server/mesh_slicer.py        |  15 +++--
+     mcp_server/workflow_guide.py     |  10 ++--
+     tests/test_mesh_slicer.py        |  93 ++++++++++++++++++
+     6 files changed, 262 insertions(+), 22 deletions(-)
+  In-scope modified files = exactly the 5 required (FusionMCP.py, fusion_server.py,
+  workflow_guide.py, mesh_slicer.py, tests/test_mesh_slicer.py). tests/test_mesh_slicer.py
+  is in scope because T7 added 4 regression tests there (18 test functions confirmed).
+  PASS (with the flagged-but-excluded .omo/plans/mesh-graph-pipeline.md)
+
+CHECK (j) — py_compile
+  Command: py -m py_compile FusionMCP.py mcp_server/fusion_server.py mcp_server/workflow_guide.py mcp_server/mesh_slicer.py
+  Result: PYCOMPILE_EXIT=0
+  PASS
+
+CHECK (k) — capture_screenshot L1350 must NOT appear in any fusion_server.py diff hunk
+  Command: git diff mcp_server/fusion_server.py | grep -c "1350"
+  Result: HUNK_1350_COUNT=0
+  PASS
+
+CHECK (l) — no new MCP tools, no public tool signature changes
+  Command: git diff FusionMCP.py mcp_server/fusion_server.py | grep -E "^[-+].*(def |@mcp|add_tool|register)" | grep -v docstring
+  Result (all hits reviewed):
+    +def _surface_grid_n(area_cm2, area_per_sample=0.5):          helper addition (T3)
+    +def _cap_grid_ns(grid_ns, max_points=2000):                  helper addition (T3)
+    +def _evaluator_uv_bounds(ev, default=(0.0, 1.0, 0.0, 1.0)):  helper addition (T3)
+    +def _sample_brep_surface_points(body, max_points=2000, area_per_sample=0.5): helper addition (T3)
+    -def _call(command: str, params: dict = None, timeout: int = 30) -> str:   private helper,
+    +def _call(command: str, params: dict = None, timeout: int = 60) -> str:   signature identical
+                                                                               except default 30->60 (the
+                                                                               intended T1 change)
+  No @mcp.tool registrations, no add_tool, no register in the diff. All 4 helper
+  additions are underscore-private and called only from _compare_mesh_brep's
+  fallback branch. _call is a private helper whose only change is the T1 default.
+  No public MCP tool function signature changed.
+  PASS
+
+================================================================================
+SUMMARY
+  Checks passed: 12 / 12
+  Verdict: APPROVE
+
+  Notes for F3:
+  - .omo/plans/mesh-graph-pipeline.md is a pre-existing working-tree modification
+    from a different plan (14 lines). NOT part of this plan's diff. F3 must NOT
+    stage it in the atomic commit (git add only the 5 in-scope files + .omo/evidence/fix-*).
+  - No out-of-scope code changes detected in FusionMCP.py / fusion_server.py /
+    workflow_guide.py / mesh_slicer.py / tests/test_mesh_slicer.py.
+  - Untracked dirs (.omo/evidence, .omo/notepads, etc.) are plan tooling, not code.

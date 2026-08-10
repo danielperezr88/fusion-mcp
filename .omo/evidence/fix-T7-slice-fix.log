@@ -1,0 +1,67 @@
+# T7 — slice_mesh thin-band fix: verification log
+# Date: 2026-08-10
+
+## Changes applied
+File: mcp_server/mesh_slicer.py (2 targeted fixes, 0 signature changes)
+
+### Fix A: _triangle_plane_segment — clamp near-plane distances (L212-224)
+Renamed `dists` → `raw_dists`, then created a clamped `dists` that zeroes
+any distance within onplane_eps. The `on` array is computed from raw_dists
+(before clamping), so on-plane-corner classification is unaffected. The
+edge-crossing loop (L227-235) now uses clamped dists, so edges touching
+an on-plane vertex never produce spurious crossings (0 * dj = 0, not < 0).
+
+Before: vertex at d=9e-7 (within onplane_eps=1e-6) → edge to opposite-side
+  vertex has di*dj = 9e-7 * (-0.25) < 0 → spurious crossing near vertex.
+After: clamped d=0.0 → 0 * (-0.25) = 0, not < 0 → no spurious crossing.
+
+### Fix B: _chain_loops — append first-hop vertex (L303-314)
+Moved `loop.append(reps[nxt2])` (old L314) to the top of the while loop as
+`loop.append(reps[cur])` (new L304). This appends the CURRENT vertex before
+finding the next one, ensuring ALL loop vertices are included. The old code
+only appended reps[start] and subsequent nxt2 values, skipping the first hop.
+
+Before: 4-segment rectangle (no midpoints) → loop=[start, hop3, hop2] = 3 pts
+After:  4-segment rectangle (no midpoints) → loop=[start, hop1, hop2, hop3] = 4 pts
+
+## Verification results
+
+### 1. py_compile
+    py -m py_compile mcp_server/mesh_slicer.py → EXIT 0 ✓
+
+### 2. Regression: z=0/z=0.5 cube sliced at z=0.25
+    loops=1, pts=4, is_hole=False
+    pts=[[1.0,0.0],[1.0,1.0],[0.0,1.0],[0.0,0.0]] ✓
+
+### 3. Regression: thin-band 10cm cube z=[0,0.249999] @ z=0.25
+    loops=1, pts=4 (was 3 before fix)
+    pts=[[10.0,0.0],[10.0,10.0],[0.0,10.0],[0.0,0.0]] ✓
+
+### 4. pytest
+    py -m pytest tests/test_mesh_slicer.py -q → 18 passed in 0.06s ✓
+    (14 original tests + 4 new regression tests)
+
+### 5. No regression on solid-height slices
+    Unit cube z=[0,0.5] @ z=0.25 → 4 corners (unchanged) ✓
+    Unit cube z=[0,1.0] @ z=0.5 → 4 corners (unchanged, tested by existing
+    test_cube_midheight_z_single_ccw_loop) ✓
+
+## Tests added (tests/test_mesh_slicer.py, 4 new tests)
+1. test_thin_band_near_plane_vertex_four_corners — 10cm cube top=0.249999
+   sliced at z=0.25 must return 4 corners (was 3 before fix)
+2. test_thin_band_near_plane_no_spurious_crossings — 1cm cube top=0.2500009
+   (d~9e-7 within onplane_eps) must produce clean loops with 4 corners
+3. test_chain_loops_no_midpoint_rectangle — 4-segment rectangle (no midpoints)
+   must chain to 4 points (was 3)
+4. test_chain_loops_no_midpoint_triangle — 3-segment triangle (no midpoints)
+   must chain to 3 points (was dropped entirely)
+
+## No regression on existing tests
+All 14 pre-existing tests pass unchanged — the fixes only ADD vertices that
+were previously dropped, and those extra vertices are collinear midpoints
+that _simplify_loop removes anyway. For no-midpoint loops (the thin-band
+case), the fixes correctly preserve real corners.
+
+## Files modified
+- mcp_server/mesh_slicer.py (2 fixes: L212-224 clamp, L303-314 chain walk)
+- tests/test_mesh_slicer.py (+1 import, +4 regression tests, ~85 lines)

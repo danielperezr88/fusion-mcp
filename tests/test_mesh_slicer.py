@@ -24,6 +24,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from mcp_server.mesh_slicer import scale_slice, slice_mesh_at
+from mcp_server.mesh_slicer import _chain_loops
 
 
 # ---------------------------------------------------------------------------
@@ -260,3 +261,95 @@ def test_scale_slice_mm():
     assert scaled["plane"]["origin"] == pytest.approx([0.0, 0.0, 5.0])
     # is_hole / structure untouched
     assert scaled["loops"][0]["is_hole"] == res["loops"][0]["is_hole"]
+
+
+# ---------------------------------------------------------------------------
+# Thin-band near-plane vertex (T7): mesh vertices within onplane_eps of the
+# slice plane must not produce spurious crossings or miss real corners.
+# ---------------------------------------------------------------------------
+
+def _cube_ztop(z0, z1, size=1.0):
+    """Indexed cube with custom z-range, outward-wound."""
+    x = y = 0.0
+    nodes = [
+        x, y, z0,   x + size, y, z0,   x + size, y + size, z0,   x, y + size, z0,
+        x, y, z1,   x + size, y, z1,   x + size, y + size, z1,   x, y + size, z1,
+    ]
+    indices = [
+        0, 2, 1, 0, 3, 2,    4, 5, 6, 4, 6, 7,
+        0, 1, 5, 0, 5, 4,    3, 7, 6, 3, 6, 2,
+        0, 4, 3, 3, 4, 7,    1, 2, 6, 1, 6, 5,
+    ]
+    return nodes, indices
+
+
+def test_thin_band_near_plane_vertex_four_corners():
+    """A 10cm cube whose top face (z=0.249999) is within onplane_eps of the
+    slice plane z=0.25 must still return all 4 rectangle corners.
+
+    Before the T7 fix, the near-plane top vertices produced only 4 full-edge
+    segments (no triangulation midpoints), and _chain_loops dropped the
+    first-hop vertex, yielding 3 points instead of 4.
+    """
+    nodes, indices = _cube_ztop(0.0, 0.249999, size=10.0)
+    res = slice_mesh_at(nodes, indices, {"axis": "Z", "height_cm": 0.25})
+    assert len(res["loops"]) == 1
+    loop = res["loops"][0]
+    assert len(loop["pts"]) == 4
+    expected = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
+    assert _cyclic_rotation_ok(loop["pts"], expected)
+    assert _signed_area(loop["pts"]) > 0
+
+
+def test_thin_band_near_plane_no_spurious_crossings():
+    """A cube whose top face is at z=0.2500009 (distance ~9e-7, within
+    onplane_eps=1e-6 for scale=1) must produce clean segments without
+    spurious near-vertex crossings.
+
+    Before the T7 clamp fix, edges from the near-plane vertex produced
+    interpolated crossings near (but not at) the vertex, creating 8 segments
+    instead of the correct 4. After simplification the output happened to be
+    correct for axis-aligned meshes, but the spurious points could corrupt
+    loops on non-axis-aligned meshes.
+    """
+    nodes, indices = _cube_ztop(0.0, 0.2500009, size=1.0)
+    res = slice_mesh_at(nodes, indices, {"axis": "Z", "height_cm": 0.25})
+    assert len(res["loops"]) == 1
+    loop = res["loops"][0]
+    assert len(loop["pts"]) == 4
+    expected = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+    assert _cyclic_rotation_ok(loop["pts"], expected)
+
+
+def test_chain_loops_no_midpoint_rectangle():
+    """_chain_loops must include ALL vertices when segments form a polygon
+    without triangulation midpoints.
+
+    Before the T7 fix, the first-hop vertex was never appended, dropping a
+    corner from a 4-segment rectangle (3 points instead of 4).
+    """
+    segs = [
+        ((10.0, 0.0), (0.0, 0.0)),
+        ((0.0, 10.0), (10.0, 10.0)),
+        ((0.0, 0.0), (0.0, 10.0)),
+        ((10.0, 10.0), (10.0, 0.0)),
+    ]
+    chains = _chain_loops(segs, 1e-8)
+    assert len(chains) == 1
+    assert len(chains[0]) == 4
+
+
+def test_chain_loops_no_midpoint_triangle():
+    """_chain_loops must not drop a triangle loop entirely.
+
+    Before the T7 fix, the first-hop vertex was never appended, leaving only
+    2 points (< 3 minimum) so the triangle was discarded.
+    """
+    segs = [
+        ((0.0, 0.0), (1.0, 0.0)),
+        ((1.0, 0.0), (0.5, 1.0)),
+        ((0.5, 1.0), (0.0, 0.0)),
+    ]
+    chains = _chain_loops(segs, 1e-9)
+    assert len(chains) == 1
+    assert len(chains[0]) == 3

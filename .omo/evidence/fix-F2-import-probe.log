@@ -1,0 +1,45 @@
+F2 — fresh-process import probes (python3.13)
+================================================================================
+Plan:   .omo/plans/fix-foundational-tool-rough-edges.md (checkbox F2)
+Role:   INDEPENDENT VERIFIER (evidence only — no fixes, no commits)
+Date:   2026-08-10
+Shell:  Windows PowerShell 5.1
+Workdir: C:\Users\danie\fusion-mcp
+
+Interpreter: python3.13 (Python 3.13.14)
+    — the interpreter the MCP server actually runs under (per
+      C:\Users\danie\.config\opencode\opencode.json). `py` (3.14.2) is NOT used
+      for imports: its mcp==2.0.0 SDK dropped mcp.server.fastmcp, so
+      `import fusion_server` fails there with ModuleNotFoundError at L20. This
+      is PRE-EXISTING (proven on git HEAD by T1/T2/T4) and out of F2 scope.
+
+Probe 1 — six tools register on fusion_server
+    python3.13 -c "import sys; sys.path.insert(0,'mcp_server'); import fusion_server;
+                   assert hasattr(fusion_server, 'compare_mesh_to_brep');
+                   assert hasattr(fusion_server, 'annotate_mesh_parameters');
+                   assert hasattr(fusion_server, 'review_reconstruction');
+                   assert hasattr(fusion_server, 'execute_script');
+                   assert hasattr(fusion_server, 'structure_graph');
+                   assert hasattr(fusion_server, 'slice_mesh'); print('IMPORT_OK')"
+    -> IMPORT_OK, EXIT_CODE=0
+
+Probe 2 — GUIDE has exactly 8 entries
+    python3.13 -c "import sys; sys.path.insert(0,'mcp_server'); import workflow_guide, json;
+                   assert len(json.loads(workflow_guide.GUIDE_JSON)) == 8; print('GUIDE_OK')"
+    -> GUIDE_OK, EXIT_CODE=0
+
+Probe 3 — docstring markers on the edited tools
+    python3.13 -c "import sys; sys.path.insert(0,'mcp_server'); import fusion_server;
+                   assert 'parallel' in fusion_server.compare_mesh_to_brep.__doc__;
+                   assert 'vision-capable' in fusion_server.annotate_mesh_parameters.__doc__;
+                   assert 'vision-capable' in fusion_server.review_reconstruction.__doc__;
+                   print('DOCSTRINGS_OK')"
+    -> DOCSTRINGS_OK, EXIT_CODE=0
+
+Probe 4 — standalone mesh_slicer still imports (standalone check suite)
+    python3.13 -c "import sys; sys.path.insert(0,'mcp_server'); import mesh_slicer;
+                   assert hasattr(mesh_slicer, 'slice_mesh_at'); print('SLICER_OK')"
+    -> SLICER_OK, EXIT_CODE=0
+
+VERDICT: IMPORT OK — all 6 tools register on fusion_server, GUIDE has exactly
+8 entries, docstring markers present, mesh_slicer imports standalone.

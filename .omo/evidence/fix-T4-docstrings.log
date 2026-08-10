@@ -1,0 +1,48 @@
+=== T4 — vision-subagent reminder docstrings (fusion_server.py) — 2026-08-10 ===
+
+Files modified: mcp_server/fusion_server.py ONLY (3 docstring-only additions)
+
+Edits:
+1. annotate_mesh_parameters docstring: Note at L2182-2185
+   "Note: This tool returns PNG image blocks for model-side classification.
+   If the calling model cannot process images, dispatch a vision-capable subagent
+   to inspect the returned views and extract the object class, then call
+   `select_parameter_schema` with the result."
+2. review_reconstruction docstring: Note at L2314-2317
+   "Note: This tool returns side-by-side PNG image pairs for model-side
+   visual QA. If the calling model cannot process images, dispatch a
+   vision-capable subagent to compare each mesh/brep pair and report whether
+   features are missing."
+3. compare_mesh_to_brep docstring: vision-free Note at L2018-2019 (added AFTER
+   T2's parallel-batch Note L2013-2016, before Args:; T2's paragraph untouched)
+   "Note: this tool is vision-free and works for any model. For visual QA,
+   see `review_reconstruction`."
+
+=== Verification ===
+
+$ py -m py_compile mcp_server/fusion_server.py
+py_compile exit: 0
+
+$ grep -n "vision-capable subagent" mcp_server/fusion_server.py  (2 matches; >=2 required)
+2183: If the calling model cannot process images, dispatch a vision-capable subagent
+2316: vision-capable subagent to compare each mesh/brep pair and report whether
+
+$ grep -n "vision-free" mcp_server/fusion_server.py  (2 matches; >=1 required)
+2001: Compare a mesh body against a BRep body (vision-free fidelity QA).   [pre-existing]
+2018: Note: this tool is vision-free and works for any model. For visual QA,  [NEW]
+
+$ py -c "import sys; sys.path.insert(0,'mcp_server'); import fusion_server; ..."
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import sys; sys.path.insert(0,'mcp_server'); import fusion_server; assert 'vision-capable' in fusion_server.annotate_mesh_parameters.__doc__; assert 'vision-capable' in fusion_server.review_reconstruction.__doc__; print('IMPORT_PROBE_OK')
+                                                 ^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie\fusion-mcp\mcp_server\fusion_server.py", line 20, in <module>
+    from mcp.server.fastmcp import FastMCP, Image
+ModuleNotFoundError: No module named 'mcp.server.fastmcp'
+
+Import probe BLOCKED by the PRE-EXISTING environment issue (mcp==2.0.0 dropped
+mcp.server.fastmcp; proven pre-existing on git HEAD — documented in learnings.md,
+T1/T2 entries). Identical failure at L20, NOT caused by this edit. Not fixed.
+py_compile passes (syntax valid); docstring assertions unreachable via import.
+
+=== RESULT: T4 VERIFIED (py_compile + grep green; import probe blocked pre-existing) ===

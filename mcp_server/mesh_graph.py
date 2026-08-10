@@ -772,11 +772,20 @@ def _tabulate(rows: List[Tuple[str, dict]],
 def _create_table(conn: duckdb.DuckDBPyConnection, table: str,
                   rows: List[Tuple[str, dict]], core: Tuple[str, ...],
                   primary_key: Optional[str] = None) -> None:
-    """Create ``table`` from ``rows`` and bulk-insert them (parameterized).
+    """Create ``table`` from ``rows`` and bulk-insert them (CSV round-trip).
 
     Column names are validated identifiers; values go through
-    ``_sql_value``.  The caller owns the surrounding transaction.
+    ``_sql_value``.  The bulk insert renders the normalized rows to a temp
+    CSV and loads it with ``read_csv`` — a zero-parameter path: DuckDB's
+    per-parameter Python→C++ binding costs ~0.35ms each, so any
+    parameterized insert of the real graph's ~770K parameters is ~270s
+    regardless of batching (measured).  The caller owns the surrounding
+    transaction.
     """
+    import csv as _csv
+    import os as _os
+    import tempfile as _tempfile
+
     columns, aligned = _tabulate(rows, core)
     col_types = {c: _column_type([r[i] for r in aligned])
                  for i, c in enumerate(columns)}
@@ -788,13 +797,28 @@ def _create_table(conn: duckdb.DuckDBPyConnection, table: str,
             d += " PRIMARY KEY"
         defs.append(d)
     conn.execute(f"CREATE TABLE {table} ({', '.join(defs)})")
-    placeholders = ", ".join("?" for _ in columns)
     normalized = [tuple(_sql_value(v, col_types[c])
                         for c, v in zip(columns, row))
                   for row in aligned]
     if normalized:
-        conn.executemany(f"INSERT INTO {table} VALUES ({placeholders})",
-                         normalized)
+        nulls = "\x01"  # sentinel never produced by _sql_value on real data
+        fd, path = _tempfile.mkstemp(suffix=".csv", prefix="mg_bulk_")
+        _os.close(fd)
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = _csv.writer(f)
+                for row in normalized:
+                    w.writerow([nulls if v is None else v for v in row])
+            struct = "{" + ", ".join(
+                f"'{c}': '"
+                + ("VARCHAR" if col_types[c] == "TEXT" else col_types[c])
+                + "'" for c in columns) + "}"
+            conn.execute(
+                f"INSERT INTO {table} SELECT * FROM read_csv("
+                f"'{path.replace(_os.sep, '/')}', columns={struct}, "
+                f"header=false, nullstr=E'\\x01')")
+        finally:
+            _os.remove(path)
 
 
 def _persist_to_duckdb(graph: nx.Graph,

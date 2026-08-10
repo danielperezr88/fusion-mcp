@@ -1,0 +1,23 @@
+fix-T1 evidence — py_compile + import probe (T1: _call default 30->60s + heavy-tool timeout=120)
+Timestamp: 2026-08-10 (session)
+================================================================================
+
+$ py -m py_compile mcp_server/fusion_server.py
+py_compile exit: 0            # PASS — syntax valid
+
+$ py -c "import sys; sys.path.insert(0,'mcp_server'); import fusion_server"
+  File "C:\Users\danie\fusion-mcp\mcp_server\fusion_server.py", line 20, in <module>
+ModuleNotFoundError: No module named 'mcp.server.fastmcp'
+
+# NOTE — import probe FAILURE IS PRE-EXISTING AND UNRELATED TO T1:
+# Installed SDK is mcp==2.0.0 (pip show mcp); the file's L20
+#   from mcp.server.fastmcp import FastMCP, Image
+# targets the 1.x fastmcp API. requirements.txt allows mcp>=1.0.0, so pip
+# upgraded to 2.0.0 where mcp.server.fastmcp no longer exists.
+# PROOF it is not caused by T1: git show HEAD:mcp_server/fusion_server.py
+# (unmodified pre-edit version) fails IDENTICALLY at L20 with the same
+# ModuleNotFoundError. T1's diff touches only lines 297/489/1573/1685/1971 —
+# no imports, no signatures, no tool registrations.
+# Resolution for F3: pin mcp<2.0.0 (e.g. mcp>=1.2.0,<2) in requirements or
+# migrate to the 2.x API. T1 scope does NOT include this.
+================================================================================

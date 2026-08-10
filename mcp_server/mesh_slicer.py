@@ -210,11 +210,18 @@ def _triangle_plane_segment(a: Float3, b: Float3, c: Float3,
     on it) contributes that edge's two endpoints.
     """
     corners = (a, b, c)
-    dists = tuple(_dot((p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]),
-                       normal) for p in corners)
-    on = [abs(d) <= onplane_eps for d in dists]
+    raw_dists = tuple(_dot((p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]),
+                           normal) for p in corners)
+    on = [abs(d) <= onplane_eps for d in raw_dists]
     if all(on):
         return None  # triangle lies entirely in the plane -> skip
+    # Clamp near-plane (on) vertices to exactly 0 so the edge-crossing test
+    # below never fires for edges touching an on-plane vertex.  Without this,
+    # a vertex at distance ~1e-7 (within onplane_eps but nonzero) causes both
+    # a spurious interpolated crossing AND the on-plane-corner point,
+    # producing segment endpoints that differ between adjacent triangles and
+    # break loop chaining (thin-band reliability bug, T7).
+    dists = tuple(0.0 if on[k] else raw_dists[k] for k in range(3))
     pts = []
     # proper edge crossings (endpoints strictly on opposite sides)
     for (i, j) in ((0, 1), (1, 2), (2, 0)):
@@ -294,6 +301,7 @@ def _chain_loops(raw_segments: Sequence[Tuple[Tuple[float, float],
             loop = [reps[start]]
             cur, prev = nxt, start
             while cur != start:
+                loop.append(reps[cur])
                 cands = [v for v in adj[cur]
                          if v != prev and _edge(cur, v) not in used]
                 if not cands:
@@ -303,7 +311,6 @@ def _chain_loops(raw_segments: Sequence[Tuple[Tuple[float, float],
                 used.add(_edge(cur, nxt2))
                 if nxt2 == start:
                     break  # loop closed; first point is not repeated
-                loop.append(reps[nxt2])
                 prev, cur = cur, nxt2
             if loop is not None and len(loop) >= 3:
                 loops.append(loop)

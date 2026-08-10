@@ -1,0 +1,145 @@
+# T7 — slice_mesh thin-band reliability: root-cause research log
+# Written BEFORE any production edit (plan D4 hard requirement)
+# Date: 2026-08-10
+
+## Symptom (from plan + demo)
+Thin-band slices (e.g. Z-slice at z=0.25 on a mesh with vertices at z=0 and
+z=0.5) produce false loops or miss real loops. The mesh-vertex probe proved
+the geometry was fine, so the bug is in the slicing math/chaining, not the
+mesh.
+
+## Reproduction
+Built 6 targeted test meshes (scripts at .omo/evidence/t7_repro.py, t7_repro2.py,
+t7_repro3.py, t7_chain_bug.py). Key findings:
+
+### Finding 1: near-plane vertices from 6-dp rounding (FusionMCP.py L2842)
+FusionMCP.py L2842 rounds all mesh coordinates to 6 decimal places:
+    nodes.extend([round(pt.x, 6), round(pt.y, 6), round(pt.z, 6)])
+
+_ONPLANE_EPS_BASE = 1e-6 (L70) sits exactly at this precision boundary.
+A vertex at z=0.249999 (6-dp) has computed distance:
+    0.249999 - 0.25 = -9.999999999747044e-07
+whose abs() < 1e-6 → classified "on" the plane (for scale=1).
+
+For a 10cm-extent mesh (scale=10), onplane_eps = 1e-5, so even vertices at
+z=0.24999 (distance ~1e-5) are "on" the plane.
+
+### Finding 2: near-plane double-counting in _triangle_plane_segment (L200-243)
+When a vertex V is classified "on" (within onplane_eps) but its distance is
+nonzero (e.g. 9e-7), the code DOUBLE-COUNTS V:
+
+(a) Edge-crossing loop (L220-228): edges from V to vertices on the OPPOSITE
+    side have di*dj < 0 (tiny * clear), producing an INTERPOLATED crossing
+    point near V but NOT at V. This is spurious — V is "on" the plane, so
+    edges from V should NOT cross it.
+
+(b) On-plane-corner loop (L230-240): V is correctly added as a genuine
+    segment endpoint via its own projected position.
+
+The function returns pts[0], pts[1] (L241-242). With 3+ points accumulated,
+the spurious crossing (a) may be returned INSTEAD of V's own position (b).
+This creates segment endpoints that are NEAR but not AT V, differing between
+adjacent triangles (different edge directions → different interpolation),
+preventing endpoint dedup and breaking chains.
+
+In the tested axis-aligned cases, the spurious points are collinear with real
+vertices and get simplified away — so the double-counting is a LATENT bug
+masked by collinearity. In non-axis-aligned meshes (diagonal/curved edges),
+the spurious points could survive simplification and corrupt loops.
+
+### Finding 3 (PRIMARY BUG): _chain_loops first-hop vertex drop (L250-310)
+THIS is the bug that produces wrong output in the thin-band case.
+
+The loop-walking algorithm in _chain_loops initializes:
+    loop = [reps[start]]          # only start is in loop
+    cur, prev = nxt, start         # nxt = first hop, but NOT appended
+Then in the while loop:
+    loop.append(reps[nxt2])        # only SUBSEQUENT hops are appended
+
+The FIRST HOP VERTEX (nxt, which becomes cur) is NEVER appended to the loop.
+For each iteration, only reps[nxt2] (the NEXT vertex) is appended — reps[cur]
+(the CURRENT vertex) is skipped.
+
+Why this is masked in normal meshes: Fusion's displayMesh triangulates every
+quad face into 2 triangles, creating a diagonal midpoint on every edge of the
+cross-section polygon. The dropped first-hop vertex is always a collinear
+midpoint that gets simplified away by _simplify_loop. The REAL polygon
+corners are appended as nxt2 in subsequent iterations.
+
+Why this manifests in thin-band meshes: When the near-plane face produces
+segments that are FULL polygon edges (no midpoints), the dropped first-hop
+vertex is a REAL polygon corner. It's NOT collinear with its neighbors, so
+simplification cannot recover it.
+
+Reproduced directly (.omo/evidence/t7_chain_bug.py):
+  - 4-segment rectangle (no midpoints): chain = 3 pts (1 corner DROPPED) ✗
+  - 8-segment rectangle (with midpoints): chain = 7 pts → simplified → 4 ✓
+  - 3-segment triangle (no midpoints): chain = 0 (DROPPED entirely, len < 3) ✗
+
+Reproduced end-to-end (.omo/evidence/t7_repro3.py Test 6):
+  - 10cm cube, top=0.249999, slice at z=0.25: 4 segments (no midpoints)
+    → chain = 3 pts → output = 3 pts (expected 4) ✗
+
+### Finding 4: the epsilon interplay
+The plan's D4 asked about the interplay between _ONPLANE_EPS_BASE and
+_DEDUP_EPS_BASE. The interplay is:
+
+1. _ONPLANE_EPS_BASE (1e-6) determines which vertices are "on" the plane.
+   For 6-dp data (Fusion's rounding), this catches vertices at distance
+   ≤1e-6 from the plane — a correct and necessary tolerance.
+
+2. When vertices are "on" but the near-plane face's edges don't create
+   crossing midpoints, _chain_loops's first-hop-drop bug produces wrong loops.
+   This is NOT an epsilon issue — it's an algorithmic bug.
+
+3. The spurious crossing points from double-counting (Finding 2) differ by
+   up to ~onplane_eps * edge_length between adjacent triangles. For scale=1,
+   that's ~1e-6 cm. _DEDUP_EPS_BASE * scale = 1e-9, so the spurious points
+   DON'T dedup. But with the clamping fix (below), the spurious points are
+   eliminated entirely, so dedup tolerance is irrelevant for this issue.
+
+## Fix decision
+TWO targeted fixes, both minimal (2-3 lines each):
+
+### Fix A: clamp near-plane distances to 0.0 in _triangle_plane_segment (L215)
+After computing `dists` and `on`, replace:
+    dists = tuple(_dot(...) for p in corners)
+with a clamped version that zeroes distances within onplane_eps:
+    dists = tuple(d if abs(d) > onplane_eps else 0.0 for d in raw_dists)
+
+This ensures edges from "on"-plane vertices never produce spurious crossings
+(di*dj = 0*dj = 0, which is NOT < 0). The on-plane-corner logic continues
+to add the vertex's own position as the sole representative. Eliminates
+double-counting. The `on` array is computed from the ORIGINAL distances
+(before clamping) and is unaffected.
+
+### Fix B: append first-hop vertex in _chain_loops (L296)
+Inside the while loop, append reps[cur] BEFORE finding the next candidate:
+    while cur != start:
+        loop.append(reps[cur])     # FIX: include current vertex
+        cands = [v for v in adj[cur] if v != prev and _edge(cur, v) not in used]
+        ...
+
+This ensures ALL vertices in the loop are included. For meshes with
+midpoints, the extra point is collinear and simplified away (no behavior
+change). For meshes without midpoints (thin-band case), the real corner
+is preserved (fixes the bug).
+
+### Why not widen _DEDUP_EPS_BASE?
+The plan offered the option of "widening _DEDUP_EPS_BASE for thin bands."
+This would NOT fix either bug: (a) the first-hop drop is algorithmic, not
+epsilon-related; (b) widening dedup could merge DISTINCT vertices in normal
+meshes, corrupting valid loops. The clamping fix is the correct approach.
+
+### Why not change _ONPLANE_EPS_BASE?
+The onplane_eps = 1e-6 * scale is correctly sized for 6-dp Fusion data.
+Changing it would either miss legitimate on-plane vertices (too small) or
+classify distant vertices as on-plane (too large). The clamping approach
+keeps the epsilon at its correct value while preventing the double-counting.
+
+## Verification plan
+1. py_compile mcp_server/mesh_slicer.py → exit 0
+2. Regression: 10cm cube z=[0,0.249999] slice at z=0.25 → 4 corners (was 3)
+3. Regression: 1cm cube z=[0,0.5] slice at z=0.25 → 4 corners (unchanged)
+4. py -m pytest tests/test_mesh_slicer.py -q → exit 0
+5. New regression test: no-midpoint rectangle chain → 4 pts (not 3)

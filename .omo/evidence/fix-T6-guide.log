@@ -1,0 +1,34 @@
+T6 evidence: vision-subagent reminders added to workflow_guide.py
+=================================================================
+Plan: fix-foundational-tool-rough-edges, task T6
+Date: 2026-08-10
+File modified: mcp_server/workflow_guide.py (ONLY)
+
+Edits
+-----
+1. Step 4 "annotate_mesh_parameters" (model_action, ~line 78):
+   "...measured_facts. If the calling model cannot process images,
+    dispatch a vision-capable subagent to inspect the returned views
+    and extract the object class."
+2. Step 8 "review_reconstruction" (model_action, ~line 135):
+   "...iterate with primitives. If the calling model cannot process
+    images, dispatch a vision-capable subagent to compare each
+    mesh/brep pair and report whether features are missing."
+
+Verification 1 — GUIDE_JSON probe (must exit 0):
+------------------------------------------------
+$ py -c "import sys; sys.path.insert(0,'mcp_server'); import workflow_guide, json; data = json.loads(workflow_guide.GUIDE_JSON); assert len(data) == 8; ann = [s for s in data if s['tool'] == 'annotate_mesh_parameters'][0]; assert 'vision-capable' in ann.get('model_action', '') or 'vision-capable' in ann.get('note', ''), ann; rev = [s for s in data if s['tool'] == 'review_reconstruction'][0]; assert 'vision-capable' in rev.get('model_action', '') or 'vision-capable' in rev.get('note', ''), rev"
+PROBE PASSED (exit 0)
+
+Verification 2 — py_compile (must exit 0):
+-------------------------------------------
+$ py -m py_compile mcp_server/workflow_guide.py
+PY_COMPILE PASSED (exit 0)
+
+Verification 3 — grep "vision-capable" (must be >= 2 matches):
+--------------------------------------------------------------
+mcp_server/workflow_guide.py:81: "images, dispatch a vision-capable subagent to inspect "
+mcp_server/workflow_guide.py:139: "process images, dispatch a vision-capable subagent to "
+Found 2 matches (one in annotate entry, one in review entry)
+
+All 3 checks passed.

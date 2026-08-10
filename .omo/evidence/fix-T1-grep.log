@@ -1,0 +1,34 @@
+fix-T1 evidence — grep verification (T1: _call default 30->60s + heavy-tool timeout=120)
+Timestamp: 2026-08-10 (session)
+Command: Select-String (grep) on mcp_server/fusion_server.py
+================================================================================
+
+=== def _call ===
+297: def _call(command: str, params: dict = None, timeout: int = 60) -> str:
+
+=== timeout=120 ===
+489:     return _call("execute_script", {"code": code}, timeout=120)
+1576:     raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)
+1688:     raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)
+1974:     raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)
+
+=== timeout=30 ===
+1350:                           timeout=30)
+
+=== _call("extract_mesh_data" (all sites, incl. untouched) ===
+1576:     raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)   # analyze_mesh
+1688:     raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)   # structure_graph
+1974:     raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)   # slice_mesh
+2103:     raw = _call("extract_mesh_data", {"mesh": mesh})                # _annotate_mesh_parameters_sync — UNTOUCHED (annotate family, job-polling)
+
+=== _call("compare_mesh_brep" (untouched, uses new 60s default) ===
+2017:     raw = _call("compare_mesh_brep", {"mesh": mesh, "body": body})
+
+================================================================================
+PASS criteria:
+- def _call default timeout: int = 60 ................. PASS (L297)
+- timeout=120 count = 4, each on a _call( line, each targeting one of the 4
+  required sites (execute_script L489, analyze_mesh L1576, structure_graph
+  L1688, slice_mesh L1974) ............................. PASS
+- timeout=30 count = EXACTLY ONE, at capture_screenshot requests.post (L1350) PASS
+- compare_mesh_to_brep / annotate / review sites carry NO timeout kwarg .... PASS

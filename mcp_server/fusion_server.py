@@ -294,7 +294,7 @@ def _get_openscad_path():
         return None
 
 
-def _call(command: str, params: dict = None, timeout: int = 30) -> str:
+def _call(command: str, params: dict = None, timeout: int = 60) -> str:
     if params is None:
         params = {}
     try:
@@ -486,7 +486,7 @@ def execute_script(code: str) -> str:
     Args:
         code: Python code to execute inside Fusion 360.
     """
-    return _call("execute_script", {"code": code})
+    return _call("execute_script", {"code": code}, timeout=120)
 
 
 # ---- Document Management ----
@@ -1573,7 +1573,7 @@ def analyze_mesh(mesh: str = "0", units: str = "cm",
         factor = _cm_to_unit_factor(units)
     except ValueError as e:
         return json.dumps({"error": str(e)}, indent=2)
-    raw = _call("extract_mesh_data", {"mesh": mesh})
+    raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)
     if raw.startswith("Error: "):
         return json.dumps({"error": raw[len("Error: "):]}, indent=2)
     if raw.startswith(("Cannot reach", "Unexpected error")):
@@ -1685,7 +1685,7 @@ def structure_graph(mesh: str = "0", units: str = "cm",
         _cm_to_unit_factor(units)
     except ValueError as e:
         return json.dumps({"error": str(e)}, indent=2)
-    raw = _call("extract_mesh_data", {"mesh": mesh})
+    raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)
     if raw.startswith("Error: "):
         return json.dumps({"error": raw[len("Error: "):]}, indent=2)
     if raw.startswith(("Cannot reach", "Unexpected error")):
@@ -1971,7 +1971,7 @@ def slice_mesh(mesh: str = "0", axis: str = "Z", height_cm: float = 0.0,
         factor = _cm_to_unit_factor(units)
     except ValueError as e:
         return json.dumps({"error": str(e)}, indent=2)
-    raw = _call("extract_mesh_data", {"mesh": mesh})
+    raw = _call("extract_mesh_data", {"mesh": mesh}, timeout=120)
     if raw.startswith("Error: "):
         return json.dumps({"error": raw[len("Error: "):]}, indent=2)
     if raw.startswith(("Cannot reach", "Unexpected error")):
@@ -2009,6 +2009,14 @@ def compare_mesh_to_brep(mesh: str = "0", body: str = "0") -> str:
     is available on the build, "vertex_fallback" otherwise.
 
     Stage 7 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Note: compare_mesh_to_brep reads the BRep body's CURRENT state. If called
+    in parallel with a cut/extrude operation on the same body, it may return
+    metrics for the PRE-cut geometry. Always call this tool AFTER the preceding
+    feature has completed, not in the same parallel batch.
+
+    Note: this tool is vision-free and works for any model. For visual QA,
+    see `review_reconstruction`.
 
     Args:
         mesh: Body name or index of a mesh body.
@@ -2171,6 +2179,11 @@ def annotate_mesh_parameters(mesh: str = "0",
 
     Stage 4 of the mesh-to-parametric workflow (see get_workflow_guide).
 
+    Note: This tool returns PNG image blocks for model-side classification.
+    If the calling model cannot process images, dispatch a vision-capable subagent
+    to inspect the returned views and extract the object class, then call
+    `select_parameter_schema` with the result.
+
     Args:
         mesh:  Body name or index of a mesh body.
         views: View names to capture, e.g. ['isometric', 'front', 'top',
@@ -2297,6 +2310,11 @@ def review_reconstruction(mesh: str = "0", body: str = "0",
     missing.
 
     Stage 8 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Note: This tool returns side-by-side PNG image pairs for model-side
+    visual QA. If the calling model cannot process images, dispatch a
+    vision-capable subagent to compare each mesh/brep pair and report whether
+    features are missing.
 
     Args:
         mesh:  Body name or index of the ORIGINAL mesh body.

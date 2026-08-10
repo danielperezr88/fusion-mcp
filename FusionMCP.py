@@ -588,7 +588,8 @@ def _execute_script(p):
         "math": math, "json": json,
     }
     try:
-        exec(code, {"__builtins__": __builtins__}, local_vars)
+        local_vars["__builtins__"] = __builtins__
+        exec(code, local_vars, local_vars)
         output = local_vars.get("result", result).get("output", None)
         return {"success": True, "output": output}
     except Exception:
@@ -2379,6 +2380,111 @@ def _mesh_convert(root, p: dict) -> dict:
         return {"error": str(e)}
 
 
+def _surface_grid_n(area_cm2, area_per_sample=0.5):
+    """Adaptive UV grid density: ~1 sample per `area_per_sample` cm^2.
+
+    grid_n = max(3, ceil(sqrt(area / area_per_sample))).  Used by
+    _sample_brep_surface_points to size each BRep face's UV sample grid;
+    the default 5 covers faces whose area cannot be read.
+    """
+    if area_cm2 is None or area_cm2 <= 0:
+        return 5
+    return max(3, int(math.ceil(math.sqrt(area_cm2 / area_per_sample))))
+
+
+def _cap_grid_ns(grid_ns, max_points=2000):
+    """Scale per-face grid sizes so the total sample count <= max_points.
+
+    The scale factor is sqrt(max_points / naive_total) applied per face,
+    floored at 2 so no face collapses to a single point.  The input list is
+    returned unchanged when the naive total already fits under the cap.
+    """
+    naive_total = sum(n * n for n in grid_ns)
+    if naive_total <= max_points:
+        return list(grid_ns)
+    scale = math.sqrt(float(max_points) / float(naive_total))
+    return [max(2, int(n * scale)) for n in grid_ns]
+
+
+def _evaluator_uv_bounds(ev, default=(0.0, 1.0, 0.0, 1.0)):
+    """Return (umin, umax, vmin, vmax) for an evaluator's param space.
+
+    Prefers the `parametricRange()` method (returns a BoundingBox2D on this
+    Fusion build); falls back to the `paramBounds` property; then to the
+    [0,1] x [0,1] default when unavailable or degenerate.
+    """
+    try:
+        b = None
+        pr = getattr(ev, "parametricRange", None)
+        if callable(pr):
+            b = pr()
+        if b is None:
+            pb = getattr(ev, "paramBounds", None)
+            b = pb() if callable(pb) else pb
+        if b is None:
+            return default
+        try:
+            umin, vmin = float(b.minPoint.x), float(b.minPoint.y)
+            umax, vmax = float(b.maxPoint.x), float(b.maxPoint.y)
+        except AttributeError:
+            umin, umax, vmin, vmax = (float(x) for x in b)
+    except Exception:
+        return default
+    if not (umax > umin and vmax > vmin):
+        return default
+    return (umin, umax, vmin, vmax)
+
+
+def _sample_brep_surface_points(body, max_points=2000, area_per_sample=0.5):
+    """Sample a BRep body's face surfaces on an adaptive UV grid.
+
+    Each face gets grid_n = _surface_grid_n(face.area, area_per_sample)
+    (~1 sample per 0.5 cm^2, default 5 when the area cannot be read), then
+    _cap_grid_ns enforces the max_points total.  Every face's sampling is
+    guarded by try/except so unsupported face types are skipped.  Returns a
+    list of (x, y, z) tuples -- [] when no face could be sampled (callers
+    fall back to vertex-to-vertex measurement).
+    """
+    points = []
+    faces = []
+    try:
+        for i in range(body.faces.count):
+            face = body.faces.item(i)
+            try:
+                area_cm2 = float(face.area)
+            except Exception:
+                area_cm2 = None
+            ev = face.evaluator
+            if not hasattr(ev, "getPointAtParameter"):
+                continue
+            faces.append((ev, area_cm2))
+        grid_ns = _cap_grid_ns(
+            [_surface_grid_n(area, area_per_sample) for _ev, area in faces],
+            max_points=max_points)
+    except Exception:
+        return points
+    for (ev, _area), grid_n in zip(faces, grid_ns):
+        try:
+            if grid_n < 2:
+                grid_n = 2
+            umin, umax, vmin, vmax = _evaluator_uv_bounds(ev)
+            if grid_n == 1:
+                us = [0.5 * (umin + umax)]
+                vs = [0.5 * (vmin + vmax)]
+            else:
+                us = [umin + (umax - umin) * i / (grid_n - 1) for i in range(grid_n)]
+                vs = [vmin + (vmax - vmin) * j / (grid_n - 1) for j in range(grid_n)]
+            for u in us:
+                for v in vs:
+                    p2 = adsk.core.Point2D.create(u, v)
+                    ret, pt = ev.getPointAtParameter(p2)
+                    if ret:
+                        points.append((float(pt.x), float(pt.y), float(pt.z)))
+        except Exception:
+            continue  # skip faces whose evaluator fails
+    return points
+
+
 def _compare_mesh_brep(root, p: dict) -> dict:
     """Compare a mesh body against a BRep body (vision-free fidelity QA).
 
@@ -2392,8 +2498,11 @@ def _compare_mesh_brep(root, p: dict) -> dict:
     only expose getParameterAtPoint / getPointAtParameter / getNormalAtPoint
     (see the T8 notepad section).  When the API exists the sampled deviation
     uses it and the response reports "method": "surface_evaluator"; on this
-    build the fallback measures each mesh vertex to its nearest BRep vertex
-    and reports "method": "vertex_fallback".
+    build the fallback samples each BRep face's surface on an adaptive UV grid
+    (~1 point per 0.5 cm^2, total capped at 2000) via getPointAtParameter,
+    measures every sampled mesh vertex to its nearest surface point, and
+    reports "method": "vertex_fallback" (if no face can be sampled at all, the
+    original vertex-to-vertex measurement runs as an inner catch-all).
     """
     try:
         mesh_ref = p.get("mesh", "0")
@@ -2438,8 +2547,18 @@ def _compare_mesh_brep(root, p: dict) -> dict:
                 face_evaluators.append(ev)
         method = "surface_evaluator" if face_evaluators else "vertex_fallback"
 
-        brep_verts = []
+        # Fallback: sample the BRep face surfaces on an adaptive UV grid and
+        # measure mesh vertices against those samples.  On this build the
+        # evaluators only expose getPointAtParameter (no getClosestPointTo),
+        # so each face is sampled ~1 point per 0.5 cm^2, total capped at 2000.
+        brep_surface_points = []
         if not face_evaluators:
+            brep_surface_points = _sample_brep_surface_points(body)
+
+        brep_verts = []
+        if not face_evaluators and not brep_surface_points:
+            # Inner catch-all: no face evaluator could be sampled; fall back
+            # to the original vertex-to-vertex measurement.
             for i in range(body.vertices.count):
                 v = body.vertices.item(i).geometry
                 brep_verts.append((v.x, v.y, v.z))
@@ -2456,6 +2575,10 @@ def _compare_mesh_brep(root, p: dict) -> dict:
                         d = math.sqrt((px - cp.x) ** 2 + (py - cp.y) ** 2 + (pz - cp.z) ** 2)
                         if best is None or d < best:
                             best = d
+                elif brep_surface_points:
+                    best = min(
+                        math.sqrt((px - bx) ** 2 + (py - by) ** 2 + (pz - bz) ** 2)
+                        for bx, by, bz in brep_surface_points)
                 else:
                     best = min(
                         math.sqrt((px - bx) ** 2 + (py - by) ** 2 + (pz - bz) ** 2)

@@ -1,0 +1,26 @@
+F2 — py_compile evidence
+================================================================================
+Plan:   .omo/plans/fix-foundational-tool-rough-edges.md (checkbox F2)
+Role:   INDEPENDENT VERIFIER (evidence only — no fixes, no commits)
+Date:   2026-08-10
+Shell:  Windows PowerShell 5.1
+Workdir: C:\Users\danie\fusion-mcp
+
+Command (verbatim):
+    py -m py_compile FusionMCP.py mcp_server/fusion_server.py mcp_server/workflow_guide.py mcp_server/mesh_slicer.py
+    ; Write-Output "EXIT_CODE=$LASTEXITCODE"
+
+Interpreter:
+    py --version            -> Python 3.14.2   (launcher default; used for compile + pytest)
+    python3.13 --version    -> Python 3.13.14  (interpreter the MCP server runs under per opencode.json; used for import probes)
+
+Result:
+    EXIT_CODE=0
+
+Checked files (mtime / size at time of check):
+    FusionMCP.py                 138487 bytes  10/08/2026 0:25:04
+    mcp_server/fusion_server.py  103141 bytes  10/08/2026 0:29:02
+    mcp_server/workflow_guide.py   7199 bytes  10/08/2026 0:16:14
+    mcp_server/mesh_slicer.py     18908 bytes  10/08/2026 0:42:58
+
+VERDICT: COMPILE OK — all 4 edited files compile with py_compile, exit code 0.

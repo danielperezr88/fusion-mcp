@@ -1,0 +1,37 @@
+fix-T2-docstring — compare_mesh_to_brep parallel-order docstring warning
+Date: 2026-08-10
+Plan: .omo/plans/fix-foundational-tool-rough-edges.md (T2)
+File modified: mcp_server/fusion_server.py (ONLY — docstring text, no code)
+
+--- Edit ---
+Appended Note paragraph to the compare_mesh_to_brep docstring (def at L1999,
+docstring region L2000-2016 pre-edit). Inserted after the "Stage 7" paragraph,
+before the Args block. Resulting Note paragraph lines:
+  L2013:     Note: compare_mesh_to_brep reads the BRep body's CURRENT state. If called
+  L2014:     in parallel with a cut/extrude operation on the same body, it may return
+  L2015:     metrics for the PRE-cut geometry. Always call this tool AFTER the preceding
+  L2016:     feature has completed, not in the same parallel batch.
+No signature/return/registration/code changes.
+
+--- Verification 1: py_compile ---
+Command: py -m py_compile mcp_server/fusion_server.py
+Exit code: 0
+Output: (none — success)
+
+--- Verification 2: grep for the warning text ---
+Command: grep -n "parallel batch" mcp_server/fusion_server.py
+Match: L2016:     feature has completed, not in the same parallel batch.
+(grep tool used; plain grep is not on PATH on this Windows host)
+
+--- Verification 3: import probe ---
+Command: py -c "import sys; sys.path.insert(0,'mcp_server'); import fusion_server; assert 'parallel' in fusion_server.compare_mesh_to_brep.__doc__; print('IMPORT PROBE OK')"
+Exit code: 1
+Result: BLOCKED BY PRE-EXISTING ENVIRONMENT ISSUE (NOT caused by this edit):
+  File "C:\Users\danie\fusion-mcp\mcp_server\fusion_server.py", line 20, in <module>
+    from mcp.server.fastmcp import FastMCP, Image
+  ModuleNotFoundError: No module named 'mcp.server.fastmcp'
+Installed SDK is mcp==2.0.0, which dropped mcp.server.fastmcp. Proven pre-existing
+on git HEAD by T1 (see learnings.md L78). Not fixed here — F3's concern.
+
+--- Conclusion ---
+py_compile exit 0, grep match present inside docstring region. PASS.

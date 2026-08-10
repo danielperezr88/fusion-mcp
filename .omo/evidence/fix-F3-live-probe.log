@@ -1,0 +1,84 @@
+﻿F3 LIVE PROBE EVIDENCE - fix-foundational-tool-rough-edges
+==========================================================
+Date: 2026-08-10 (session ses_046722e53fferGQ5c1ZKxNJ377)
+
+PROBE 1: compare_mesh_to_brep(mesh="1", body="1")  -> PASS
+  sampled_deviation_cm.max = 0.979808  (criterion: <= 1.5)
+  sampled_deviation_cm.mean = 0.199055, samples = 197
+  volume_ratio = 1.033387, bbox_max_deviation_cm = 0.933333
+  method = vertex_fallback
+  Verified live via MCP tool (re-run 2026-08-10).
+
+PROBE 2: execute_script nested-function scope      -> PASS
+  Payload: def outer(): def inner(x): return x*2; return inner(7)
+  Output: "14" (no NameError). Exec-scope fix confirmed live.
+
+PROBE 3: structure_graph(mesh="1")                 -> FIX APPLIED, NEEDS SERVER RESTART
+  Live MCP probe returned MCP -32001 Request timed out (stale process).
+
+  ROOT CAUSE (server-side, NOT the add-in):
+  mcp_server/mesh_graph.py _create_table used duckdb conn.executemany
+  with per-row parameterized INSERTs. Measured real-data cost:
+    - nodes   (1,160 rows):  16.5s
+    - edges   (55,080 rows): 219.1s
+    - persist total:         237.3s
+    - full chain (extract 0.3 + decompose ~16 + build ~40 + persist 237) = ~294s
+  > the 150s F3 cap and the MCP client timeout.
+
+  FIX (landed in repo, mcp_server/mesh_graph.py):
+  Replace executemany with a temp-CSV + read_csv bulk insert
+  (zero-parameter path; DuckDB per-parameter binding ~0.35ms => ~270s
+  for the real graph's ~770K parameters regardless of batching).
+  NULL sentinel \x01 + nullstr=E'\x01'; TEXT -> VARCHAR in the
+  read_csv column struct; forward-slash path; temp file removed in
+  finally; empty-rows guard retained.
+
+  REAL-DATA RE-PROBE (fixed code, same real mesh "1", direct import):
+    extract_mesh_data:  0.3s
+    decompose:         15.7s
+    build graph:       41.3s
+    persist:            0.7s   (was 237.3s)
+    TOTAL:             58.0s   (criterion: < 150s)  PASS
+    row-count check:   nodes 1160/1160, edges 55080/55080  PASS
+  Evidence command: py C:\Users\danie\AppData\Local\Temp\opencode\live_persist_probe.py
+
+  Automated gates: py_compile OK; pytest 45 passed
+  (tests/test_mesh_graph_db.py, test_mesh_graph.py, test_structure_graph_tool.py)
+
+  WHY THE LIVE PROBE STILL TIMED OUT:
+  The MCP server process serving the fusion360_* tools
+  (PID 26648, fusion_server.py, created 2026-08-07 19:45:45, child of
+  opencode session ses_046722e53fferGQ5c1ZKxNJ377) started BEFORE the fix
+  (mesh_graph.py mtime 2026-08-10 03:04:42) and has the old module cached.
+  The fix is proven correct on the identical real mesh; the live probe
+  passes once the MCP server restarts and reloads mesh_graph.py.
+
+STATUS: probes 1+2 PASS (live). Probe 3 code-level PASS (real-data chain
+58s < 150s, exact row counts); live confirmation pending MCP server restart.
+
+LIVE RE-VERIFICATION AFTER MCP SERVER RESTART (2026-08-10 09:14)
+===============================================================
+- MCP server process restarted: PID 23360 (fusion_server.py) created
+  2026-08-10 09:13:59 - AFTER the mesh_graph.py fix (mtime 03:04:42).
+  Previous serving process PID 26648 (created 08-07 19:45:45) held the
+  stale executemany module and was the sole cause of the -32001 timeout.
+
+- PROBE 3 (LIVE, via MCP tool): fusion360_structure_graph(mesh="1")  -> PASS
+  Completed without timeout. Full result:
+    component_count = 1, face_count = 992
+    edge_type_counts: COMPONENT_OF 127, CONTAINS 167, COPLANAR 9,
+      EDGE_ADJACENT 1028, EXTRUSION_ALIGNED 1480, HAS_BASE 992,
+      PARALLEL 10864, PERPENDICULAR 32467, SAME_ORIENTATION 7917,
+      VERTEX_TOUCH 29
+    base_face_candidates: component 0 -> face:4 (area 116.58 cm2)
+    articulation_points: [face:4, face:5], connected_components = 1
+    workstream: base_face_per_component {0: face:4}, dag_has_cycles = false
+    duckdb_table_schema: nodes (22 cols) + edges (14 cols) persisted
+    query_example: SELECT node_id, area_cm2 FROM nodes WHERE label='Face'...
+  Row-count provenance: real-data probe earlier confirmed nodes 1160 /
+  edges 55080 exact; the live DuckDB persist is the same fixed code path.
+
+F3 FINAL VERDICT: ALL THREE LIVE PROBES PASS.
+  1. compare_mesh_to_brep  max 0.979808 <= 1.5        PASS
+  2. execute_script        nested funcs, no NameError PASS
+  3. structure_graph       completes, no timeout      PASS

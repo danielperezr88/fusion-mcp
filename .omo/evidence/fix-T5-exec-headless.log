@@ -1,0 +1,25 @@
+# T5 evidence — exec() scope fix in FusionMCP.py:_execute_script
+# Date: 2026-08-10
+# File changed: ONLY FusionMCP.py
+
+## Change
+L591: local_vars["__builtins__"] = __builtins__   (new)
+L592: exec(code, local_vars, local_vars)          (was: exec(code, {"__builtins__": __builtins__}, local_vars))
+
+local_vars (unchanged population, L584-589) already holds:
+  app, ui, design, root, adsk (__import__("adsk")), result, math, json
+
+## 1. py_compile
+$ py -m py_compile FusionMCP.py
+PY_COMPILE_EXIT_0
+
+## 2. Headless harness — NEW pattern (exec(code, local_vars, local_vars) + __builtins__ merged)
+$ py C:\Users\danie\AppData\Local\Temp\opencode\t5_harness.py
+T5 HEADLESS PASS
+  - sibling function resolution: def f()... def g() -> f() ... result['output'] == "7"  (assert passed)
+  - builtins intact: len([1,2,3]) -> result['output'] == "3"                            (assert passed)
+
+## 3. Headless proof — OLD pattern FAILS (exec(code, {"__builtins__": __builtins__}, local_vars))
+$ py C:\Users\danie\AppData\Local\Temp\opencode\t5_old_pattern.py
+OLD PATTERN NameError: name 'f' is not defined
+  => confirms the fix (locals-as-globals) is what makes sibling names resolve

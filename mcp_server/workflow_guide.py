@@ -77,7 +77,9 @@ GUIDE = [
         ],
         "model_action": ("classify the object from the views, then call "
                          "select_parameter_schema with object_class and "
-                         "measured_facts"),
+                         "measured_facts. If the calling model cannot process "
+                         "images, dispatch a vision-capable subagent to inspect "
+                         "the returned views and extract the object class."),
         "branch": None,
         "fallback": None,
     },
@@ -132,7 +134,11 @@ GUIDE = [
             "text envelope (pairs, geometry)",
             "PNG images interleaved per view (mesh then brep)",
         ],
-        "model_action": "compare each pair + geometry summary; accept or iterate with primitives",
+        "model_action": ("compare each pair + geometry summary; accept or "
+                         "iterate with primitives. If the calling model cannot "
+                         "process images, dispatch a vision-capable subagent to "
+                         "compare each mesh/brep pair and report whether "
+                         "features are missing."),
         "branch": None,
         "fallback": None,
     },
