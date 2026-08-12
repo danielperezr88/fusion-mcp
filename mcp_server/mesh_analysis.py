@@ -816,6 +816,10 @@ def _fit_sphere(nodes_array, face_indices, face_normals):
     if radius < 1e-9:
         return None
 
+    cluster_extent = float(np.max(verts.max(axis=0) - verts.min(axis=0)))
+    if cluster_extent > 1e-9 and radius > 100.0 * cluster_extent:
+        return None
+
     # Confidence: low coefficient of variation ⇒ high confidence.
     mean_r = float(np.mean(dists))
     if mean_r < 1e-9:
@@ -824,6 +828,28 @@ def _fit_sphere(nodes_array, face_indices, face_normals):
     confidence = max(0.0, 1.0 - cv * 5.0)
     if confidence < 0.3:
         return None
+
+    # Normal-radial alignment gate (validated: median |cos| < 0.85 rejects).
+    radial = centroids - center
+    radial_norm = np.linalg.norm(radial, axis=1)
+    valid_r = radial_norm > 1e-9
+    if np.any(valid_r):
+        radial_unit = radial[valid_r] / radial_norm[valid_r, np.newaxis]
+        n = min(len(normals), len(radial_unit))
+        if n > 0:
+            nm = np.linalg.norm(normals[:n], axis=1)
+            ok = nm > 1e-12
+            if np.any(ok):
+                dots = np.abs(np.sum(
+                    normals[:n][ok] / nm[ok, np.newaxis]
+                    * radial_unit[:n][ok], axis=1))
+                if len(dots) > 0:
+                    median_align = float(np.median(dots))
+                    if median_align < 0.85:
+                        return None
+                    confidence *= median_align
+                    if confidence < 0.3:
+                        return None
 
     return {
         "surface_type": "sphere",
@@ -917,6 +943,81 @@ def _fit_cone(nodes_array, face_indices, face_normals):
     }
 
 
+def _fit_torus(nodes_array, face_indices, face_normals):
+    """Deterministic torus fit for a curved patch.
+
+    Strategy:
+      1. Torus centre: vertex mean (torus is point-symmetric about centre).
+      2. Axis: smallest-eigenvector of vertex covariance.  For a ring
+         torus (R > r), spread along axis = 2r while spread perpendicular
+         = 2(R+r), so the axis is unambiguously the least-spread dir.
+      3. For each vertex: rho = radial distance from axis, z = signed
+         height along axis from the equatorial plane.
+      4. Torus constraint: (rho-R)^2 + z^2 = r^2, linearised to
+         rho^2 + z^2 = 2R*rho + (r^2-R^2).  Least-squares gives R, r.
+      5. Confidence: inverse of the geometric residual coefficient of
+         variation.
+
+    Returns dict with surface_type, axis, centre_cm, major_radius_cm,
+    minor_radius_cm, confidence; or None if confidence < 0.3.
+    """
+    verts = np.asarray(nodes_array, dtype=np.float64)
+    if len(verts) < 16:
+        return None
+
+    center = verts.mean(axis=0)
+    centered = verts - center
+    cov = centered.T @ centered
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    axis = eigvecs[:, 0]
+    anorm = np.linalg.norm(axis)
+    if anorm < 1e-12:
+        return None
+    axis = axis / anorm
+
+    projections = centered @ axis
+    perp = centered - np.outer(projections, axis)
+    rho = np.linalg.norm(perp, axis=1)
+
+    if np.min(rho) < 1e-9:
+        return None
+
+    z = projections
+    x = rho
+    y = rho ** 2 + z ** 2
+    A = np.column_stack([x, np.ones_like(x)])
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    slope = float(coeffs[0])
+    intercept = float(coeffs[1])
+    R = slope / 2.0
+    r_sq = intercept + R * R
+    if R < 1e-9 or r_sq < 1e-12:
+        return None
+    r = math.sqrt(r_sq)
+    if r < 1e-9 or r >= R:
+        return None
+
+    tube_dist = np.sqrt((rho - R) ** 2 + z ** 2)
+    geom_err = np.abs(tube_dist - r)
+    std_err = float(np.std(geom_err))
+    cv = std_err / r
+    confidence = max(0.0, 1.0 - cv * 5.0)
+    if confidence < 0.3:
+        return None
+
+    return {
+        "surface_type": "torus",
+        "axis": [round(float(c), 6) for c in axis],
+        "center_cm": [round(float(c), 6) for c in center],
+        "major_radius_cm": round(R, 6),
+        "minor_radius_cm": round(r, 6),
+        "confidence": round(float(confidence), 4),
+    }
+
+
 def _estimate_freeform_curvature(mesh):
     """Rough mean-curvature proxy for a freeform patch.
 
@@ -939,26 +1040,601 @@ def _estimate_freeform_curvature(mesh):
         return 0.0
 
 
-def _classify_curved_patch(patch):
+def _cylinder_fit_residual(verts, faces, fit):
+    """Mean radial residual of a cylinder fit on (verts, faces).
+
+    For each face vertex: |distance_to_axis_line − radius|, averaged.
+    """
+    axis = np.array(fit["axis"], dtype=np.float64)
+    axis_point = np.array(fit["axis_point_cm"], dtype=np.float64)
+    radius = float(fit["radius_cm"])
+    face_verts = verts[faces]
+    rel = face_verts - axis_point
+    cross_dists = np.linalg.norm(np.cross(rel, axis), axis=2)
+    return float(np.mean(np.abs(cross_dists - radius)))
+
+
+def _sphere_fit_residual(verts, fit):
+    """Mean vertex distance residual of a sphere fit."""
+    center = np.array(fit["center_cm"], dtype=np.float64)
+    radius = float(fit["radius_cm"])
+    dists = np.linalg.norm(verts - center, axis=1)
+    return float(np.mean(np.abs(dists - radius)))
+
+
+def _cone_fit_residual(verts, faces, fit):
+    """Mean surface residual of a cone fit."""
+    apex = np.array(fit["apex_cm"], dtype=np.float64)
+    axis = np.array(fit["axis"], dtype=np.float64)
+    half_angle = math.radians(float(fit["half_angle_deg"]))
+    cos_a = math.cos(half_angle)
+    sin_a = math.sin(half_angle)
+    face_verts = verts[faces]
+    rel = face_verts - apex
+    h = rel @ axis
+    perp = rel - h[:, :, None] * axis
+    rho = np.linalg.norm(perp, axis=2)
+    surf_err = np.abs(rho * cos_a - np.abs(h) * sin_a)
+    return float(np.mean(surf_err))
+
+
+def _torus_fit_residual(verts, faces, fit):
+    """Mean tube-distance residual of a torus fit on (verts, faces)."""
+    center = np.array(fit["center_cm"], dtype=np.float64)
+    axis = np.array(fit["axis"], dtype=np.float64)
+    R = float(fit["major_radius_cm"])
+    r = float(fit["minor_radius_cm"])
+    face_verts = verts[faces]
+    rel = face_verts - center
+    proj = rel @ axis
+    perp = rel - proj[:, :, None] * axis
+    rho = np.linalg.norm(perp, axis=2)
+    tube_dist = np.sqrt((rho - R) ** 2 + proj ** 2)
+    return float(np.mean(np.abs(tube_dist - r)))
+
+
+def _classify_curved_patch(patch, epsilon=None):
     """Classify a single curved-patch trimesh and return the surface dict.
 
-    Tries cylinder → sphere → cone → freeform, in that order.
+    When *epsilon* is provided, runs the full 5-model competition
+    (cylinder, sphere, cone, torus): each model is fit independently,
+    candidates with mean geometric residual <= epsilon are collected,
+    and the winner is chosen by validated preference rules:
+
+      1. Cone preference (conf >= 0.5): a high-confidence cone fit is
+         structurally a cone — the median-angle gate ensures half-angle
+         >= 10 deg, which cylinders (half-angle 0) cannot produce.
+      2. Cylinder preference (conf >= 0.5): the normal-axis perpendicularity
+         structural test beats algebraic sphere overfitting on short
+         cylinders (h ~ 2r).
+      3. Lowest residual among remaining candidates.
+
+    Patches that win no model (all fits fail or exceed epsilon) remain
+    ``surface_type: freeform``.
+
+    When *epsilon* is None, the original sequential first-fit-wins logic
+    (cylinder -> sphere -> cone -> freeform) is preserved for backward
+    compatibility.
     """
     verts = np.asarray(patch.vertices, dtype=np.float64)
     faces = np.asarray(patch.faces, dtype=np.int64)
     normals = np.asarray(patch.face_normals, dtype=np.float64)
 
-    surface = _fit_cylinder(verts, faces, normals)
-    if surface is None:
+    if epsilon is None:
+        surface = _fit_cylinder(verts, faces, normals)
+        if surface is not None:
+            return surface
         surface = _fit_sphere(verts, faces, normals)
-    if surface is None:
+        if surface is not None:
+            return surface
         surface = _fit_cone(verts, faces, normals)
-    if surface is None:
-        surface = {
+        if surface is not None:
+            return surface
+        return {
             "surface_type": "freeform",
             "mean_curvature": _estimate_freeform_curvature(patch),
         }
-    return surface
+
+    candidates = []
+
+    cyl_fit = _fit_cylinder(verts, faces, normals)
+    if cyl_fit is not None:
+        cyl_res = _cylinder_fit_residual(verts, faces, cyl_fit)
+        if cyl_res <= epsilon:
+            candidates.append(("cylinder", cyl_fit, cyl_res))
+
+    sph_fit = _fit_sphere(verts, faces, normals)
+    if sph_fit is not None:
+        sph_res = _sphere_fit_residual(verts, sph_fit)
+        if sph_res <= epsilon:
+            candidates.append(("sphere", sph_fit, sph_res))
+
+    cone_fit = _fit_cone(verts, faces, normals)
+    if cone_fit is not None:
+        cone_res = _cone_fit_residual(verts, faces, cone_fit)
+        if cone_res <= epsilon:
+            candidates.append(("cone", cone_fit, cone_res))
+
+    tor_fit = _fit_torus(verts, faces, normals)
+    if tor_fit is not None:
+        tor_res = _torus_fit_residual(verts, faces, tor_fit)
+        if tor_res <= epsilon:
+            candidates.append(("torus", tor_fit, tor_res))
+
+    if not candidates:
+        return {
+            "surface_type": "freeform",
+            "mean_curvature": _estimate_freeform_curvature(patch),
+        }
+
+    cone_entry = next((c for c in candidates if c[0] == "cone"), None)
+    if cone_entry is not None and cone_entry[1].get("confidence", 0) >= 0.5:
+        result = dict(cone_entry[1])
+        result["residual_cm"] = round(cone_entry[2], 6)
+        return result
+
+    cyl_entry = next((c for c in candidates if c[0] == "cylinder"), None)
+    if cyl_entry is not None and cyl_entry[1].get("confidence", 0) >= 0.5:
+        result = dict(cyl_entry[1])
+        result["residual_cm"] = round(cyl_entry[2], 6)
+        return result
+
+    best = min(candidates, key=lambda c: c[2])
+    result = dict(best[1])
+    result["residual_cm"] = round(best[2], 6)
+    return result
+
+
+# --------------------------------------------------------------------------
+# universal delta estimator + cylinder recovery (fix-e, 2026-08-12)
+# --------------------------------------------------------------------------
+
+_SMALL_GROUP_MAX = 30   # planar groups with <= this many triangles are
+                        # candidates for cylinder-wall recovery
+
+
+def _otsu_threshold(log_values, n_bins=128):
+    """Otsu's method: threshold maximizing between-class variance.
+
+    Returns the bin-edge value that best separates the log10-residual
+    histogram into two classes (flat noise mode vs curved tessellation
+    mode).  Deterministic: pure numpy histogram + cumsum.
+    """
+    lo, hi = float(np.min(log_values)), float(np.max(log_values))
+    if hi - lo < 0.1:
+        return float(np.median(log_values))
+
+    hist, edges = np.histogram(log_values, bins=n_bins, range=(lo, hi))
+    total = len(log_values)
+    prob = hist / total
+    bin_centers = (edges[:-1] + edges[1:]) / 2
+
+    cumsum_w = np.cumsum(prob)
+    cumsum_m = np.cumsum(prob * bin_centers)
+    total_mean = cumsum_m[-1]
+
+    max_var = -1.0
+    best_t = 0
+    for t in range(1, n_bins):
+        w0 = cumsum_w[t - 1]
+        w1 = 1.0 - w0
+        if w0 < 1e-10 or w1 < 1e-10:
+            continue
+        m0 = cumsum_m[t - 1] / w0
+        m1 = (total_mean - cumsum_m[t - 1]) / w1
+        var_between = w0 * w1 * (m0 - m1) ** 2
+        if var_between > max_var:
+            max_var = var_between
+            best_t = t
+
+    return float(edges[best_t])
+
+
+def _estimate_delta(v_arr, f_arr, tri_normals, quant_step, extent,
+                    normal_filter_deg=45.0, max_tris=5000):
+    """Universal delta estimator: per-triangle 1-ring plane-fit residual +
+    Otsu gap detection on log10-histogram.
+
+    Estimates the mesh's own tessellation error (chordal deviation between
+    the tessellated surface and the underlying smooth surface) without
+    knowing the surface type.  Works by measuring how non-planar each
+    triangle's 1-ring neighborhood is: on a planar face the residual is
+    machine-zero, on a tessellated curved surface it is the sagitta
+    (chordal error) of the tessellation.
+
+    Algorithm:
+      1. For each sampled triangle, collect its edge-adjacent 1-ring.
+      2. Filter the ring by normal consistency (|dot| >= cos(45°)) to
+         exclude sharp dihedral edges (e.g. the seam between a cylinder
+         wall and its cap).
+      3. Fit a plane (PCA smallest eigenvector) to the filtered ring's
+         vertices; residual = mean abs vertex-to-plane distance.
+      4. Histogram on log10(residual).  Otsu threshold splits the flat-
+         noise mode from the curved-tessellation mode.
+      5. delta_est = median of residuals ABOVE the Otsu threshold (the
+         curved mode's center, not the split point).
+      6. eps = clamp(3*delta_est, floor, ceiling) where
+         floor = min(max(10*quant_step, 1e-6), 0.1*ceiling) and
+         ceiling = max(1e-3*extent, 4*delta_est).
+
+    On planar-only meshes all residuals are machine-zero → delta_est ≈ 0
+    → eps stays at floor → no false curved patches.
+
+    Returns dict with keys: delta_est, epsilon, floor, ceiling,
+    quant_step, extent, n_residuals, n_curved.
+    """
+    n_tris = len(f_arr)
+    if n_tris == 0:
+        return {"delta_est": 1e-15, "epsilon": max(1e-6, 10 * quant_step),
+                "floor": max(1e-6, 10 * quant_step),
+                "ceiling": max(1e-3 * extent, 4e-15),
+                "quant_step": quant_step, "extent": extent,
+                "n_residuals": 0, "n_curved": 0}
+
+    # --- edge-to-face adjacency ---
+    edge_faces: Dict[Tuple[int, int], set] = defaultdict(set)
+    for ti in range(n_tris):
+        a, b, c = int(f_arr[ti, 0]), int(f_arr[ti, 1]), int(f_arr[ti, 2])
+        for e in ((min(a, b), max(a, b)),
+                  (min(b, c), max(b, c)),
+                  (min(a, c), max(a, c))):
+            if e[0] != e[1]:
+                edge_faces[e].add(ti)
+
+    stride = max(1, n_tris // max_tris)
+    sample_indices = list(range(0, n_tris, stride))
+    cos_threshold = math.cos(math.radians(normal_filter_deg))
+
+    residuals: List[float] = []
+    for ti in sample_indices:
+        # 1-ring via shared edges
+        ring: set = set()
+        a, b, c = int(f_arr[ti, 0]), int(f_arr[ti, 1]), int(f_arr[ti, 2])
+        for e in ((min(a, b), max(a, b)),
+                  (min(b, c), max(b, c)),
+                  (min(a, c), max(a, c))):
+            ring.update(edge_faces.get(e, ()))
+
+        # Filter by normal consistency
+        cn = tri_normals[ti]
+        filtered = [tj for tj in ring
+                    if abs(float(np.dot(tri_normals[tj], cn))) >= cos_threshold]
+
+        if len(filtered) < 3:
+            continue
+
+        # Collect all vertices in the filtered ring
+        verts = v_arr[f_arr[filtered].ravel()]
+        if len(verts) < 4:
+            continue
+
+        # PCA plane fit (smallest eigenvector = normal)
+        center = verts.mean(axis=0)
+        centered = verts - center
+        cov = centered.T @ centered
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        normal = eigvecs[:, 0]
+
+        # Residual = mean abs distance to fitted plane
+        dists = np.abs((verts - center) @ normal)
+        res = float(np.mean(dists))
+        if res < 1e-15:
+            res = 1e-15
+        residuals.append(res)
+
+    if not residuals:
+        delta_est = 1e-15
+    else:
+        residuals_arr = np.array(residuals)
+        log_res = np.log10(residuals_arr)
+        threshold = _otsu_threshold(log_res)
+
+        curved_mask = log_res > threshold
+        n_curved = int(np.sum(curved_mask))
+        if n_curved >= max(3, len(residuals) * 0.02):
+            delta_est = float(np.median(residuals_arr[curved_mask]))
+        else:
+            delta_est = 10.0 ** threshold
+
+    # eps = clamp(3*delta_est, floor, ceiling)
+    ceiling = max(1e-3 * extent, 4.0 * delta_est)
+    raw_floor = max(10.0 * quant_step, 1e-6) if quant_step > 0 else 1e-6
+    floor = min(raw_floor, 0.1 * ceiling)
+    epsilon = max(floor, min(3.0 * delta_est, ceiling))
+
+    return {
+        "delta_est": delta_est,
+        "epsilon": epsilon,
+        "floor": floor,
+        "ceiling": ceiling,
+        "quant_step": quant_step,
+        "extent": extent,
+        "n_residuals": len(residuals),
+        "n_curved": int(np.sum(np.log10(np.array(residuals)) > threshold))
+                    if residuals else 0,
+    }
+
+
+def _cluster_tri_area(v_arr, f_arr, tri_indices):
+    """Total area of a set of triangles."""
+    total = 0.0
+    for ti in tri_indices:
+        a = v_arr[f_arr[ti, 0]]
+        b = v_arr[f_arr[ti, 1]]
+        c = v_arr[f_arr[ti, 2]]
+        total += 0.5 * float(np.linalg.norm(np.cross(b - a, c - a)))
+    return total
+
+
+def _cylinder_residual_on_tris(v_arr, f_arr, tri_normals, tri_indices):
+    """Cylinder fit + mean radial residual for a set of triangle indices.
+
+    Remaps to local vertex indices, calls ``_fit_cylinder``, then computes
+    the mean absolute radial error of all face vertices.
+
+    Returns ``(fit_dict, residual)`` or ``(None, inf)`` on failure.
+    """
+    ti_arr = np.asarray(tri_indices, dtype=np.int64)
+    if len(ti_arr) < 6:
+        return None, float("inf")
+    faces_sub = f_arr[ti_arr]
+    normals_sub = tri_normals[ti_arr]
+    unique_idx, inverse = np.unique(faces_sub.ravel(), return_inverse=True)
+    local_verts = v_arr[unique_idx]
+    local_faces = inverse.reshape(-1, 3)
+    fit = _fit_cylinder(local_verts, local_faces, normals_sub)
+    if fit is None:
+        return None, float("inf")
+    axis = np.array(fit["axis"], dtype=np.float64)
+    axis_point = np.array(fit["axis_point_cm"], dtype=np.float64)
+    radius = float(fit["radius_cm"])
+    face_verts = local_verts[local_faces]
+    rel = face_verts - axis_point
+    cross_dists = np.linalg.norm(np.cross(rel, axis), axis=2)
+    radial_err = np.abs(cross_dists - radius)
+    return fit, float(np.mean(radial_err))
+
+
+def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
+                                      planar_groups, epsilon, comp_ids):
+    """Recover curved patches from small planar groups (fix-e + competition).
+
+    After planar grouping, small groups (<= ``_SMALL_GROUP_MAX`` tris)
+    that are actually tessellated curved surfaces get absorbed as planar
+    fragments.  This function:
+
+      1. Builds group adjacency over shared edges.
+      2. Union-finds connected components of small groups into clusters.
+      3. For each cluster: runs the FULL model competition (cylinder /
+         sphere / cone / torus) via ``_classify_curved_patch`` on a
+         compact trimesh built from the cluster's triangles.  If a
+         non-freeform surface wins, emits it as a recovered curved patch.
+      4. Cap-contamination retry: when the competition returns freeform,
+         falls back to a cylinder-only fit.  If the fit fails but
+         produced a valid axis, splits the cluster by
+         |dot(tri_normal, axis)| < 0.15 (side=wall vs non-side=cap).
+         If both exist and the side-only fit passes, emits side tris as
+         one cylinder patch and leaves non-side groups as planar.
+
+    The retry only fires when the competition AND the direct cylinder fit
+    both fail — clusters that pass on the first attempt (fine-tessellation
+    cylinders, meshb2 hole walls, spheres, tori, cones) are recovered
+    immediately and the retry is never reached.
+
+    Args:
+        v_arr, f_arr, tri_normals: welded mesh arrays + per-tri normals.
+        planar_groups: output of ``_group_planar_triangles``.
+        epsilon: derived acceptance tolerance from ``_estimate_delta``.
+        comp_ids: per-triangle component IDs.
+
+    Returns:
+        ``(recovered_patches, recovered_tri_indices, remaining_groups)``
+        where recovered_patches is a list of curved-patch dicts matching
+        the existing curved-patch schema, recovered_tri_indices is the set
+        of triangle indices now assigned to curved patches, and
+        remaining_groups is the planar_groups list with fully-recovered
+        groups removed.
+    """
+    n_faces = len(f_arr)
+
+    # --- edge-to-face adjacency ---
+    edge_faces: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for ti in range(n_faces):
+        a, b, c = int(f_arr[ti, 0]), int(f_arr[ti, 1]), int(f_arr[ti, 2])
+        for e in ((min(a, b), max(a, b)),
+                  (min(b, c), max(b, c)),
+                  (min(a, c), max(a, c))):
+            if e[0] != e[1]:
+                edge_faces[e].append(ti)
+
+    # --- group adjacency via shared edges ---
+    tri_to_group: Dict[int, int] = {}
+    for gi, g in enumerate(planar_groups):
+        for ti in g["tri_indices"]:
+            tri_to_group[ti] = gi
+
+    group_adj: Dict[int, set] = defaultdict(set)
+    for tris in edge_faces.values():
+        tl = list(tris)
+        for i in range(len(tl)):
+            for j in range(i + 1, len(tl)):
+                ga = tri_to_group.get(tl[i])
+                gb = tri_to_group.get(tl[j])
+                if ga is not None and gb is not None and ga != gb:
+                    group_adj[ga].add(gb)
+                    group_adj[gb].add(ga)
+
+    # --- identify small groups ---
+    is_small = [len(g["tri_indices"]) <= _SMALL_GROUP_MAX
+                for g in planar_groups]
+
+    # --- union-find on adjacent small groups ---
+    n_groups = len(planar_groups)
+    parent = list(range(n_groups))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for gi in range(n_groups):
+        if not is_small[gi]:
+            continue
+        for nbr in group_adj.get(gi, ()):
+            if nbr < n_groups and is_small[nbr]:
+                _union(gi, nbr)
+
+    clusters: Dict[int, List[int]] = defaultdict(list)
+    for gi in range(n_groups):
+        if is_small[gi]:
+            clusters[_find(gi)].append(gi)
+
+    recovered_patches: List[Dict] = []
+    recovered_tri_indices: set = set()
+    recovered_groups: set = set()
+    patch_idx = 0
+
+    for root, group_list in clusters.items():
+        cluster_tris = sorted(set(
+            ti for gi in group_list
+            for ti in planar_groups[gi]["tri_indices"]))
+
+        if len(cluster_tris) < 6:
+            continue
+
+        # --- (0) Sharp-edge gate ---
+        # Clusters with sharp dihedral edges (boxes, capped cylinders) are
+        # not smooth curved surfaces.  On such clusters the sphere fit can
+        # produce a false positive (box vertices are cospherical → residual
+        # 0).  Gate the competition on mean |dot(adjacent normals)| >= 0.707
+        # (≈ average dihedral <= 45°) so only smooth clusters enter it.
+        tri_set_c = frozenset(cluster_tris)
+        dot_sum = 0.0
+        dot_n = 0
+        for ti in cluster_tris:
+            a, b, c = (int(f_arr[ti, 0]),
+                       int(f_arr[ti, 1]),
+                       int(f_arr[ti, 2]))
+            for e in ((min(a, b), max(a, b)),
+                      (min(b, c), max(b, c)),
+                      (min(a, c), max(a, c))):
+                if e[0] == e[1]:
+                    continue
+                for nbr in edge_faces.get(e, ()):
+                    if nbr != ti and nbr in tri_set_c:
+                        dot_sum += abs(
+                            float(tri_normals[ti] @ tri_normals[nbr]))
+                        dot_n += 1
+        mean_normal_dot = dot_sum / dot_n if dot_n > 0 else 1.0
+
+        # --- (1) Full model competition (cylinder / sphere / cone / torus) ---
+        if mean_normal_dot >= 0.707:
+            f_sub = f_arr[np.array(cluster_tris, dtype=np.int64)]
+            unique_idx, inverse = np.unique(
+                f_sub.ravel(), return_inverse=True)
+            local_verts = v_arr[unique_idx]
+            local_faces = inverse.reshape(-1, 3)
+            try:
+                part = trimesh.Trimesh(
+                    vertices=local_verts, faces=local_faces,
+                    process=False)
+                surface = _classify_curved_patch(part, epsilon=epsilon)
+            except Exception:
+                surface = None
+
+            if surface is not None and \
+                    surface.get("surface_type") != "freeform":
+                comp = comp_ids[cluster_tris[0]] if cluster_tris else 0
+                entry = {
+                    "component": comp,
+                    "patch_index": patch_idx,
+                    "triangle_count": len(cluster_tris),
+                    "area": round(_cluster_tri_area(
+                        v_arr, f_arr, cluster_tris), 6),
+                }
+                entry.update(surface)
+                recovered_patches.append(entry)
+                patch_idx += 1
+                recovered_tri_indices.update(cluster_tris)
+                for gi in group_list:
+                    recovered_groups.add(gi)
+                continue
+
+        # --- (2) Cylinder-only fit (fallback + cap-retry trigger) ---
+        fit, res = _cylinder_residual_on_tris(
+            v_arr, f_arr, tri_normals, cluster_tris)
+
+        if fit is not None and res <= epsilon:
+            comp = comp_ids[cluster_tris[0]] if cluster_tris else 0
+            entry = {
+                "component": comp,
+                "patch_index": patch_idx,
+                "triangle_count": len(cluster_tris),
+                "area": round(_cluster_tri_area(
+                    v_arr, f_arr, cluster_tris), 6),
+            }
+            entry.update(fit)
+            entry["residual"] = round(res, 6)
+            recovered_patches.append(entry)
+            patch_idx += 1
+            recovered_tri_indices.update(cluster_tris)
+            for gi in group_list:
+                recovered_groups.add(gi)
+            continue
+
+        # --- (3) Cap-contamination retry ---
+        # Fires ONLY on full-fit failure.  Split by normal-vs-axis
+        # direction: side groups (normals ⊥ axis) are wall candidates,
+        # non-side groups (normals ∥ axis) are cap candidates.
+        if fit is not None:
+            axis = np.array(fit["axis"], dtype=np.float64)
+            side_groups = []
+            non_side_groups = []
+            for gi in group_list:
+                g_tris = planar_groups[gi]["tri_indices"]
+                normals_g = tri_normals[np.asarray(g_tris)]
+                dots = np.abs(normals_g @ axis)
+                if float(np.mean(dots < 0.15)) > 0.5:
+                    side_groups.append(gi)
+                else:
+                    non_side_groups.append(gi)
+
+            if non_side_groups and side_groups:
+                side_tris = sorted(set(
+                    ti for gi in side_groups
+                    for ti in planar_groups[gi]["tri_indices"]))
+                if len(side_tris) >= 6:
+                    side_fit, side_res = _cylinder_residual_on_tris(
+                        v_arr, f_arr, tri_normals, side_tris)
+                    if side_fit is not None and side_res <= epsilon:
+                        comp = comp_ids[side_tris[0]] if side_tris else 0
+                        entry = {
+                            "component": comp,
+                            "patch_index": patch_idx,
+                            "triangle_count": len(side_tris),
+                            "area": round(_cluster_tri_area(
+                                v_arr, f_arr, side_tris), 6),
+                        }
+                        entry.update(side_fit)
+                        entry["residual"] = round(side_res, 6)
+                        recovered_patches.append(entry)
+                        patch_idx += 1
+                        recovered_tri_indices.update(side_tris)
+                        for gi in side_groups:
+                            recovered_groups.add(gi)
+                        # non-side groups stay as planar
+                        continue
+
+    remaining_groups = [g for gi, g in enumerate(planar_groups)
+                        if gi not in recovered_groups]
+
+    return recovered_patches, recovered_tri_indices, remaining_groups
 
 
 # --------------------------------------------------------------------------
@@ -2005,12 +2681,17 @@ def _point_in_polygon_2d(px, py, poly):
 
 
 def _extract_curved_patches(welded_verts, welded_tris, planar_tri_set,
-                            comp_ids, v_arr, f_arr):
+                            comp_ids, v_arr, f_arr, epsilon=None):
     """Classify non-planar triangles into curved surface patches.
 
     Groups curved triangles by component, builds a trimesh per group, splits
     into connected patches, and classifies each (cylinder / sphere / cone /
     freeform).
+
+    When *epsilon* is provided (fix-e), each patch classification is gated
+    by the derived tessellation-error tolerance: a fit whose mean geometric
+    residual exceeds epsilon falls through to freeform, preventing false
+    curved patches on planar-only meshes.
     """
     curved_by_comp: Dict[int, List[int]] = defaultdict(list)
     for i in range(len(welded_tris)):
@@ -2033,7 +2714,7 @@ def _extract_curved_patches(welded_verts, welded_tris, planar_tri_set,
         for part in parts:
             if len(part.faces) == 0:
                 continue
-            surface = _classify_curved_patch(part)
+            surface = _classify_curved_patch(part, epsilon=epsilon)
             entry = {"component": comp, "patch_index": patch_idx,
                      "triangle_count": len(part.faces),
                      "area": round(float(part.area), 6)}
@@ -2176,7 +2857,17 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=None,
         planar_groups = _group_planar_triangles(
             v_arr, f_arr, tri_normals, effective_angle, extent, tol=tol)
 
-        planar_tri_set: set = set()
+        # --- Delta estimation + cylinder recovery (fix-e) ---
+        delta_info = _estimate_delta(
+            v_arr, f_arr, tri_normals, quant_step, extent)
+        derived_eps = delta_info["epsilon"]
+
+        recovered_patches, recovered_tris, planar_groups = (
+            _recover_curved_from_small_groups(
+                v_arr, f_arr, tri_normals, planar_groups,
+                derived_eps, comp_ids))
+
+        planar_tri_set: set = set(recovered_tris)
         planar_faces: List[Dict] = []
         face_idx = 0
         has_warnings = False
@@ -2375,7 +3066,15 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=None,
 
         # Curved patches: triangles not in any planar group
         curved_patches = _extract_curved_patches(
-            welded_verts, welded_tris, planar_tri_set, comp_ids, v_arr, f_arr)
+            welded_verts, welded_tris, planar_tri_set, comp_ids, v_arr, f_arr,
+            epsilon=derived_eps)
+
+        # Append recovered cylinder patches (fix-e)
+        if recovered_patches:
+            patch_offset = len(curved_patches)
+            for i, rp in enumerate(recovered_patches):
+                rp["patch_index"] = patch_offset + i
+            curved_patches.extend(recovered_patches)
 
         result = {
             "components_detected": n_components,
