@@ -108,12 +108,14 @@ class _FakeCall:
 
 
 def _run(fs, mesh="0", units="cm", payload=None, fake=None):
-    """Run structure_graph with a mocked _call; returns (summary_dict, fake)."""
+    """Run structure_graph synchronously with a mocked _call; returns
+    (summary_dict, fake). ``job_id="sync"`` runs the tool in the foreground so
+    the result is the summary (the no-arg default now launches a job)."""
     fake = fake or _FakeCall(payload)
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(fs, "_call", fake)
     try:
-        raw = fs.structure_graph(mesh=mesh, units=units)
+        raw = fs.structure_graph(mesh=mesh, units=units, job_id="sync")
     finally:
         monkeypatch.undo()
     return json.loads(raw), fake
@@ -188,7 +190,8 @@ def test_analyze_mesh_invalid_preset_error_envelope(fs):
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(fs, "_call", fake)
     try:
-        raw = fs.analyze_mesh(mesh="0", units="cm", preset="ultra")
+        raw = fs.analyze_mesh(mesh="0", units="cm", preset="ultra",
+                              job_id="sync")
     finally:
         monkeypatch.undo()
     result = json.loads(raw)
@@ -206,7 +209,8 @@ def test_structure_graph_invalid_preset_error_envelope(fs):
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(fs, "_call", fake)
     try:
-        raw = fs.structure_graph(mesh="0", units="cm", preset="ultra")
+        raw = fs.structure_graph(mesh="0", units="cm", preset="ultra",
+                                 job_id="sync")
     finally:
         monkeypatch.undo()
     result = json.loads(raw)
@@ -352,7 +356,10 @@ def test_query_structure_graph_no_graph(fs):
     # do NOT build first: _GRAPH_DBS starts empty (autouse fixture)
     result = json.loads(fs.query_structure_graph(mesh="0", sql="SELECT 1"))
     assert result == {"error": "no graph built for mesh '0'. "
-                               "Call structure_graph first."}
+                               "structure_graph is asynchronous: launch "
+                               "structure_graph(mesh='0') (no job_id), "
+                               "then poll its job_id until status 'complete' "
+                               "before querying."}
 
 
 def test_query_structure_graph_syntax_error(fs):

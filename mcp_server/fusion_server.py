@@ -316,20 +316,25 @@ def _job_status(job_id: str) -> dict:
     record = get_job(job_id)
     if record is None:
         return {"job_id": job_id, "status": "not_found"}
+    if record["status"] == "queued":
+        return {"job_id": job_id, "status": "queued",
+                "position": record.get("position")}
     if record["status"] == "running":
         return {"job_id": job_id, "status": "running"}
-    if record["status"] == "completed":
-        return {"job_id": job_id, "status": "completed",
+    if record["status"] == "complete":
+        return {"job_id": job_id, "status": "complete",
                 "result": record["result"]}
-    return {"job_id": job_id, "status": "error", "error": record["error"]}
+    return {"job_id": job_id, "status": "failed", "error": record["error"]}
 
 
 def _launch_job(fn, *args, **kwargs) -> str:
     """Launch ``fn(*args, **kwargs)`` on a background thread and return the
     launch envelope (lazy sibling import like bundle)."""
-    from jobs import launch_job  # lazy: script-dir import in prod, sys.path in tests
-    return json.dumps({"job_id": launch_job(fn, *args, **kwargs),
-                       "status": "running"}, indent=2)
+    from jobs import launch_job, get_job  # lazy: script-dir import in prod, sys.path in tests
+    job_id = launch_job(fn, *args, **kwargs)
+    record = get_job(job_id)
+    status = record["status"] if record is not None else "running"
+    return json.dumps({"job_id": job_id, "status": status}, indent=2)
 
 
 # ---- Status & Info ----
@@ -1313,25 +1318,84 @@ def set_body_color(body: str = "0", r: int = 100, g: int = 149,
 
 # ---- Export & Capture ----
 
-@mcp.tool()
-def export_as_stl(path: str = "") -> str:
+def _export_as_stl_sync(path: str = "") -> str:
     """Export as STL for 3D printing. Blank path = ~/Desktop/fusion_export.stl"""
-    return _call("export_stl", {"path": path} if path else {})
+    return _call("export_stl", {"path": path} if path else {}, timeout=330)
+
 
 @mcp.tool()
-def export_as_step(path: str = "") -> str:
+def export_as_stl(path: str = "", job_id: str = "") -> str:
+    """
+    Export as STL for 3D printing. Blank path = ~/Desktop/fusion_export.stl
+
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _export_as_stl_sync(path)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_export_as_stl_sync, path)
+
+
+def _export_as_step_sync(path: str = "") -> str:
     """Export as STEP (universal CAD format). Blank path = ~/Desktop/fusion_export.step"""
-    return _call("export_step", {"path": path} if path else {})
+    return _call("export_step", {"path": path} if path else {}, timeout=330)
+
 
 @mcp.tool()
-def export_as_3mf(path: str = "") -> str:
+def export_as_step(path: str = "", job_id: str = "") -> str:
+    """
+    Export as STEP (universal CAD format). Blank path = ~/Desktop/fusion_export.step
+
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _export_as_step_sync(path)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_export_as_step_sync, path)
+
+
+def _export_as_3mf_sync(path: str = "") -> str:
     """Export as 3MF for modern 3D printing. Blank path = ~/Desktop/fusion_export.3mf"""
-    return _call("export_3mf", {"path": path} if path else {})
+    return _call("export_3mf", {"path": path} if path else {}, timeout=330)
+
 
 @mcp.tool()
-def export_as_f3d(path: str = "") -> str:
+def export_as_3mf(path: str = "", job_id: str = "") -> str:
+    """
+    Export as 3MF for modern 3D printing. Blank path = ~/Desktop/fusion_export.3mf
+
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _export_as_3mf_sync(path)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_export_as_3mf_sync, path)
+
+
+def _export_as_f3d_sync(path: str = "") -> str:
     """Export as Fusion archive (.f3d) for backup/sharing. Blank path = ~/Desktop/fusion_export.f3d"""
-    return _call("export_f3d", {"path": path} if path else {})
+    return _call("export_f3d", {"path": path} if path else {}, timeout=330)
+
+
+@mcp.tool()
+def export_as_f3d(path: str = "", job_id: str = "") -> str:
+    """
+    Export as Fusion archive (.f3d) for backup/sharing. Blank path = ~/Desktop/fusion_export.f3d
+
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _export_as_f3d_sync(path)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_export_as_f3d_sync, path)
 
 @mcp.tool()
 def capture_screenshot(path: str = "", width: int = 1920, height: int = 1080) -> list:
@@ -1366,8 +1430,7 @@ def capture_screenshot(path: str = "", width: int = 1920, height: int = 1080) ->
 
 # ---- Import Tools ----
 
-@mcp.tool()
-def import_cad_file(path: str, format: str = "", as_component: bool = False) -> str:
+def _import_cad_file_sync(path: str, format: str = "", as_component: bool = False) -> str:
     """
     Import a CAD file (STEP/SAT/SMT/IGES/F3D) into the current design.
 
@@ -1378,11 +1441,32 @@ def import_cad_file(path: str, format: str = "", as_component: bool = False) -> 
         format:       Optional format override: step, sat, smt, iges, f3d. Empty = auto-detect.
         as_component: If True, import into a new component instead of the root component.
     """
-    return _call("import_cad_file", {"path": path, "format": format, "as_component": as_component})
+    return _call("import_cad_file", {"path": path, "format": format, "as_component": as_component}, timeout=330)
 
 
 @mcp.tool()
-def import_mesh_file(path: str, units: str = "mm", as_component: bool = False) -> str:
+def import_cad_file(path: str, format: str = "", as_component: bool = False,
+                    job_id: str = "") -> str:
+    """
+    Import a CAD file (STEP/SAT/SMT/IGES/F3D) into the current design.
+
+    Auto-detects the format from the file extension when `format` is empty.
+
+    Args:
+        path:         Absolute path to the CAD file (.step/.stp, .sat, .smt, .igs/.iges, .f3d).
+        format:       Optional format override: step, sat, smt, iges, f3d. Empty = auto-detect.
+        as_component: If True, import into a new component instead of the root component.
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _import_cad_file_sync(path, format, as_component)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_import_cad_file_sync, path, format, as_component)
+
+
+def _import_mesh_file_sync(path: str, units: str = "mm", as_component: bool = False) -> str:
     """
     Import a mesh file (STL or 3MF) as a mesh body.
 
@@ -1391,7 +1475,27 @@ def import_mesh_file(path: str, units: str = "mm", as_component: bool = False) -
         units:        Units of the mesh file: mm, cm, or in.
         as_component: If True, import into a new component instead of the root component.
     """
-    return _call("import_mesh_file", {"path": path, "units": units, "as_component": as_component})
+    return _call("import_mesh_file", {"path": path, "units": units, "as_component": as_component}, timeout=330)
+
+
+@mcp.tool()
+def import_mesh_file(path: str, units: str = "mm", as_component: bool = False,
+                     job_id: str = "") -> str:
+    """
+    Import a mesh file (STL or 3MF) as a mesh body.
+
+    Args:
+        path:         Absolute path to the mesh file (.stl or .3mf).
+        units:        Units of the mesh file: mm, cm, or in.
+        as_component: If True, import into a new component instead of the root component.
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _import_mesh_file_sync(path, units, as_component)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_import_mesh_file_sync, path, units, as_component)
 
 
 @mcp.tool()
@@ -1528,8 +1632,7 @@ def _cm_to_unit_factor(units: str) -> float:
     raise ValueError(f"Unsupported units '{units}'. Use 'mm', 'cm', or 'in'.")
 
 
-@mcp.tool()
-def analyze_mesh(mesh: str = "0", units: str = "cm",
+def _analyze_mesh_sync(mesh: str = "0", units: str = "cm",
                   angle_tolerance_deg: Optional[float] = None,
                   offset_tol: Optional[float] = None,
                   snap_tol: Optional[float] = None,
@@ -1604,6 +1707,59 @@ def analyze_mesh(mesh: str = "0", units: str = "cm",
     return json.dumps(report, indent=2)
 
 
+@mcp.tool()
+def analyze_mesh(mesh: str = "0", units: str = "cm",
+                 angle_tolerance_deg: Optional[float] = None,
+                 offset_tol: Optional[float] = None,
+                 snap_tol: Optional[float] = None,
+                 simplify_vertices: bool = True,
+                 preset: Optional[str] = None,
+                 job_id: str = "") -> str:
+    """
+    Analyze a mesh body and report measured facts + a recommended strategy.
+
+    Fetches the mesh triangle data (nodes/indices/normals) from Fusion, then
+    runs pure-Python analysis: watertightness, manifoldness, vertex/triangle
+    counts, enclosed volume (divergence theorem), bounding box, mirror
+    symmetry, primitive hints (plane regions / box / cylinder), and a
+    recommended reconstruction strategy (prismatic | revolved |
+    csg_decompose | organic).
+
+    Stage 2 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:  Body name or index of a mesh body.
+        units: Units for the report: mm, cm, or in (default cm).
+        angle_tolerance_deg:
+            Dihedral angle threshold for planar face grouping in degrees
+            (default ``None`` → resolves to ``0.5`` or the preset's angle).
+            An explicit value overrides the preset.
+        offset_tol:
+            Per-plane offset tolerance for coplanarity grouping (cm).
+            Overrides both defaults and preset when provided.
+        snap_tol:
+            Vertex-snap tolerance for seam closure (cm).
+            Overrides both defaults and preset when provided.
+        simplify_vertices:
+            If True (default), collapse nearly-collinear polygon vertices
+            in planar face outlines.
+        preset:
+            Tolerance preset — ``"accurate"``, ``"balanced"``, or
+            ``"coarse"``.  ``"accurate"`` is stricter (more faces);
+            ``"coarse"`` is looser (fewer faces).  Invalid names raise
+            an error.
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _analyze_mesh_sync(mesh, units, angle_tolerance_deg, offset_tol,
+                                  snap_tol, simplify_vertices, preset)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_analyze_mesh_sync, mesh, units, angle_tolerance_deg,
+                       offset_tol, snap_tol, simplify_vertices, preset)
+
+
 _GRAPH_EDGE_RELATIONS = (
     "COMPONENT_OF", "CONTAINS", "COPLANAR", "EDGE_ADJACENT",
     "EXTRUSION_ALIGNED", "HAS_BASE", "PARALLEL", "PERPENDICULAR",
@@ -1630,8 +1786,7 @@ def _base_face_candidates(graph):
             for comp, (fid, area) in sorted(best.items())]
 
 
-@mcp.tool()
-def structure_graph(mesh: str = "0", units: str = "cm",
+def _structure_graph_sync(mesh: str = "0", units: str = "cm",
                      angle_tolerance_deg: Optional[float] = None,
                      offset_tol: Optional[float] = None,
                      snap_tol: Optional[float] = None,
@@ -1782,6 +1937,71 @@ def structure_graph(mesh: str = "0", units: str = "cm",
     return json.dumps(summary, indent=2)
 
 
+@mcp.tool()
+def structure_graph(mesh: str = "0", units: str = "cm",
+                    angle_tolerance_deg: Optional[float] = None,
+                    offset_tol: Optional[float] = None,
+                    snap_tol: Optional[float] = None,
+                    simplify_vertices: bool = True,
+                    preset: Optional[str] = None,
+                    job_id: str = "") -> str:
+    """
+    Build the structure graph of a mesh body and persist it to DuckDB.
+
+    Fetches the mesh triangle data (nodes/indices) from Fusion, decomposes it
+    into planar faces / curved patches (mesh_analysis), builds the NetworkX
+    property graph (face/hole/curved/component nodes; 10 edge relation types)
+    via mesh_graph.build_structure_graph, runs graph algorithms (articulation
+    points, connected components), and persists the FULL graph into an
+    in-memory DuckDB database (nodes/edges tables) so later queries can run
+    SQL against it (mesh_graph._get_graph_db).
+
+    Returns a JSON summary -- NOT the full graph.  The full graph stays
+    server-side in DuckDB; the summary (counts, edge-type histogram,
+    PRELIMINARY base-face candidates, the persisted table schema, and a
+    ready-to-run query example) helps the agent decide the first query.
+
+    NOTE: ``base_face_candidates`` is retained as a legacy preliminary key
+    (largest-area face per component).  The real scored analysis (composite
+    base-face scoring and cycle detection) is in the ``workstream`` section
+    of the summary — see that for
+    ``base_face_per_component`` / ``dag_has_cycles``.
+
+    Args:
+        mesh:  Body name or index of a mesh body.
+        units: Units for the report: mm, cm, or in (default cm).
+        angle_tolerance_deg:
+            Dihedral angle threshold for planar face grouping in degrees
+            (default ``None`` → resolves to ``0.5`` or the preset's angle).
+            An explicit value overrides the preset.
+        offset_tol:
+            Per-plane offset tolerance for coplanarity grouping (cm).
+            Overrides both defaults and preset when provided.
+        snap_tol:
+            Vertex-snap tolerance for seam closure (cm).
+            Overrides both defaults and preset when provided.
+        simplify_vertices:
+            If True (default), collapse nearly-collinear polygon vertices
+            in planar face outlines.
+        preset:
+            Tolerance preset — ``"accurate"``, ``"balanced"``, or
+            ``"coarse"``.  ``"accurate"`` is stricter (more faces);
+            ``"coarse"`` is looser (fewer faces).  Invalid names raise
+            an error.
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _structure_graph_sync(mesh, units, angle_tolerance_deg,
+                                     offset_tol, snap_tol, simplify_vertices,
+                                     preset)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_structure_graph_sync, mesh, units,
+                       angle_tolerance_deg, offset_tol, snap_tol,
+                       simplify_vertices, preset)
+
+
 def _assert_read_only_sql(sql):
     """Reject any SQL that is not a single read-only SELECT/WITH statement.
 
@@ -1923,7 +2143,10 @@ def query_structure_graph(mesh: str = "0", sql: str = "") -> str:
         conn = mesh_graph._get_graph_db(mesh)
     except KeyError:
         return json.dumps({"error": f"no graph built for mesh '{mesh}'. "
-                                    "Call structure_graph first."}, indent=2)
+                                    "structure_graph is asynchronous: launch "
+                                    f"structure_graph(mesh='{mesh}') (no job_id), "
+                                    "then poll its job_id until status 'complete' "
+                                    "before querying."}, indent=2)
     try:
         cleaned = _assert_read_only_sql(sql)
     except ValueError as e:
@@ -1941,8 +2164,7 @@ def query_structure_graph(mesh: str = "0", sql: str = "") -> str:
                        "row_count": len(rows)}, indent=2)
 
 
-@mcp.tool()
-def slice_mesh(mesh: str = "0", axis: str = "Z", height_cm: float = 0.0,
+def _slice_mesh_sync(mesh: str = "0", axis: str = "Z", height_cm: float = 0.0,
                units: str = "cm") -> str:
     """
     Slice a mesh body with a plane and return the 2D cross-section loops.
@@ -1996,7 +2218,38 @@ def slice_mesh(mesh: str = "0", axis: str = "Z", height_cm: float = 0.0,
 
 
 @mcp.tool()
-def compare_mesh_to_brep(mesh: str = "0", body: str = "0") -> str:
+def slice_mesh(mesh: str = "0", axis: str = "Z", height_cm: float = 0.0,
+               units: str = "cm", job_id: str = "") -> str:
+    """
+    Slice a mesh body with a plane and return the 2D cross-section loops.
+
+    Fetches the mesh triangle data from Fusion, then runs pure-Python
+    triangle-plane intersection: for each triangle the plane-vs-triangle
+    intersection segment is computed, the segments are chained into ordered
+    closed 2D loops, and each loop is classified as an outer contour (CCW,
+    positive shoelace area) or a hole (CW, negative) by containment.
+
+    The plane is axis-aligned: one of X/Y/Z plus a signed height (cm) along
+    that axis.  Loop points are in the requested units.
+
+    Stage 3 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Args:
+        mesh:      Body name or index of a mesh body.
+        axis:      Plane normal axis: X, Y, or Z (default Z).
+        height_cm: Signed plane height along the axis, in cm (default 0).
+        units:     Units for the loop points: mm, cm, or in (default cm).
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _slice_mesh_sync(mesh, axis, height_cm, units)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_slice_mesh_sync, mesh, axis, height_cm, units)
+
+
+def _compare_mesh_to_brep_sync(mesh: str = "0", body: str = "0") -> str:
     """
     Compare a mesh body against a BRep body (vision-free fidelity QA).
 
@@ -2034,6 +2287,43 @@ def compare_mesh_to_brep(mesh: str = "0", body: str = "0") -> str:
     if "error" in data:
         return json.dumps({"error": data["error"]}, indent=2)
     return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+def compare_mesh_to_brep(mesh: str = "0", body: str = "0",
+                         job_id: str = "") -> str:
+    """
+    Compare a mesh body against a BRep body (vision-free fidelity QA).
+
+    Fetches both bodies' enclosed volume (cm^3) and bounding-box spans (cm)
+    from Fusion and reports the volume ratio mesh/BRep, the max per-axis
+    bounding-box span deviation, and a sampled surface deviation: ~200 mesh
+    vertices measured to the nearest point on the BRep surface
+    (mean/max/samples).  The method used for the sampled deviation is
+    reported in the response: "surface_evaluator" when the closest-point API
+    is available on the build, "vertex_fallback" otherwise.
+
+    Stage 7 of the mesh-to-parametric workflow (see get_workflow_guide).
+
+    Note: compare_mesh_to_brep reads the BRep body's CURRENT state. If called
+    in parallel with a cut/extrude operation on the same body, it may return
+    metrics for the PRE-cut geometry. Always call this tool AFTER the preceding
+    feature has completed, not in the same parallel batch.
+
+    Note: this tool is vision-free and works for any model. For visual QA,
+    see `review_reconstruction`.
+
+    Args:
+        mesh: Body name or index of a mesh body.
+        body: Body name or index of a BRep body.
+    `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+    synchronously and returns the full result; a job id polls status/result.
+    """
+    if job_id == "sync":
+        return _compare_mesh_to_brep_sync(mesh, body)
+    if job_id:
+        return json.dumps(_job_status(job_id), indent=2)
+    return _launch_job(_compare_mesh_to_brep_sync, mesh, body)
 
 
 @mcp.tool()
@@ -2258,11 +2548,13 @@ def _review_reconstruction_sync(mesh: str = "0", body: str = "0",
         return f"Unexpected error: {e}"
     if "error" in brep_cap:
         return json.dumps({"error": brep_cap["error"]}, indent=2)
-    # Geometry summary from the LOCAL compare_mesh_to_brep (plain call, same
-    # module). On error the images remain the primary payload -- "geometry"
-    # carries {"error": ...} instead of failing the whole tool.
+    # Geometry summary from the LOCAL _compare_mesh_to_brep_sync helper (the
+    # compare_mesh_to_brep tool itself is job-centric and would launch a
+    # background job; the sync helper runs the comparison inline). On error
+    # the images remain the primary payload -- "geometry" carries
+    # {"error": ...} instead of failing the whole tool.
     try:
-        geometry = json.loads(compare_mesh_to_brep(mesh=mesh, body=body))
+        geometry = json.loads(_compare_mesh_to_brep_sync(mesh=mesh, body=body))
     except Exception as e:
         geometry = {"error": f"geometry comparison failed: {e}"}
     mesh_views = {v.get("view"): v.get("image_base64", "")

@@ -12,20 +12,26 @@ directory is placed on ``sys.path`` so the lazy sibling imports
 where the script directory is on ``sys.path``.
 
 Coverage:
-  * run_scad: launch -> poll -> completed (result equals the canned sync
+  * run_scad: launch -> poll -> complete (result equals the canned sync
     output string); ``job_id="sync"`` equals exactly what the mocked ``_call``
     would return; an unknown uuid polls ``not_found``; a mocked ``_call``
-    raising ``requests.exceptions.ReadTimeout`` records a job ``error``.
+    raising ``requests.exceptions.ReadTimeout`` records a job ``failed``.
   * review_reconstruction: the async job result is JSON-safe
     (``json.loads(json.dumps(result))`` round-trips; ``text`` plus
     ``views`` with ``image_base64`` strings, no Image objects).
+  * structure_graph: launch -> poll -> complete (async result is the summary);
+    a saturated pool reports the extra launch as ``queued`` with a ``position``
+    key (new status vocabulary: queued/running/complete/failed/not_found).
 """
 
 import base64
+import importlib
 import importlib.util
 import json
 import os
+import queue
 import sys
+import threading
 import time
 import types
 
@@ -107,15 +113,17 @@ class _CommandCall:
 
 
 def _poll_tool(fs, tool_fn, job_id, deadline=10.0):
-    """Poll ``tool_fn(job_id=job_id)`` until its status leaves 'running'."""
+    """Poll ``tool_fn(job_id=job_id)`` until its status leaves
+    'queued'/'running' (i.e. reaches a terminal complete/failed/not_found)."""
     end = time.time() + deadline
     while True:
         status = json.loads(tool_fn(job_id=job_id))
-        if status["status"] != "running":
+        if status["status"] not in ("queued", "running"):
             return status
         if time.time() > end:
             raise AssertionError(
-                f"job {job_id} still running after {deadline:.1f}s: {status}")
+                f"job {job_id} still queued/running after {deadline:.1f}s: "
+                f"{status}")
         time.sleep(0.02)
 
 
@@ -143,20 +151,21 @@ def test_run_scad_sync_equals_call_output(fs, monkeypatch):
 
 
 def test_run_scad_launch_poll_completed(fs, monkeypatch):
-    """job_id='' launches (status running + job_id); polling the id reaches
-    completed with result == the canned sync output string."""
+    """job_id='' launches (status queued or running + job_id); polling the id
+    reaches complete with result == the canned sync output string."""
     fake = _CommandCall({"run_scad": CANNED_SCAD_SYNC})
     monkeypatch.setattr(fs, "_call", fake)
 
     raw = fs.run_scad(code="cube([10,10,10]);")
     launch = json.loads(raw)
-    assert launch["status"] == "running"
+    # The pool may report 'queued' when saturated; accept either active status.
+    assert launch["status"] in ("queued", "running")
     assert launch["job_id"]
 
     status = _poll_tool(
         fs, lambda **kw: fs.run_scad(code="cube([10,10,10]);", **kw),
         launch["job_id"])
-    assert status["status"] == "completed"
+    assert status["status"] == "complete"
     assert status["result"] == CANNED_SCAD_SYNC
 
 
@@ -168,8 +177,9 @@ def test_run_scad_unknown_uuid_not_found(fs):
 
 
 def test_run_scad_transport_failure_records_job_error(fs, monkeypatch):
-    """A mocked _call raising ReadTimeout surfaces as a job error whose message
-    names the exception (the launch envelope still returns running)."""
+    """A mocked _call raising ReadTimeout surfaces as a job failure whose
+    message names the exception (the launch envelope still returns an active
+    status)."""
     fake = _CommandCall(
         {}, raise_on={"run_scad": requests.exceptions.ReadTimeout(
             "ReadTimeout")})
@@ -177,12 +187,12 @@ def test_run_scad_transport_failure_records_job_error(fs, monkeypatch):
 
     raw = fs.run_scad(code="cube([10,10,10]);")
     launch = json.loads(raw)
-    assert launch["status"] == "running"
+    assert launch["status"] in ("queued", "running")
 
     status = _poll_tool(
         fs, lambda **kw: fs.run_scad(code="cube([10,10,10]);", **kw),
         launch["job_id"])
-    assert status["status"] == "error"
+    assert status["status"] == "failed"
     assert "ReadTimeout" in status["error"]
 
 
@@ -247,15 +257,116 @@ def test_review_reconstruction_async_result_is_json_safe(fs, monkeypatch):
     # The async path stores the JSON-safe dict as the job result.
     raw = fs.review_reconstruction(mesh="0", body="0", views=_VIEWS)
     launch = json.loads(raw)
-    assert launch["status"] == "running"
+    assert launch["status"] in ("queued", "running")
     status = _poll_tool(
         fs, lambda **kw: fs.review_reconstruction(mesh="0", body="0",
                                                   views=_VIEWS, **kw),
         launch["job_id"])
-    assert status["status"] == "completed"
+    assert status["status"] == "complete"
     result = status["result"]
     assert json.loads(json.dumps(result)) == result
     assert isinstance(result["text"], str)
     assert len(result["views"]) == 2 * len(_VIEWS)
     for view in result["views"]:
         assert "view" in view and view["image_base64"]
+
+
+# ---------------------------------------------------------------------------
+# structure_graph (job-enabled tool: launch -> poll -> complete)
+# ---------------------------------------------------------------------------
+
+# Canned extract_mesh_data payload: the canonical box from
+# tests/test_mesh_graph.py (8 nodes / 12 triangles / 6 planar faces).
+CANNED_MESH_DATA = json.dumps({
+    "mesh": "0",
+    "nodes": [(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0),
+              (0, 0, 2), (2, 0, 2), (2, 2, 2), (0, 2, 2)],
+    "indices": [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+                (0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5),
+                (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7)],
+    "normals": [],
+}, indent=2)
+
+
+def test_structure_graph_launch_poll_complete(fs, monkeypatch):
+    """structure_graph's async path: launching with no job_id returns an
+    envelope with a job_id and an active status; polling the id reaches
+    'complete' with the summary JSON as the job result."""
+    fake = _CommandCall({"extract_mesh_data": CANNED_MESH_DATA})
+    monkeypatch.setattr(fs, "_call", fake)
+
+    raw = fs.structure_graph(mesh="0")
+    launch = json.loads(raw)
+    assert launch["status"] in ("queued", "running")
+    assert launch["job_id"]
+
+    status = _poll_tool(
+        fs, lambda **kw: fs.structure_graph(mesh="0", **kw),
+        launch["job_id"])
+    assert status["status"] == "complete"
+    parsed = json.loads(status["result"])
+    assert parsed["mesh"] == "0"
+    assert parsed["component_count"] == 1
+    assert parsed["face_count"] == 6
+
+
+# ---------------------------------------------------------------------------
+# pool saturation (queued + position)
+# ---------------------------------------------------------------------------
+
+def _wait_for_status(fs, job_id, statuses, deadline=30.0):
+    """Poll ``fs._job_status(job_id)`` until its status is one of *statuses*."""
+    end = time.time() + deadline
+    while True:
+        status = fs._job_status(job_id)
+        if status["status"] in statuses:
+            return status
+        if time.time() > end:
+            raise AssertionError(
+                f"job {job_id} did not reach {statuses!r} within "
+                f"{deadline:.1f}s: {status}")
+        time.sleep(0.02)
+
+
+def test_pool_saturation_queued_with_position(fs, monkeypatch):
+    """With the pool saturated, the extra launch reports 'queued' with a
+    position key; releasing the gate drains both jobs to 'complete'."""
+    # fusion_server's _launch_job imports the TOP-LEVEL `jobs` module
+    # (mcp_server/jobs.py via MCP_SERVER_DIR on sys.path) -- not the
+    # `mcp_server.jobs` package module -- so patch that exact instance.
+    jobs = importlib.import_module("jobs")
+
+    # Quarantine workers started by earlier tests: old workers are parked on
+    # the OLD queue forever, so new launches flow only through the fresh
+    # single-worker pool this test sets up.
+    monkeypatch.setattr(jobs, "MAX_CONCURRENT", 1)
+    monkeypatch.setattr(jobs, "_WORKERS_STARTED", False)
+    monkeypatch.setattr(jobs, "_QUEUE", queue.Queue())
+
+    gate = threading.Event()
+
+    def gated_call(command, params=None, timeout=30):
+        gate.wait(timeout=30)
+        return CANNED_MESH_DATA
+
+    monkeypatch.setattr(fs, "_call", gated_call)
+
+    raw1 = fs.structure_graph(mesh="0")
+    launch1 = json.loads(raw1)
+    assert launch1["job_id"]
+    assert launch1["status"] in ("queued", "running")
+    job1 = launch1["job_id"]
+    _wait_for_status(fs, job1, ("running",))
+
+    raw2 = fs.structure_graph(mesh="0")
+    launch2 = json.loads(raw2)
+    assert launch2["job_id"]
+    assert launch2["status"] in ("queued", "running")
+    job2 = launch2["job_id"]
+    env2 = fs._job_status(job2)
+    assert env2["status"] == "queued"
+    assert env2["position"] == 0
+
+    gate.set()
+    assert _wait_for_status(fs, job1, ("complete",))["status"] == "complete"
+    assert _wait_for_status(fs, job2, ("complete",))["status"] == "complete"

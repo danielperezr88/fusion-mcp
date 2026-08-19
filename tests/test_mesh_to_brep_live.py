@@ -311,7 +311,7 @@ def test_compare_mesh_to_brep_server_path(bridge, monkeypatch):
         fs, "_call",
         lambda command, params=None, timeout=30: json.dumps(real, indent=2))
 
-    out = fs.compare_mesh_to_brep(mesh=mesh, body=body)
+    out = fs.compare_mesh_to_brep(mesh=mesh, body=body, job_id="sync")
     parsed = json.loads(out)
     assert set(parsed) == EXPECTED_KEYS, set(parsed) ^ EXPECTED_KEYS
     assert parsed["mesh"]["volume_cm3"] == pytest.approx(1.0, abs=0.01)
@@ -323,5 +323,6 @@ def test_compare_mesh_to_brep_server_path(bridge, monkeypatch):
         fs, "_call",
         lambda command, params=None, timeout=30: json.dumps(
             {"error": "Body '999' not found."}, indent=2))
-    err_out = json.loads(fs.compare_mesh_to_brep(mesh="999", body="0"))
+    err_out = json.loads(fs.compare_mesh_to_brep(mesh="999", body="0",
+                                                 job_id="sync"))
     assert err_out == {"error": "Body '999' not found."}

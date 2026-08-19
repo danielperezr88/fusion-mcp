@@ -91,24 +91,35 @@ Example workflow:
 
 ### Long-running tools & job polling
 
-Five long-running tools accept a `job_id` parameter so heavy work (OpenSCAD rendering, screenshot capture) never blocks the caller: `run_scad`, `update_scad_body`, `create_from_scad`, `annotate_mesh_parameters`, `review_reconstruction`.
+Fifteen long-running tools accept a `job_id` parameter so heavy work (OpenSCAD rendering, mesh analysis, screenshot capture, imports and exports) never blocks the caller: `run_scad`, `update_scad_body`, `create_from_scad`, `annotate_mesh_parameters`, `review_reconstruction`, `structure_graph`, `analyze_mesh`, `slice_mesh`, `compare_mesh_to_brep`, `import_cad_file`, `import_mesh_file`, `export_as_stl`, `export_as_step`, `export_as_3mf`, `export_as_f3d`.
 
 The `job_id` parameter has three modes:
 
-- `job_id=""` (default): launches the job in the background and returns `{"job_id": "<id>", "status": "running"}` immediately
-- `job_id="<id>"`: polls the job, returning `running`, `completed` (with `result`), `error` (with `error`), or `not_found`
+- `job_id=""` (default): launches the job in the background and returns `{"job_id": "<id>", "status": "queued"}` immediately (or `running` if a worker slot is free)
+- `job_id="<id>"`: polls the job and returns its current status
 - `job_id="sync"`: runs in the foreground and returns the full result exactly as before
 
+A polled job returns one of these statuses:
+
+- `queued`: waiting in the bounded worker queue; the payload includes `position`, the job's place in line
+- `running`: in progress; the payload is just `job_id` and `status`
+- `complete`: finished successfully; the payload includes `result`
+- `failed`: finished with an error; the payload includes `error`
+- `not_found`: the job id is unknown or has expired
+
 ```text
-run_scad(code="cube([10,10,10]);")            -> {"job_id": "...", "status": "running"}     # launch
-run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "running"}     # poll
-run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "completed", "result": "{...}"}
+run_scad(code="cube([10,10,10]);")            -> {"job_id": "...", "status": "queued"}                   # launch (queued)
+run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "queued", "position": 2}    # poll (still queued)
+run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "running"}                 # poll
+run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "complete", "result": "{...}"} # poll
 ```
 
 Notes:
-- Jobs are in-memory only and are lost when the MCP server restarts, so keep polling until a job reaches `completed` or `error`.
+- Jobs run on a bounded worker pool: at most `MAX_CONCURRENT = 4` jobs run at once and the excess jobs wait as `queued`.
+- Jobs are in-memory only and are lost when the MCP server restarts, so keep polling until a job reaches `complete` or `failed`.
 - The Fusion add-in command cap is 300s: each polled job runs to completion or returns its own timeout error.
 - The result of a polled `run_scad` is the same JSON string the tool normally returns; `annotate_mesh_parameters` and `review_reconstruction` return their screenshots as base64 image data.
+- `query_structure_graph` stays synchronous but needs a finished `structure_graph` job first: `structure_graph` is asynchronous, so launch it, poll its `job_id` until `complete`, then run your query against the persisted graph.
 
 ### Other
 - Execute arbitrary Python scripts inside Fusion 360
