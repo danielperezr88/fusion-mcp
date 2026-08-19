@@ -9,3 +9,11 @@ dist/
 build/
 .DS_Store
 Thumbs.db
+
+# agent process state (oh-my-openagent / Sisyphus)
+.omo/boulder.json
+.omo/drafts/
+.omo/run-continuation/
+.omo/start-work/
+.omo/transcripts/
+.sisyphus/
