@@ -487,3 +487,41 @@ EFFECT: production cone confidence is >= prototype confidence for the same fit (
 RISK: an unvalidated edge case — a poor cone fit with low cv but scattered apex distances would score higher in production than the prototype intended, potentially winning the cone-preference slot where the prototype would have demoted it below 0.5. If such a misclassification shows up, the fix is one line at mesh_analysis.py L914 (port the `t_std/h_range` term; compute `t_std = np.std(t_vals)` and `h_range = max(h0) - min(h0)` with the < 1e-9 guard from the prototype).
 
 All other competition math (residual functions, gates 5-80° half-angle + cv <= 0.3, both-signs apex fix, sphere/torus fitters) was verified equivalent between prototype and production at port time.
+
+
+## [2026-08-19] cuerpo79 CLOSED: project recovered, full parametric reconstruction, and the definitive (d) root cause (sisyphus)
+
+TASK: recover the "Plataforma tortus" project (import `C:\Users\danie\Documents\3D Prints\Plataforma tortus\Plataforma tortus 4.3mf`, units="mm"), then run the remaining work: the BRep-based cuerpo79 (d) confirmation.
+
+PROJECT RECOVERY:
+- Original 40-face BRep document is UNRECOVERABLE: not open in Fusion, no tortus-named file in any of the 4 cloud projects (Assets/Default/Housing_new/My First Project), no f3d/step on disk. Other STLs in the folder (grande 4176t, prototipo 6552t, tortus-3 12808t) are all DIFFERENT variants (no 214.6x70x70mm footprint match) — no finer cuerpo79 tessellation exists anywhere.
+- 3mf re-import via import_mesh_file: MeshBody1 (1842v/1780t, min Y 4.738) = cuerpo79 + MeshBody2 (4882v/4938t, min Y 12.769) = meshb2, byte-consistent with the Aug-12 session.
+
+RECONSTRUCTION (full-circle mesh->parametric, saved as "Plataforma tortus recon v1"):
+- Structure derived from authoritative slices (mesh_slicer.slice_mesh_at locally on the dump, 6 heights) + decompose face map + targeted triangle probes. 5-layer prismatic model:
+  1. Slab Z[0,0.5]: rect X[2.882,20.839]xY[4.738,11.738] minus front-right open channel X[16.339,20.339]xY[4.738,8.738] (full-height notch, NOT a floor pocket — the Z=0.25 outer loop traces the detour) minus crescent slot (flat edge X=2.882 Y[5.843,10.633], straight right edge X=3.806, curved top/bottom, area 3.93 — the "tortus" cutout; f25 flat wall 2.394=4.79x0.5 proves it is an internal slot, not a left-edge bite).
+  2. Wall ring Z[0.5,3.5]: front band X[3.806,16.339]xY[4.738,5.238] (ends at divider rib), back band X[3.806,20.839]xY[11.238,11.738], right column X[20.339,20.839] full depth, rib X[15.917,16.339]xY[5.238,8.738], bar X[15.917,20.339]xY[8.738,9.138]. LEFT side open (no wall) except band end caps.
+  3. Inner posts Z[3.5,6.5]: X[20.339,20.839] front+back.
+  4. Outer posts Z[5,6.5]: X[23.839,24.339] front+back (free-standing until caps).
+  5. Cap strips Z[6.5,7]: X[20.339,24.339] front+back (bridge/handle over the arm).
+- Built with native MCP features: 2 rect extrudes + 1 cut (notch) + line+SketchFittedSpline sketch via execute_script -> cut (crescent, 15 spline pts from the slice loop) + 5 rect extrudes (ring) + 2+2 posts + 2 caps, all join.
+- RESULT: 34 faces, volume 120.79 cm3 (mesh 121.66, ratio 1.0073), bbox deviation 6.7e-5 cm. compare_mesh_to_brep: mean sampled dev 0.26 cm (vertex_fallback method — low-fidelity sampler, volume/bbox are the authoritative gates).
+
+THE DEFINITIVE (d) ROOT CAUSE (two runs):
+- Unfilleted recon, VeryHigh-quality STL (2134 tris after Y-filtering the mixed export): delta_est=4.88e-08 MACHINE ZERO, P=72 C=0, cov=0.58 => (d) FAIL. NEW KNOWLEDGE: an extruded fitted-spline wall tessellates PIECEWISE-PLANAR BY CONSTRUCTION — Fusion extrudes the sketch curve's polyline approximation, so the crescent walls have literally zero smooth curvature in the tessellation, at any refinement. No available cuerpo79 source contains recoverable curvature (all exports are slicer-grade; the original BRep is gone).
+- CONCLUSION: the original (d) FAILs were NEVER an estimator bug and never fixable from available data — cuerpo79's recoverable geometry is curvature-free. The only curvature in the design family is the meshb2-informed r=0.25 fillets.
+
+FILLETED VARIANT EXPERIMENT (explicitly labeled — NOT a cuerpo79 verdict):
+- Added 3 r=0.25 fillets on the wall-top outer perimeter (edges 45/37/50 = front/back/right, geometrically selected at Z=3.5) => 37 faces, volume 120.32.
+- Fine STL (2436 tris): delta_est=1.9333e-04 IN [1e-4,1e-1] => **(d) PASS** (first (d) pass in the workstream), cov=0.945. Proves the delta estimator + competition pipeline work correctly when real curvature exists.
+- (d2) got WORSE: P=91 C=0 = 91 vs 40 => FAR. VeryHigh tessellation shatters fillet bands into narrow planar strips that fragment in the planar grouping and never cluster into cylinders (C=0 despite 3 real r=0.25 cylinders). Same fragmentation class as meshb2's 51-vs-40, amplified. Open issue: cylinder recovery does not fire on finely-tessellated narrow fillet bands at eps~5.8e-4.
+
+GOTCHAS:
+1. STLExportOptions exports the whole COMPONENT (mesh bodies included) even when created with a single body — filter by geometry (the 10mm Y-gap made this trivial) or expect contaminated dumps.
+2. opts.meshRefinement = TriangleMeshQualityOptions.VeryHighQualityTriangleMesh (NOT MeshRefinementOptions); refinement barely changes tri count on prismatic geometry.
+3. Fusion body name is locale-dependent ("Cuerpo1"); rename immediately after first feature.
+4. SketchFittedSplines.add() takes an ObjectCollection, not a list; a failed execute_script attempt leaves a stale named sketch — delete before retry (name collision gives "name (1)").
+5. The mixed-charge crescent: decimation of a chained slice loop can silently jump collinear runs (the 3.8cm right edge was ONE segment) — always inspect the raw loop order before fitting splines.
+6. Volume arithmetic is the cheapest structure validator: predicted 121.72 vs mesh 121.66 before building (0.05%) caught every misread notch/pocket during slicing interpretation.
+
+HARNESS FILES (Temp\opencode): cuerpo79_cm_data.json RESTORED to the frozen 1780-tri dump (backup was cuerpo79_cm_data.slicer-grade.bak.json); new artifacts cuerpo79_recon_data.json (2134t unfilleted) + filtered filleted variant inside harness run harness_recon_run.txt / harness_filleted_run.txt; STLs cuerpo79_recon.stl / _fine.stl / _filleted.stl.
