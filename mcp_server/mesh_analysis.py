@@ -1192,6 +1192,39 @@ def _classify_curved_patch(patch, epsilon=None):
 _SMALL_GROUP_MAX = 30   # planar groups with <= this many triangles are
                         # candidates for cylinder-wall recovery
 
+# --- extruded-wall sweep recovery (2026-08-19) ------------------------------
+_MAX_CHAIN_ANGLE_DEG = 30.0   # small-group chaining gate: adjacent groups
+                              # union into a cluster only when their mean
+                              # normals agree within 30 deg — kills the
+                              # sliver-bridged mega-clusters that chained
+                              # unrelated wall bands through degenerate
+                              # seam triangles
+_SWEEP_AXIS_PERP_DOT = 0.15   # |n . axis| < this => normal is perpendicular
+                              # to the extrusion axis (side-wall normal)
+_SWEEP_AXIS_MIN_FRACTION = 0.8   # >= 80% of cluster normals perpendicular
+                                 # to a candidate axis => extrusion band
+_SWEEP_STEP_MIN_DEG = 0.5      # per-step normal turn below this = straight
+                               # (constant-direction) run — stop there
+_SWEEP_STEP_MAX_DEG = 45.0     # per-step normal turn above this = sharp
+                               # junction — stop there
+_SWEEP_MIN_TOTAL_DEG = 10.0    # a run must sweep >= this many degrees of
+                               # normal rotation to be an arc worth fitting
+
+# --- axis-partitioned chaining (2026-08-19) ---------------------------------
+_CANON_AXES: Tuple[np.ndarray, np.ndarray, np.ndarray] = (
+    np.array([1.0, 0.0, 0.0]),
+    np.array([0.0, 1.0, 0.0]),
+    np.array([0.0, 0.0, 1.0]),
+)
+_CHAIN_AXIS_PERP_DOT = 0.15   # |mean_normal . axis| < this => the group's
+                              # normals are perpendicular to that axis
+                              # (i.e. the group is a wall band extruded
+                              # along it).  Two groups in different axis
+                              # partitions never chain, even when their
+                              # normals agree within 30° — preventing
+                              # fillet bands (⊥ X/Y) from chaining into
+                              # wall bands (⊥ Z) through smooth junctions.
+
 
 def _otsu_threshold(log_values, n_bins=128):
     """Otsu's method: threshold maximizing between-class variance.
@@ -1395,6 +1428,321 @@ def _cylinder_residual_on_tris(v_arr, f_arr, tri_normals, tri_indices):
     return fit, float(np.mean(radial_err))
 
 
+def _group_mean_normals(planar_groups, tri_normals):
+    """Area-free unit mean normal per planar group (None when degenerate).
+
+    The mean of a group's per-triangle normals, normalized.  Groups whose
+    normals cancel to near-zero length (numerically degenerate slivers)
+    return None — callers treat that as "fails any angular gate".
+    """
+    out: List[Optional[np.ndarray]] = []
+    for g in planar_groups:
+        tris = np.asarray(g["tri_indices"], dtype=np.int64)
+        if len(tris) == 0:
+            out.append(None)
+            continue
+        mean_n = tri_normals[tris].mean(axis=0)
+        norm = float(np.linalg.norm(mean_n))
+        out.append(mean_n / norm if norm > 1e-12 else None)
+    return out
+
+
+def _group_axis_partition(mean_normal):
+    """Index (0=X, 1=Y, 2=Z) of the canonical axis most perpendicular to
+    *mean_normal*, or -1 when no axis is clearly perpendicular.
+
+    Groups in different partitions never chain together — this stops
+    fillet bands (⊥ X/Y) from merging into wall bands (⊥ Z) through
+    smooth (< 30°) normal transitions at fillet-wall junctions.
+    """
+    if mean_normal is None:
+        return -1
+    dots = (abs(float(mean_normal @ _CANON_AXES[0])),
+            abs(float(mean_normal @ _CANON_AXES[1])),
+            abs(float(mean_normal @ _CANON_AXES[2])))
+    best = min(range(3), key=lambda i: dots[i])
+    if dots[best] < _CHAIN_AXIS_PERP_DOT:
+        return best
+    return -1
+
+
+def _find_extrusion_axis(tri_normals, tri_indices):
+    """Candidate extrusion axis for a triangle set, or None.
+
+    A band of triangles extruded along axis ``a`` has (nearly) all face
+    normals perpendicular to ``a``.  Candidate axes are the
+    cross-product result from ``_find_axis_from_cross_products`` (cross
+    products of normal pairs are parallel to the axis) PLUS the three
+    canonical world axes — the cross-product method alone picks the
+    wrong axis on mixed-topology clusters (e.g. an extruded wall with a
+    minority fillet band whose normals contaminate the cross products),
+    so every candidate is scored by its perpendicular fraction and the
+    highest wins.  Returned only when that fraction is at least
+    ``_SWEEP_AXIS_MIN_FRACTION``.
+    """
+    normals = tri_normals[np.asarray(tri_indices, dtype=np.int64)]
+    if len(normals) < 4:
+        return None
+
+    candidates: List[np.ndarray] = []
+    cp = _find_axis_from_cross_products(normals)
+    if cp is not None:
+        candidates.append(cp)
+    for c in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+        candidates.append(np.array(c, dtype=np.float64))
+
+    best_axis = None
+    best_frac = 0.0
+    for cand in candidates:
+        frac = float(np.count_nonzero(
+            np.abs(normals @ cand) < _SWEEP_AXIS_PERP_DOT) / len(normals))
+        if frac > best_frac:
+            best_frac = frac
+            best_axis = cand
+    if best_axis is None or best_frac < _SWEEP_AXIS_MIN_FRACTION:
+        return None
+    return best_axis
+
+
+def _grow_sweep_runs(group_ids, group_mean_normals, group_adj, axis):
+    """Monotonic arc runs over a cluster's planar groups (deterministic).
+
+    Region-grows runs of groups whose mean normals rotate monotonically
+    around *axis* — the tessellation rings of an extruded circular-arc
+    wall form exactly such a chain.  Seeds are visited in ascending group
+    index; neighbors grow in ascending index order.  Each seed grows
+    BIDIRECTIONALLY: a forward pass (append, direction = sign of its
+    first step) and a backward pass (prepend, direction = sign of its
+    first step) extend the run from both sides of the seed, so a single
+    monotonic chain is covered by one run regardless of where the seed
+    sits along it.
+
+    A pass extends from its current group *g_cur* to an adjacent
+    unvisited group *g_next* only when the projected normal angle step
+    ``theta(g_next) - theta(g_cur)``:
+
+      * keeps the pass's rotation direction (sign of its first step),
+      * has magnitude in ``[_SWEEP_STEP_MIN_DEG, _SWEEP_STEP_MAX_DEG]``
+        — steps below the minimum are a straight (constant-normal) edge,
+        steps above the maximum are a sharp junction; both stop the pass.
+
+    Returns a list of ``(run_groups, total_sweep_deg)`` for every run
+    with at least 2 groups; total sweep is the accumulated |delta
+    theta| of both passes' accepted steps.
+    """
+    thetas = np.full(len(group_mean_normals), np.nan, dtype=np.float64)
+    ax_abs = np.abs(axis)
+    dominant = int(np.argmax(ax_abs))
+    if dominant == 0:
+        c1, c2 = 1, 2
+    elif dominant == 1:
+        c1, c2 = 0, 2
+    else:
+        c1, c2 = 0, 1
+    for gi in group_ids:
+        mn = group_mean_normals[gi]
+        if mn is None:
+            continue
+        perp = mn - float(mn @ axis) * axis
+        if float(np.hypot(perp[c1], perp[c2])) > 1e-9:
+            thetas[gi] = math.degrees(math.atan2(perp[c2], perp[c1]))
+
+    def _step(a, b):
+        return (thetas[b] - thetas[a] + 180.0) % 360.0 - 180.0
+
+    def _pass(start, visited, cluster):
+        """Greedy one-direction path from *start*; returns (groups, sweep)."""
+        out: List[int] = []
+        sweep = 0.0
+        direction = 0.0
+        cur = start
+        while True:
+            nxt = None
+            for cand in sorted(group_adj.get(cur, ())):
+                if cand not in cluster or cand in visited \
+                        or np.isnan(thetas[cand]):
+                    continue
+                step = _step(cur, cand)
+                if abs(step) < _SWEEP_STEP_MIN_DEG \
+                        or abs(step) > _SWEEP_STEP_MAX_DEG:
+                    continue
+                if direction == 0.0 \
+                        or math.copysign(1.0, step) == direction:
+                    nxt = cand
+                    if direction == 0.0:
+                        direction = math.copysign(1.0, step)
+                    break
+            if nxt is None:
+                break
+            step = _step(cur, nxt)
+            visited.add(nxt)
+            out.append(nxt)
+            sweep += abs(step)
+            cur = nxt
+        return out, sweep
+
+    visited: set = set()
+    cluster = set(group_ids)
+    runs: List[Tuple[List[int], float]] = []
+    for seed in sorted(group_ids):
+        if seed in visited:
+            continue
+        visited.add(seed)
+        forward, sweep_f = _pass(seed, visited, cluster)
+        backward, sweep_b = _pass(seed, visited, cluster)
+        run = list(reversed(backward)) + [seed] + forward
+        if len(run) >= 2:
+            runs.append((run, sweep_f + sweep_b))
+    return runs
+
+
+def _fit_sweep_cylinder(v_arr, f_arr, tri_normals, tri_indices, axis,
+                        epsilon):
+    """Cylinder fit for a sweep run against a KNOWN extrusion axis.
+
+    ``_fit_cylinder`` places its axis line through the patch vertex mean,
+    which is chord-biased on open (< 360 deg) arcs and inflates the radial
+    residual far above epsilon — an arc of a true r=2.0 cylinder fits as
+    r=0.77 with residual 0.33.  A sweep run already knows the extrusion
+    axis, so only the axis line's perpendicular position is unknown: a
+    Kasa algebraic circle fit (linear least squares on
+    ``x^2 + y^2 = 2*cx*x + 2*cy*y + c``) on the run's compacted vertices
+    projected to the axis-perpendicular plane recovers the exact center
+    for vertices lying on a circular arc.  Tessellated cylinders put
+    their vertices exactly ON the surface, so the mean radial residual of
+    a true arc run is machine-zero and the epsilon gate stays honest.
+
+    Returns ``(fit_dict, residual)`` with the standard cylinder schema
+    (surface_type, axis, radius_cm, axis_point_cm, height_cm,
+    confidence, residual_cm), or ``(None, inf)`` when the run is not a
+    cylinder within epsilon.
+    """
+    ti_arr = np.asarray(tri_indices, dtype=np.int64)
+    if len(ti_arr) < 6:
+        return None, float("inf")
+
+    faces_sub = f_arr[ti_arr]
+    unique_idx, inverse = np.unique(faces_sub.ravel(), return_inverse=True)
+    local_verts = v_arr[unique_idx]
+    local_faces = inverse.reshape(-1, 3)
+
+    ref = (np.array([1.0, 0.0, 0.0]) if abs(float(axis[0])) < 0.9
+           else np.array([0.0, 1.0, 0.0]))
+    u = np.cross(axis, ref)
+    u = u / np.linalg.norm(u)
+    w = np.cross(axis, u)
+
+    rel = local_verts - local_verts.mean(axis=0)
+    x = rel @ u
+    y = rel @ w
+    A = np.column_stack([2.0 * x, 2.0 * y, np.ones_like(x)])
+    b = x * x + y * y
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None, float("inf")
+    cx, cy, c = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+    r_sq = cx * cx + cy * cy + c
+    if r_sq <= 1e-12:
+        return None, float("inf")
+    axis_point = local_verts.mean(axis=0) + cx * u + cy * w
+
+    face_verts = local_verts[local_faces]
+    cross_dists = np.linalg.norm(
+        np.cross(face_verts - axis_point, axis), axis=2)
+    radius = float(np.median(cross_dists))
+    if radius < 1e-9:
+        return None, float("inf")
+    residual = float(np.mean(np.abs(cross_dists - radius)))
+    if residual > epsilon:
+        return None, float("inf")
+
+    normals_sub = tri_normals[ti_arr]
+    perp = float(np.count_nonzero(
+        np.abs(normals_sub @ axis) < _SWEEP_AXIS_PERP_DOT)
+        / len(normals_sub))
+    if perp < 0.3:
+        return None, float("inf")
+
+    projs = local_verts @ axis
+    height = float(projs.max() - projs.min())
+
+    fit = {
+        "surface_type": "cylinder",
+        "axis": [round(float(cc), 6) for cc in axis],
+        "radius_cm": round(radius, 6),
+        "axis_point_cm": [round(float(cc), 6) for cc in axis_point],
+        "height_cm": round(height, 6),
+        "confidence": round(perp, 4),
+        "residual_cm": round(residual, 6),
+    }
+    return fit, residual
+
+
+def _sweep_recover_cluster(v_arr, f_arr, tri_normals, planar_groups,
+                          group_list, mean_normals, group_adj, axis,
+                          epsilon, comp_ids):
+    """Recover sweep cylinders from one cluster's monotonic arc runs.
+
+    Grows monotonic rotation runs over the cluster's groups (``_grow_sweep_runs``),
+    fits each run with at least ``_SWEEP_MIN_TOTAL_DEG`` of normal sweep
+    first via the validated ``_classify_curved_patch`` competition and, on
+    failure, via the axis-aware ``_fit_sweep_cylinder`` (which alone can
+    fit open < 360 deg arcs).  Accepts only cylinders whose residual is
+    within *epsilon*.
+
+    Returns ``(entries, consumed_groups, consumed_tris)`` where each entry
+    is a curved-patch dict (``recovered_via: "sweep"``) WITHOUT
+    ``patch_index`` (the caller assigns it sequentially).
+    """
+    runs = _grow_sweep_runs(group_list, mean_normals, group_adj, axis)
+    entries: List[Dict] = []
+    consumed: set = set()
+    consumed_tris: set = set()
+    for run_groups, sweep_deg in runs:
+        if sweep_deg < _SWEEP_MIN_TOTAL_DEG:
+            continue
+        run_tris = sorted(set(
+            ti for gi in run_groups
+            for ti in planar_groups[gi]["tri_indices"]))
+        if len(run_tris) < 6:
+            continue
+        f_run = f_arr[np.array(run_tris, dtype=np.int64)]
+        unique_idx, inverse = np.unique(
+            f_run.ravel(), return_inverse=True)
+        local_verts = v_arr[unique_idx]
+        local_faces = inverse.reshape(-1, 3)
+        try:
+            part = trimesh.Trimesh(
+                vertices=local_verts, faces=local_faces,
+                process=False)
+            surface = _classify_curved_patch(part, epsilon=epsilon)
+        except Exception:
+            surface = None
+        if surface is None or \
+                surface.get("surface_type") != "cylinder" or \
+                surface.get("residual_cm", float("inf")) > epsilon:
+            surface, _ = _fit_sweep_cylinder(
+                v_arr, f_arr, tri_normals, run_tris, axis, epsilon)
+        if surface is None or \
+                surface.get("surface_type") != "cylinder" or \
+                surface.get("residual_cm", float("inf")) > epsilon:
+            continue
+        comp = comp_ids[run_tris[0]] if run_tris else 0
+        entry = {
+            "component": comp,
+            "triangle_count": len(run_tris),
+            "area": round(_cluster_tri_area(
+                v_arr, f_arr, run_tris), 6),
+            "recovered_via": "sweep",
+        }
+        entry.update(surface)
+        entries.append(entry)
+        consumed.update(run_groups)
+        consumed_tris.update(run_tris)
+    return entries, consumed, consumed_tris
+
+
 def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
                                       planar_groups, epsilon, comp_ids):
     """Recover curved patches from small planar groups (fix-e + competition).
@@ -1409,10 +1757,18 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
          sphere / cone / torus) via ``_classify_curved_patch`` on a
          compact trimesh built from the cluster's triangles.  If a
          non-freeform surface wins, emits it as a recovered curved patch.
-      4. Cap-contamination retry: when the competition returns freeform,
-         falls back to a cylinder-only fit.  If the fit fails but
-         produced a valid axis, splits the cluster by
-         |dot(tri_normal, axis)| < 0.15 (side=wall vs non-side=cap).
+      4. Sweep-run recovery: when the competition fails or is skipped by
+         the sharp gate, detect an extrusion axis (>= 80% of cluster
+         normals perpendicular to a dominant cross-product axis) and
+         region-grow monotonic arc runs over the cluster's groups.  Each
+         run sweeping >= _SWEEP_MIN_TOTAL_DEG is fitted as a compact
+         trimesh; accepted cylinders become sweep-recovered patches
+         (``recovered_via: "sweep"``).  Unconsumed groups (straight runs,
+         leftover slivers) stay in the cluster.
+      5. Cap-contamination retry: when the competition and the sweep both
+         fail to explain the cluster, falls back to a cylinder-only fit.
+         If the fit fails but produced a valid axis, splits the cluster
+         by |dot(tri_normal, axis)| < 0.15 (side=wall vs non-side=cap).
          If both exist and the side-only fit passes, emits side tris as
          one cylinder patch and leaves non-side groups as planar.
 
@@ -1469,8 +1825,19 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
                 for g in planar_groups]
 
     # --- union-find on adjacent small groups ---
+    # Normal-continuity + axis-partition gate (2026-08-19): two adjacent
+    # small groups chain only when (a) their mean normals agree within
+    # _MAX_CHAIN_ANGLE_DEG AND (b) they share the same dominant
+    # perpendicular canonical axis (or either lacks one).  Without the
+    # axis partition, fillet bands (⊥ X/Y) chain into wall bands (⊥ Z)
+    # through the smooth < 30° normal transitions at fillet-wall
+    # junctions, producing mixed-axis clusters that no single extrusion
+    # axis can explain.
     n_groups = len(planar_groups)
     parent = list(range(n_groups))
+    mean_normals = _group_mean_normals(planar_groups, tri_normals)
+    axis_parts = [_group_axis_partition(mn) for mn in mean_normals]
+    chain_cos = math.cos(math.radians(_MAX_CHAIN_ANGLE_DEG))
 
     def _find(x):
         while parent[x] != x:
@@ -1484,10 +1851,15 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
             parent[ra] = rb
 
     for gi in range(n_groups):
-        if not is_small[gi]:
+        if not is_small[gi] or mean_normals[gi] is None:
             continue
         for nbr in group_adj.get(gi, ()):
-            if nbr < n_groups and is_small[nbr]:
+            if nbr < n_groups and is_small[nbr] \
+                    and mean_normals[nbr] is not None \
+                    and abs(float(mean_normals[gi] @ mean_normals[nbr])) \
+                    >= chain_cos \
+                    and (axis_parts[gi] == -1 or axis_parts[nbr] == -1
+                         or axis_parts[gi] == axis_parts[nbr]):
                 _union(gi, nbr)
 
     clusters: Dict[int, List[int]] = defaultdict(list)
@@ -1565,6 +1937,37 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
                 for gi in group_list:
                     recovered_groups.add(gi)
                 continue
+
+        # --- (1.5) Sweep-run recovery (extruded-wall arcs) ---
+        # A finely tessellated wall EXTRUDED from a curved profile (arcs
+        # of cylinders sweeping around the extrusion axis) fragments into
+        # dozens of small planar groups; when several arcs with different
+        # radii chain into one cluster, the whole-cluster competition
+        # correctly returns freeform and the arcs are lost.  Split the
+        # cluster into monotonic rotation runs and fit each run as its
+        # own cylinder.  Runs that stop (straight edges, sharp junctions,
+        # direction reversal) are left for steps 2/3.
+        axis = _find_extrusion_axis(tri_normals, cluster_tris)
+        if axis is not None:
+            sweep_entries, consumed_groups, consumed_tris = \
+                _sweep_recover_cluster(
+                    v_arr, f_arr, tri_normals, planar_groups,
+                    group_list, mean_normals, group_adj,
+                    axis, epsilon, comp_ids)
+            for e in sweep_entries:
+                e["patch_index"] = patch_idx
+                recovered_patches.append(e)
+                patch_idx += 1
+            if consumed_groups:
+                recovered_groups.update(consumed_groups)
+                recovered_tri_indices.update(consumed_tris)
+                group_list = [gi for gi in group_list
+                              if gi not in consumed_groups]
+                cluster_tris = sorted(set(
+                    ti for gi in group_list
+                    for ti in planar_groups[gi]["tri_indices"]))
+                if len(cluster_tris) < 6:
+                    continue
 
         # --- (2) Cylinder-only fit (fallback + cap-retry trigger) ---
         fit, res = _cylinder_residual_on_tris(

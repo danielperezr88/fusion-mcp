@@ -525,3 +525,29 @@ GOTCHAS:
 6. Volume arithmetic is the cheapest structure validator: predicted 121.72 vs mesh 121.66 before building (0.05%) caught every misread notch/pocket during slicing interpretation.
 
 HARNESS FILES (Temp\opencode): cuerpo79_cm_data.json RESTORED to the frozen 1780-tri dump (backup was cuerpo79_cm_data.slicer-grade.bak.json); new artifacts cuerpo79_recon_data.json (2134t unfilleted) + filtered filleted variant inside harness run harness_recon_run.txt / harness_filleted_run.txt; STLs cuerpo79_recon.stl / _fine.stl / _filleted.stl.
+
+## 2026-08-19 — Extruded-wall sweep recovery: 3 fixes, 1 fundamental limitation
+
+### What was built
+Three-layer fix in `mcp_server/mesh_analysis.py` `_recover_curved_from_small_groups` for finely-tessellated extruded curved walls:
+1. **Chain gate** (`_MAX_CHAIN_ANGLE_DEG=30°`): union-find on adjacent small planar groups only chains when mean normals agree within 30°. Kills sliver-bridged mega-clusters.
+2. **Axis-partitioned chaining** (`_group_axis_partition`, `_CHAIN_AXIS_PERP_DOT=0.15`): groups in different perpendicular-axis partitions never chain — prevents fillet bands (⊥X/Y) from merging into wall bands (⊥Z) through smooth <30° normal transitions at fillet-wall junctions.
+3. **Sweep-run recovery** (`_grow_sweep_runs`, `_fit_sweep_cylinder`, `_sweep_recover_cluster`): detects extrusion axis via cross-products + canonical candidates, grows monotonic normal-rotation runs, fits each as a cylinder via Kasa circle fit (axis-aware, handles open <360° arcs that `_fit_cylinder` can't).
+
+### Bug found and fixed during verification
+`_grow_sweep_runs` computed projected-normal angles as `atan2(perp[1], perp[0])` (always XY plane) regardless of extrusion axis. For X-axis extrusions (rotation in YZ), all angles collapsed to 90° → 0 runs. Fixed: pick the two non-dominant axis components based on `argmax(|axis|)`.
+
+### What works
+- 7/7 synthetic tests pass (annular sector, egg profile, meshb2 regression, etc.)
+- Full suite: 289 passed, 1 xfailed, 0 failures (baseline 282 + 7 new)
+- meshb2 regression fully preserved: 32P + 20C r=0.25, coverage 0.9498
+- Axis partition successfully splits the 187-tri mega-cluster into clean single-axis clusters (141⊥X, 91⊥Y, 96⊥X, 114⊥Z)
+- Sweep runs correctly detected on all large clusters (82.5° and 90° sweeps)
+
+### The fundamental limitation (cuerpo79)
+cuerpo79's crescent wall is an **extruded fitted spline**, not an extruded arc. The spline has monotonically rotating normals (looks like a cylinder to the run-grower) but **non-constant radius** (r varies 0.07–0.25 cm across the arc). The Kasa fit correctly rejects these because the radial residual (0.02–0.08 cm) far exceeds epsilon (5.8e-4 cm). This is the correct behavior — the sweep recovers true cylinders, not spline lookalikes.
+
+Probe result on filleted cuerpo79: 119P + 4 freeform + 1 cylinder (r=0.37, sweep-recovered) = 124 total faces (baseline 126). The modest improvement (126→124) is real: the chain gate + axis partition broke the mega-cluster into smaller, cleaner clusters, and the sweep recovered one small cylinder. The remaining 4 freeform patches are the spline walls — correctly classified as non-cylindrical.
+
+### Key insight
+The (d2) "P=91 C=0" fragmentation issue from the filleted experiment is now understood: it was never a clustering bug — it's that the curved walls are splines, not cylinders. No amount of clustering improvement can make a spline surface pass a cylinder epsilon gate. Future work to recover spline surfaces would need a different approach (e.g., fit a 2D spline to the projected normal-angle vs radius curve).
