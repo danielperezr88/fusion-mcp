@@ -1,0 +1,44 @@
+﻿
+============================================================
+[2026-08-10] T4: README "Long-running tools & job polling" section rewritten
+Plan: .omo/plans/job-centric-api.md, task 4
+Scope: ONLY the "### Long-running tools & job polling" section (README.md lines 92-121).
+       No other section or file modified.
+
+Changes applied:
+- Opening paragraph: "Five long-running tools" -> "Fifteen long-running tools",
+  listing all 15 job-enabled tools (5 existing + 10 newly converted):
+  run_scad, update_scad_body, create_from_scad, annotate_mesh_parameters,
+  review_reconstruction, structure_graph, analyze_mesh, slice_mesh,
+  compare_mesh_to_brep, import_cad_file, import_mesh_file, export_as_stl,
+  export_as_step, export_as_3mf, export_as_f3d.
+- Three job_id modes kept (launch / poll / sync) with new vocabulary:
+  launch returns {"job_id": "<id>", "status": "queued"} (or "running" if a
+  worker slot is free); poll returns the current status; sync unchanged.
+- New status list: queued (payload has position), running (payload is just
+  job_id + status), complete (payload has result), failed (payload has error),
+  not_found (unknown/expired id).
+- Bounded queue documented: MAX_CONCURRENT = 4, excess jobs wait as queued.
+- run_scad example block updated: queued (with position) -> running -> complete.
+- Notes updated: keep polling until complete/failed; 300s add-in cap kept;
+  base64 screenshot payloads for annotate/review kept;
+  new note that query_structure_graph is sync but needs a finished
+  structure_graph job (launch, poll job_id until complete, then query).
+- Zero leftover old-status references: no "completed" and no status:"error".
+
+VERIFY (Select-String on README.md):
+  Select-String -Pattern "queued"        -> 4 hit(s):
+    98: - `job_id=""` (default): launches the job in the background and returns `{"job_id": "<id>", "status": "queued"}` immediately (or `running` if a worker slot is free)
+    104: - `queued`: waiting in the bounded worker queue; the payload includes `position`, the job's place in line
+    111: run_scad(code="cube([10,10,10]);")            -> {"job_id": "...", "status": "queued", "position": 2}    # launch (queued)
+    117: - Jobs run on a bounded worker pool: at most `MAX_CONCURRENT = 4` jobs run at once and the excess jobs wait as `queued`.
+  Select-String -Pattern "MAX_CONCURRENT" -> 1 hit(s):
+    117: - Jobs run on a bounded worker pool: at most `MAX_CONCURRENT = 4` jobs run at once and the excess jobs wait as `queued`.
+  Select-String -Pattern "completed"     -> 0 hit(s) (expected 0)
+  Select-String -Pattern 'status": "error"' -> 0 hit(s) (expected 0)
+
+RESULT: PASS - both greps hit; no leftover old job-status vocabulary in the file.
+[2026-08-10] T4 follow-up: launch-envelope example corrected in README example block (lines 110-114).
+  Launch envelope is {job_id, status} ONLY - position is poll-only (_job_status queued adds position).
+  Block is now 4 lines: launch(queued) -> poll(queued, position:2) -> poll(running) -> poll(complete).
+  VERIFY: 'status": "queued", "position"' matches exactly line 112 (the poll line); launch line 111 has no position.

@@ -1,0 +1,33 @@
+# Task 10: Wire workstream into structure_graph build pipeline
+## Evidence log — 2026-08-05
+
+### Baseline (unchanged tree)
+```
+py -3.14 -m pytest tests/ -k "not live" -v
+216 passed, 18 deselected in 14.90s
+```
+
+### Changes
+- `mcp_server/fusion_server.py`:
+  - Updated docstring NOTE at L1519-1523: documented that `base_face_candidates` is the legacy key, real scored analysis is in `workstream`
+  - Added workstream construction (L1574-1597): reads `is_base_candidate`, `unit_type`, `rebuild_order`, `dag_has_cycles` from graph attrs set by T9 functions (already called inside `build_structure_graph` — no re-calling)
+  - Added `"workstream": {...}` key to summary dict (L1618)
+- `tests/test_structure_graph_tool.py`:
+  - L133-137: added `"workstream"` to expected summary keys set
+  - 3 new tests appended (L210-254):
+    - `test_structure_graph_workstream_summary`: verifies workstream keys, box values
+    - `test_structure_graph_workstream_sql_agrees`: SQL cross-check via DuckDB
+    - `test_structure_graph_workstream_raises`: monkeypatched `_build_dependency_order` → tool reports error
+
+### Final counts
+```
+py -3.14 -m pytest tests/ -k "not live" -v
+219 passed, 18 deselected in 15.21s
+(+3 tests, zero regressions)
+```
+
+### Targeted test run
+```
+py -3.14 -m pytest tests/test_structure_graph_tool.py -v
+17 passed in 4.52s
+```

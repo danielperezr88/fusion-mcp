@@ -1,0 +1,150 @@
+# Task 3 (R-3) — Replace O(n²) snap with grid-bucketed spatial hash
+Date: 2026-08-05
+Scope: `mcp_server/mesh_analysis.py` `_snap_group_vertices` only (was L1021 pre-T2,
+drifted to **L1221** after T2's edits — located by grep, confirmed). Tests appended
+to `tests/test_decompose_faces_fix.py`.
+
+================================================================================
+0. BASELINE (unchanged code, before edit)
+================================================================================
+$ py -3.14 -m pytest tests/test_decompose_faces_fix.py -v
+> 39 passed in 1.12s
+All 39 pre-existing tests green on the unmodified tree. (T1/T2 committed.)
+
+================================================================================
+1. NEW IMPLEMENTATION  (mcp_server/mesh_analysis.py L1221-1290)
+================================================================================
+Signature / return type UNCHANGED:
+  def _snap_group_vertices(welded_verts, tri_indices, welded_tris, snap_tol)
+  -> Dict[int, int]  ({old_vertex_index: canonical_vertex_index})
+
+Body change (only the merge loop; guard, vi_set/vi_list build, _find with path
+compression, remap build, return are byte-identical to the pre-change version):
+
+    snap_sq = snap_tol * snap_tol
+    cells: Dict[Tuple[int, int, int], List[int]] = defaultdict(list)
+    for i in range(n):
+        p = coords[i]
+        cell = (int(math.floor(p[0] / snap_tol)),
+                int(math.floor(p[1] / snap_tol)),
+                int(math.floor(p[2] / snap_tol)))
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for u in cells.get((cell[0] + dx, cell[1] + dy,
+                                        cell[2] + dz), ()):
+                        diff = coords[i] - coords[u]
+                        if float(diff @ diff) < snap_sq:
+                            ri, rj = _find(u), _find(i)
+                            if ri != rj:
+                                if ri < rj:
+                                    parent[rj] = ri
+                                else:
+                                    parent[ri] = rj
+        cells[cell].append(i)
+
+Algorithm:
+- Cell size = snap_tol; cell key = (floor(x/snap_tol), floor(y/snap_tol),
+  floor(z/snap_tol))  [per plan spec — floor, NOT round() like _cluster_near_vertices].
+- Each vertex is inserted into its own cell only AFTER probing, so every candidate
+  u in a probed cell has u < i  (mirrors the old outer-i/inner-j>i ordering).
+- Probe = 27-cell neighbourhood (dx,dy,dz in {-1,0,1}) → every in-range pair found.
+- Union predicate unchanged: float((coords[i]-coords[u]) @ (coords[i]-coords[u]))
+  < snap_sq  (strict <, same float64 op order: high-index minus low-index, then
+  dx*dx+dy*dy+dz*dz).
+- Union rule unchanged: smaller root absorbs larger (parent[max(ri,rj)] = min(ri,rj)).
+- Determinism: defaultdict insertion order is stable; per-cell lists append in
+  ascending index order; canonical root = smallest vertex index per cluster
+  (order-independent, see §3).
+
+================================================================================
+2. TESTS APPENDED  (tests/test_decompose_faces_fix.py, +3 tests, +3 helpers)
+================================================================================
+Helpers (test-only; quadratic ref NOT in production):
+  _snap_group_vertices_quadratic_ref()  — verbatim copy of the pre-R-3 O(n^2)
+      all-pairs implementation (nested loops, same _find, same tie-break).
+  _snap_partition(remap, vi_list)       — canonical sorted-tuple cluster partition
+      (groups + sizes of GLOBAL vertex indices); the functional-equivalence contract.
+  _random_snap_group(n_verts, rng, tol, cluster_size=5) — clustered random planar
+      group: points within tol/3 of random centres (guaranteed intra-cluster merges,
+      random cell-boundary straddles) + 2 far anchors; deterministic rng seeds.
+
+  test_snap_spatial_hash_functionally_equivalent
+      - for n_verts in (10, 100, 500, 2000): new vs ref → same cluster partition.
+      - full pipeline: monkeypatch mesh_analysis._snap_group_vertices to the ref,
+        decompose seam-duplicated touching quads (offset 1.5e-4), restore, compare
+        -> same planar face count (1) and area.
+  test_snap_gap_barely_exceeding_tol_not_merged
+      - gap = tol+1e-9 -> NOT merged (new == ref == {}).
+      - gap = tol exactly (cell-boundary straddle) -> NOT merged (strict < snap_sq).
+      - gap = tol-1e-9 -> merged as {1: 0} (smaller index absorbs).
+  test_snap_spatial_hash_5000_vertices_fast
+      - 5000-vertex group, assert < 5 s; ACTUAL TIME 0.0907 s.
+
+================================================================================
+3. EQUIVALENCE PROOF (why the grid version cannot miss an in-range pair)
+================================================================================
+Lemma: for real a, b with |a - b| < T, |floor(a/T) - floor(b/T)| <= 1.
+Proof: let x = a/T, y = b/T, so |x - y| < 1. WLOG x <= y, y - x < 1. Then
+  floor(y) <= floor(x + 1) = floor(x) + 1   (floor monotone; floor(x+1)=floor(x)+1)
+and floor(y) >= floor(x) trivially, so 0 <= floor(y) - floor(x) <= 1. Symmetric
+for y < x. QED.
+
+Applied per axis: Euclidean distance < snap_tol  =>  each |coord diff| < snap_tol
+=> each axis key differs by at most 1  =>  the two vertices lie in the same or an
+adjacent cell, i.e. inside the 27-cell neighbourhood. Every pair the O(n^2) loop
+would merge is therefore examined; the distance predicate is the same bit-exact
+float64 arithmetic (coords[high] - coords[low], then diff @ diff), so the merge
+verdict for every pair is identical. Edge set equal  =>  connected components
+equal  =>  identical cluster partition.
+
+Canonical root: the "smaller root absorbs larger" rule preserves the invariant
+root(x) = min{indices in component of x} at every step, so the canonical vertex of
+each cluster is its smallest member index — independent of union order. Hence the
+output remap is deterministic and in fact BIT-IDENTICAL to the O(n^2) version
+(plan allowed canonical choice to differ; it does not).
+
+Boundary case (dist exactly = snap_tol): keys still differ by <= 1
+(floor(x+1) = floor(x)+1), so the pair is probed and rejected by the strict
+< snap_sq predicate — same as the old code. Covered by the new boundary test.
+
+================================================================================
+4. TEST RESULTS (target file)
+================================================================================
+$ py -3.14 -m pytest tests/test_decompose_faces_fix.py -v
+> 42 passed in 5.65s   (39 pre-existing + 3 new, all green)
+  test_snap_spatial_hash_functionally_equivalent      PASSED
+  test_snap_gap_barely_exceeding_tol_not_merged       PASSED
+  test_snap_spatial_hash_5000_vertices_fast           PASSED
+
+================================================================================
+5. PERFORMANCE
+================================================================================
+$ py -3.14 -c "… _random_snap_group(5000, rng, 0.01); time _snap_group_vertices"
+> 5000-vertex spatial-hash snap: 0.0907s, 4280 merged, n_verts=5002
+
+$ py -3.14 -c "… same input, _snap_group_vertices_quadratic_ref"
+> 5000-vertex O(n^2) ref snap: 24.078s, 4280 merged
+
+Speedup ≈ 265x (24.078s -> 0.0907s). Identical merge count (4280) on the same
+input corroborates bit-identical output at scale.
+
+================================================================================
+6. FULL HEADLESS SUITE
+================================================================================
+$ py -3.14 -m pytest tests/ -k "not live"
+> 146 passed, 18 deselected in 6.82s   — no regressions.
+
+================================================================================
+7. VERIFICATION SUMMARY
+================================================================================
+- lsp_diagnostics: unavailable (basedpyright not installed, previously declined).
+- py -3.14 -m py_compile mcp_server/mesh_analysis.py tests/test_decompose_faces_fix.py
+  -> OK.
+- Guardrails: scad_translator.py untouched; _group_planar_triangles/_weld_vertices/
+  _cluster_near_vertices/_coplanar_with_region untouched; function signature and
+  return shape unchanged; decompose_mesh_faces call site (L1669-1671) untouched;
+  no new dependencies (numpy + stdlib math/collections only); no git commands.
+- Behavior differences vs O(n^2): NONE observable. Remap is bit-identical (same
+  clusters, same canonical smallest-index vertices); the plan's allowance for a
+  differing canonical vertex is not exercised.

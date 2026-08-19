@@ -1,0 +1,186 @@
+================================================================================
+TASK 7 EVIDENCE LOG — MCP tool: structure_graph with DuckDB persistence
+Plan: .omo/plans/mesh-to-parametric.md Todo 7   (Wave W4 task 1 of 2)
+Date: 2026-08-05
+================================================================================
+
+----------------------------------------------------------------------
+1. BASELINE (on UNCHANGED code, before any edit)
+----------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result : 175 passed, 18 deselected in 13.22s
+Baseline recorded BEFORE any modification.
+
+----------------------------------------------------------------------
+2. FILES MODIFIED
+----------------------------------------------------------------------
+mcp_server/fusion_server.py  (ADD-only; existing tools untouched)
+  + import networkx as nx                    (top-level imports, L16)
+  + _load_mesh_graph()                       (L86)  — lazy importer mirroring
+                                               _load_mesh_analysis (L55-82):
+                                               try `from mcp_server import
+                                               mesh_graph`; fallback candidates
+                                               os.path.join(here, "mesh_graph.py")
+                                               and os.path.join(here, os.pardir,
+                                               "mcp_server", "mesh_graph.py") via
+                                               importlib.util.spec_from_file_location(
+                                               "fusionmcp_mesh_graph", path);
+                                               FileNotFoundError message mentions
+                                               "structure_graph".
+  + _GRAPH_EDGE_RELATIONS                     (L1473) — the 10 relation keys,
+                                               sorted (zero-count dict basis).
+  + _base_face_candidates(graph)              (L1481) — PRELIMINARY heuristic:
+                                               largest-area Face per component
+                                               (strict > so the first tie wins
+                                               deterministically). T9 replaces.
+  + structure_graph(mesh="0", units="cm")     (L1500) — @mcp.tool(), placed
+                                               directly after analyze_mesh.
+
+tests/test_structure_graph_tool.py  (NEW, 150 LOC, 5 tests)
+
+----------------------------------------------------------------------
+3. structure_graph FLOW (mirrors analyze_mesh error-envelope ordering)
+----------------------------------------------------------------------
+1. _cm_to_unit_factor(units) -> ValueError => {"error": <msg>}
+2. raw = _call("extract_mesh_data", {"mesh": mesh})
+3. Envelopes, in analyze_mesh's exact order:
+     raw.startswith("Error: ")            -> {"error": rest}
+     raw.startswith(("Cannot reach",
+                     "Unexpected error")) -> return raw verbatim
+     json.loads(raw) ValueError          -> return raw verbatim
+     "error" in data                     -> {"error": data["error"]}
+4. decompose_result = mesh_analysis.decompose_mesh_faces(nodes, indices)
+5. graph = mesh_graph.build_structure_graph(decompose_result)
+6. Algorithms:
+     articulation_points = sorted(nx.articulation_points(graph))
+     components = list(nx.connected_components(graph))
+     graph.graph["articulation_points"] = articulation_points
+     graph.graph["connected_components"] = [sorted(c) for c in components]
+     Face nodes in articulation_points -> is_articulation_point = True
+     (set BEFORE _persist_to_duckdb so the flag lands as a nodes column)
+7. conn = mesh_graph._persist_to_duckdb(graph, mesh)   # key = mesh param
+8. Summary computed AFTER persist so duckdb_table_schema reflects reality.
+9. json.dumps(summary, indent=2)
+10. Steps 4-8 wrapped: except Exception -> {"error": "structure graph failed: ..."}
+
+----------------------------------------------------------------------
+4. SUMMARY SHAPE (box fixture example — real end-to-end output)
+----------------------------------------------------------------------
+{
+  "mesh": "0", "units": "cm",
+  "component_count": 1,
+  "face_count": 6,
+  "edge_type_counts": {
+    "COMPONENT_OF": 0, "CONTAINS": 0, "COPLANAR": 0,
+    "EDGE_ADJACENT": 12, "EXTRUSION_ALIGNED": 3, "HAS_BASE": 6,
+    "PARALLEL": 0, "PERPENDICULAR": 0, "SAME_ORIENTATION": 0,
+    "VERTEX_TOUCH": 0},
+  "base_face_candidates": [{"component_id": 0, "face_id": "face:0",
+                            "area_cm2": 4.0}],
+  "has_warnings": false,
+  "duckdb_table_schema": {
+    "nodes": ["node_id", "label", "area_cm2", "centroid", "component_id",
+              "convexity", "curve_type", "face_count", "face_index",
+              "interior_angles", "is_articulation_point",
+              "is_base_candidate", "mean_curvature", "normal_x", "normal_y",
+              "normal_z", "plane_id", "triangle_count", "vertex_count"],
+    "edges": ["source", "target", "relation", "convexity",
+              "dihedral_angle_deg", "extrusion_direction", "orientation",
+              "shared_edge_length"]},
+  "query_example": "SELECT node_id, area_cm2 FROM nodes WHERE label='Face'
+                    ORDER BY area_cm2 DESC",
+  "articulation_points": [],
+  "connected_component_count": 1
+}
+Edge total = 12 + 3 + 6 = 21 (matches T6 box expectation).
+_all 10 edge relation keys present, zeros included, sorted._
+
+----------------------------------------------------------------------
+5. _call MOCK PATTERN (used in tests)
+----------------------------------------------------------------------
+- Load fusion_server.py headless with a stubbed mcp.server.fastmcp (the
+  established pattern from tests/test_mesh_convert.py), where _FastMCP.tool
+  records fn.__name__ into self._tools (lets tests assert the tool is in the
+  MCP tool list: assert "structure_graph" in fs.mcp._tools).
+- Mock the HTTP dispatcher, never hit it:
+      class _FakeCall:
+          def __init__(self, payload=None):
+              self.payload = payload if payload is not None else _box_payload()
+              self.calls = []
+          def __call__(self, command, params=None, timeout=30):
+              self.calls.append((command, params))
+              return self.payload
+      monkeypatch = pytest.MonkeyPatch()
+      monkeypatch.setattr(fs, "_call", fake)
+      ... finally: monkeypatch.undo()
+- _box_payload() = json.dumps({"mesh": "0", "nodes": <8 verts>,
+  "indices": <12 tris>, "normals": []}) — the canonical _box() fixture from
+  tests/test_mesh_graph.py.
+- Real pipeline runs through _load_mesh_analysis()/_load_mesh_graph() (the
+  repo root is on sys.path), so asserted counts are genuine end-to-end.
+- autouse fixture clears mesh_graph._GRAPH_DBS before/after each test
+  (same as tests/test_mesh_graph_db.py) so LRU state never leaks.
+
+----------------------------------------------------------------------
+6. NEW TEST RESULTS
+----------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/test_structure_graph_tool.py -v
+Result : 5 passed in 2.34s
+  test_structure_graph_summary_keys          PASSED  (all keys, face=6,
+                                                     comp=1, EDGE_ADJACENT=12,
+                                                     10 relation keys, schema
+                                                     section, base candidate
+                                                     face:0/4.0, _call fired
+                                                     once with mesh "0", tool
+                                                     registered in MCP list)
+  test_structure_graph_persists_duckdb       PASSED  (_get_graph_db("0")
+                                                     returns cached conn,
+                                                     nodes=7, edges=21,
+                                                     Face rows == face_count)
+  test_structure_graph_error_envelope        PASSED  ("Error: mesh not found"
+                                                     -> {"error": "mesh not
+                                                     found"}; invalid units
+                                                     -> error BEFORE _call)
+  test_structure_graph_articulation_points   PASSED  (key present, list type,
+                                                     box -> [] ; DB-flagged
+                                                     Face nodes == computed
+                                                     list == [])
+  test_structure_graph_rebuild_overwrites    PASSED  (2nd call replaces cached
+                                                     connection, no KeyError,
+                                                     counts still correct)
+
+----------------------------------------------------------------------
+7. FULL HEADLESS SUITE
+----------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result : 180 passed, 18 deselected in 13.04s
+         175 baseline + 5 new = 180. NO REGRESSIONS.
+
+----------------------------------------------------------------------
+8. ACCEPTANCE CRITERIA CHECK
+----------------------------------------------------------------------
+[OK] Tool appears in MCP tool list            (assert "structure_graph" in fs.mcp._tools)
+[OK] structure_graph(mesh="0") on valid mesh -> summary JSON with correct
+     component/face/edge counts               (1 / 6 / EDGE_ADJACENT=12)
+[OK] _GRAPH_DBS["0"] holds the connection after a tool call
+     (asserted in persists test + verified via script: 'in _GRAPH_DBS: True')
+[OK] summary includes base_face_candidates    (preliminary heuristic)
+[OK] Calling again overwrites the previous graph for the same mesh key
+     (rebuild test: conn2 is not conn1, _GRAPH_DBS["0"] is conn2)
+[OK] Invalid mesh -> {"error": "..."} structured JSON
+     (Error-envelope path + invalid-units path both covered)
+
+----------------------------------------------------------------------
+9. DEVIATIONS FROM PLAN SPEC
+----------------------------------------------------------------------
+None material. Notes:
+  - Added a 6th assertion set inside test_structure_graph_error_envelope for
+    the invalid-units ValueError path (no separate test function; plan
+    listed 5 tests, all present).
+  - `import networkx as nx` added at module top (networkx 3.6.1 is installed
+    and already imported at top of mesh_graph.py; keeps the nx.* algorithm
+    calls in the tool). The lazy requirement applies to _load_mesh_graph
+    (module load), which is preserved.
+  - structure_graph placed immediately after analyze_mesh (logical grouping
+    with the mesh-analysis tools).
+================================================================================

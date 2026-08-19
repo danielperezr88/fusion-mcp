@@ -1,0 +1,80 @@
+# T9 Evidence Log — Workstream Computation
+
+## Baseline Run
+```
+$ py -3.14 -m pytest tests/ -k "not live" -q
+189 passed, 18 deselected in 14.67s
+```
+
+## Functions Added (mcp_server/mesh_graph.py)
+
+`_score_base_faces(graph, decompose_result)` — L613-L743
+`_classify_units(graph, decompose_result)` — L746-L858
+`_build_dependency_order(graph)` — L861-L943
+
+Wiring at L568-L571 (inside `build_structure_graph`, after HAS_BASE edges, before return).
+
+## Design Decisions
+
+1. **DAG direction**: edges are `dependency → dependent` (base→others) so
+   `nx.topological_sort` naturally puts base first. This is the reverse of
+   the initial implementation (which had `dependent → dependency`).
+
+2. **Component base_score assignment**: Must happen before the early return
+   in `_score_base_faces` — otherwise a graph with no Face nodes silently
+   skips Component nodes, leaving them without `base_score`.
+
+3. **Box floor_facing**: The canonical-normal caveat means both top and
+   bottom faces have `normal_z > 0`, so only 2 of 6 faces get
+   `floor_facing=1`. Side faces have `normal_z=0`. The composite score
+   still works because the tie-break (area → face_index) picks face:0.
+
+4. **Fillet vs chamfer**: If any CurvedPatch `curve_type` contains "fillet"
+   (case-insensitive substring) → fillet, else chamfer.
+
+5. **50/50 tie-break**: When a component has equal numbers of convex and
+   concave EDGE_ADJACENT edges to base, the edge with the largest
+   `shared_edge_length` breaks the tie.
+
+6. **Duplicate edge removal**: The old `is_base_candidate` line in the
+   module docstring was updated to attribute T9 for this flag.
+
+## Test List (tests/test_workstream.py — 27 tests)
+
+1. `test_composite_score_formula` — hand-built graph, exact score verification
+2. `test_score_base_faces_empty_graph` — empty decompose → {}
+3. `test_score_base_faces_no_faces` — Component-only graph → base_score=0.0
+4. `test_score_base_faces_axis_alignment_empty` — unique normals → axis=0
+5. `test_score_base_faces_tie_break` — identical faces → face_index tie-break
+6. `test_score_base_faces_tie_break_by_area` — same score → area tie-break
+7. `test_classify_base_box` — real pipeline: component:0 → "base"
+8. `test_classify_protrusion` — convex EDGE_ADJACENT to base
+9. `test_classify_depression` — concave EDGE_ADJACENT to base
+10. `test_classify_hole` — CurvedPatch "cylindrical"
+11. `test_classify_hole_conical` — CurvedPatch "conical"
+12. `test_classify_fillet` — small curved, curve_type contains "fillet"
+13. `test_classify_chamfer` — small curved, no "fillet" substring
+14. `test_classify_freeform` — no edges to base, no curved patches
+15. `test_classify_empty_component_freeform` — no faces/edges → freeform
+16. `test_classify_fifty_fifty_tie_protrusion` — 50/50, larger length convex
+17. `test_classify_fifty_fifty_tie_depression` — 50/50, larger length concave
+18. `test_classify_hole_priority_over_fillet` — hole > fillet priority
+19. `test_dependency_order_box` — 1 component → order 0
+20. `test_dependency_order_multi_component` — base + protrusion + depression
+21. `test_dependency_order_fillets_last` — fillet comes after protrusion
+22. `test_dependency_order_empty_graph` — empty → []
+23. `test_cycle_detection_in_dependency_order` — 2 fillets, cycle detected
+24. `test_box_through_full_pipeline` — decompose→build→persist→SQL queries
+25. `test_box_pipeline_column_presence` — T9 columns appear in DuckDB
+26. `test_box_pipeline_is_base_candidate_per_component` — exactly 1 per component
+27. `test_box_pipeline_no_regression_on_determinism` — two builds match
+
+## Other Files Modified
+- `tests/test_mesh_graph.py` L130: `is_base_candidate is False` → `in (True, False)`
+
+## Final Test Run
+```
+$ py -3.14 -m pytest tests/ -k "not live" -q
+216 passed, 18 deselected in 14.93s
+```
+Zero regressions (baseline 189 + 27 new = 216).

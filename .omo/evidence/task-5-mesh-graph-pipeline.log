@@ -1,0 +1,196 @@
+================================================================================
+Task 5 (T5): NetworkX property-graph builder over decompose output
+Wave W2 - mcp_server/mesh_graph.py (NEW FILE)
+Date: 2026-08-05
+================================================================================
+
+--------------------------------------------------------------------------------
+1. BASELINE (unchanged code)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result: 149 passed, 18 deselected in 7.65s
+No failures, no errors, no skips.  networkx 3.6.1 importable (py -3.14).
+
+--------------------------------------------------------------------------------
+2. FILES MODIFIED / CREATED
+--------------------------------------------------------------------------------
+- mcp_server/mesh_graph.py        (NEW, 482 lines)
+- mcp_server/requirements.txt     (+2 deps, 10 lines)
+- tests/test_mesh_graph.py        (NEW, 320 lines, 20 tests)
+
+Guardrails respected: scad_translator.py, mesh_analysis.py, fusion_server.py
+NOT touched; no numpy/trimesh in the builder (pure math); no persistence
+(T6), no MCP tools (T7/T8), no workstream scoring (T9); no git commands.
+
+--------------------------------------------------------------------------------
+3. MODULE STRUCTURE (mcp_server/mesh_graph.py)
+--------------------------------------------------------------------------------
+L124-125   _COS_1_DEG / _COS_89_DEG thresholds
+L132-146   _r6 / _dot3 / _norm3 / _dist3  (pure math)
+L148       _canonical_normal      flip so dominant component is positive
+L155       _plane_offset          n . v
+L159       _polygon_area_3d       Newell's method (sign-free), rounded 6dp
+L174       _face_convexity        "planar"(tri)/"concave"(any angle>180)/"convex"
+L182       _edge_convexity        "coplanar"(|dot|>=1-1e-6)/"concave"(sum>360)/"convex"
+L190       _find_shared_edge      first CONSECUTIVE shared pair of poly_a also an
+                                 edge of poly_b -> (u,w,i_a,j_b,FORWARD/REVERSED)
+L211       _bounding_extent       max per-axis span over all face+hull vertices
+L230       _is_perpendicular      |n1.n2| <= cos(89deg)
+L234       _adjacency_edges       sorted EDGE_ADJACENT pairs induced by a face set
+L241       _connected_via_adjacency  True iff EDGE_ADJACENT subgraph is connected
+L250       _add_extrusion_aligned best-effort EXTRUSION_ALIGNED (replaces geometric)
+L316       build_structure_graph  SOLE PUBLIC BUILDER (see section 4)
+L399       physical edges: EDGE_ADJACENT / VERTEX_TOUCH
+L431       geometric relations: COPLANAR > SAME_ORIENTATION > PARALLEL > PERPENDICULAR
+L454       CONTAINS: Face->Hole, Face->CurvedPatch
+L463       EXTRUSION_ALIGNED (best-effort)
+L468       COMPONENT_OF (CurvedPatch->Component only) / HAS_BASE (every face)
+L480       _plane_id              "nx|ny|nz|offset" rounded 6dp
+
+--------------------------------------------------------------------------------
+4. GRAPH SCHEMA (as built)
+--------------------------------------------------------------------------------
+Nodes (4 types):
+  face:N        label "Face"  attrs: node_id, label, component_id, face_index,
+                plane_id, area_cm2, normal_x/y/z, centroid (3-list),
+                vertex_count, triangle_count, interior_angles (list),
+                convexity, is_base_candidate=False, is_articulation_point=False,
+                mean_curvature=0.0, curve_type="planar"
+  hole:N        label "Hole"  attrs: node_id, label, containing_face_id,
+                area_cm2 (Newell), is_filled=False
+  curved:N      label "CurvedPatch" attrs: node_id, label, component_id,
+                triangle_count, curve_type (surface_type), area_cm2
+  component:N   label "Component" attrs: node_id, label, component_id,
+                face_count
+
+Edges (10 types, one edge per node pair - nx.Graph):
+  EDGE_ADJACENT     Face-Face real polygon edge; built from vertex->face map,
+                    REQUIRES >=1 shared pair CONSECUTIVE in BOTH ordered
+                    polygons (wrap-around allowed); attrs dihedral_angle_deg,
+                    convexity, shared_edge_length, orientation (FWD/REV).
+  VERTEX_TOUCH      Face-Face sharing >=1 vertex, no consecutive pair; attrs
+                    shared_vertex, shared_vertex_count.
+  COPLANAR          |n1.n2|>=cos(1deg) AND |off1-off2|<=1e-4*extent; normal_dot.
+  SAME_ORIENTATION  canonical normals equal, NOT coplanar; normal_x/y/z.
+  PARALLEL          |n1.n2|>=cos(1deg), offsets differ, canonical !=; normal_dot.
+  PERPENDICULAR     |n1.n2|<=cos(89deg); normal_dot.
+  CONTAINS          Face->Hole and Face->CurvedPatch (smallest face_index).
+  EXTRUSION_ALIGNED Face-Face both in one extrusion structure; see section 5.
+  COMPONENT_OF      CurvedPatch -> Component ONLY.
+  HAS_BASE          Component -> Face, emitted for EVERY face.
+
+Graph attrs: G.graph["has_warnings"], G.graph["components_detected"].
+
+Precedence (documented in module docstring): physical (EDGE_ADJACENT,
+VERTEX_TOUCH) > geometric; COPLANAR > SAME_ORIENTATION > PARALLEL >
+PERPENDICULAR; EXTRUSION_ALIGNED replaces geometric relations on marked
+pairs, never physical ones.
+
+--------------------------------------------------------------------------------
+5. EDGE_ADJACENT IMPLEMENTATION (L399-425)
+--------------------------------------------------------------------------------
+- vertex_to_faces: rounded-6dp vertex tuple -> set of face ids.
+- candidates: every face pair sharing >=1 vertex (sorted tuples).
+- _find_shared_edge walks face a's polygon edges; a pair is EDGE_ADJACENT iff
+  both endpoints appear in b's vertex map and are consecutive in b (either
+  direction, wrap-around allowed).  Diagonal-only pairs fail -> VERTEX_TOUCH.
+- dihedral = acos(clamped n1.n2) deg; convexity via _edge_convexity;
+  shared_edge_length = span first..last shared vertex on a; orientation
+  FORWARD when b traverses in a's direction.
+
+--------------------------------------------------------------------------------
+6. EXTRUSION_ALIGNED (L250-306, L463-466) - OUTCOME ON BOX
+--------------------------------------------------------------------------------
+Per component: plane families (plane_id groups).  A pair of families is
+eligible when parallel (|n1.n2|>=cos(1deg)), distinct offsets, both
+internally EDGE_ADJACENT-connected.  Side walls = faces EDGE_ADJACENT to a
+face of each family AND perpendicular to it; require >=3 side walls with an
+EDGE_ADJACENT cycle (nx.cycle_basis, longest wins).  marked = cycle + both
+families; emit EXTRUSION_ALIGNED for every marked pair.
+
+IMPORTANT FIX (this session): the initial version SKIPPED pairs that already
+had an edge (G.has_edge -> continue), so a closed box emitted ZERO
+EXTRUSION_ALIGNED edges (top/bottom already carried SAME_ORIENTATION).  The
+pair loop now REMOVES an existing geometric relation (COPLANAR/
+SAME_ORIENTATION/PARALLEL/PERPENDICULAR) and re-adds EXTRUSION_ALIGNED;
+physical relations (EDGE_ADJACENT/VERTEX_TOUCH) are never replaced.
+
+Box fixture (2x2x2 cube): EXTRUSION_ALIGNED = 3 edges:
+  face:0-face:1 (top-bottom), face:2-face:4, face:3-face:5 (the three
+  parallel non-adjacent pairs).  The 4 side-wall-per-face pairs correctly
+  remain EDGE_ADJACENT (closed box: every side face physically touches both
+  caps, physical wins).  extrusion_direction = [0,0,1].
+
+Also fixed: the face->component COMPONENT_OF edge (L468) was removed.
+In an undirected Graph one pair holds ONE edge; HAS_BASE (emitted for every
+face) already occupies the face-component pair, so the COMPONENT_OF write
+was silently overwritten dead code.  COMPONENT_OF is now CurvedPatch->
+Component only; Face->Component membership rides HAS_BASE (documented).
+
+--------------------------------------------------------------------------------
+7. NEW TESTS (tests/test_mesh_graph.py, 20 tests)
+--------------------------------------------------------------------------------
+Node types:  Face (box attrs), Hole (frame), CurvedPatch (degenerate-tris
+  fixture), Component (face_count).
+Edge types:  EDGE_ADJACENT (box, 12, dihedral=90 convexity len=2),
+  VERTEX_TOUCH (2 quads sharing only origin), COPLANAR (separated coplanar
+  quads, dot=1.0), SAME_ORIENTATION (parallel quads z=0/z=2),
+  PARALLEL (0.8deg tilt, dot=cos(0.8deg)), PERPENDICULAR (xy+ yz quads,
+  dot=0.0), CONTAINS (frame face->hole AND curved face->patch),
+  EXTRUSION_ALIGNED (box, 3 edges), COMPONENT_OF (curved->component),
+  HAS_BASE (box, 6 edges).
+Graph:       one-edge-per-pair, JSON-serialisable attrs, graph-level attrs,
+  determinism (two builds -> to_dict_of_dicts + node attrs + G.graph equal),
+  empty-decompose ({ } -> 0 nodes/edges, has_warnings False).
+
+Fixture design note: all fixtures run through the REAL decompose pipeline
+(decompose_mesh_faces -> build_structure_graph), never hand-built dicts.
+
+--------------------------------------------------------------------------------
+8. TEST RESULTS
+--------------------------------------------------------------------------------
+Target file:
+  py -3.14 -m pytest tests/test_mesh_graph.py -v
+  -> 20 passed in 1.19s
+
+Full headless suite:
+  py -3.14 -m pytest tests/ -k "not live"
+  -> 169 passed, 18 deselected in 8.68s   (149 baseline + 20 new; no regressions)
+
+Syntax check: py -3.14 -m py_compile mcp_server/mesh_graph.py
+              tests/test_mesh_graph.py  -> OK
+LSP (basedpyright) not installed (user previously declined); py_compile +
+full pytest suite used as the gate instead.
+
+--------------------------------------------------------------------------------
+9. requirements.txt (final, 10 lines)
+--------------------------------------------------------------------------------
+mcp>=1.0.0
+requests>=2.31.0
+openscad-lalr-parser>=1.1.0
+openscad-evaluator>=1.1.0
+manifold3d>=3.5.2
+numpy>=1.24.0
+trimesh>=4.0.0
+scipy>=1.10.0
+networkx>=3.6.1
+duckdb>=1.5.5
+
+--------------------------------------------------------------------------------
+10. DEVIATIONS FROM PLAN
+--------------------------------------------------------------------------------
+1. Face->Component COMPONENT_OF edge removed (see section 6) - the plan's
+   "COMPONENT_OF for every face+patch" collides with "HAS_BASE for every
+   face" in an undirected Graph.  HAS_BASE carries membership.
+2. EXTRUSION_ALIGNED replaces geometric relations rather than only adding
+   where absent; required so a closed box (the plan's example fixture)
+   actually produces the edge.
+3. EXTRUSION_ALIGNED box count is 3, not the naive 12: in a closed box the
+   marked side-wall pairs already hold physical EDGE_ADJACENT edges, which
+   precedence keeps.
+4. duckdb pinned >=1.5.5 (T6 sink dependency, installed with networkx even
+   though T6 is a later task) - keeps the single pip install complete.
+
+================================================================================
+END OF EVIDENCE LOG
+================================================================================

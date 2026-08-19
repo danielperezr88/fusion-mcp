@@ -1,0 +1,167 @@
+================================================================================
+Task 4 (R-4): Report residual non-manifold edges as per-face warnings
+Wave W2 - mcp_server/mesh_analysis.py
+Date: 2026-08-05
+================================================================================
+
+--------------------------------------------------------------------------------
+1. BASELINE (unchanged code)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/test_decompose_faces_fix.py -v
+Result: 42 passed in 5.17s
+No failures, no errors, no skips.
+
+--------------------------------------------------------------------------------
+2. FILES MODIFIED
+--------------------------------------------------------------------------------
+- mcp_server/mesh_analysis.py
+- tests/test_decompose_faces_fix.py
+
+Guardrails respected: scad_translator.py untouched; _weld_vertices,
+_snap_group_vertices, _group_planar_triangles, _cluster_near_vertices,
+_coplanar_with_region, _detect_quantization_step untouched; loop-chaining /
+pinch-splitting logic untouched (only read-only observation after the fact);
+no existing dict keys removed/renamed; no new dependencies.
+
+--------------------------------------------------------------------------------
+3. WARNING-COMPUTATION CODE (added, read-only observation)
+--------------------------------------------------------------------------------
+New helper (L1393-1408):
+
+    def _count_residual_loop_edges(loops, residual_pairs):
+        """Count occurrences of residual non-manifold edges in vertex-index loops.
+        A *residual edge* is an undirected vertex pair whose directed-edge
+        cancellation count |net| is not 1 - the seam was too wide for snapping
+        to close, leaving an unbalanced boundary edge (R-4).  Each occurrence
+        of such an edge among the consecutive vertex pairs of *loops* is
+        counted once.  Returns 0 when no residual pairs are given.
+        """
+        if not residual_pairs or not loops:
+            return 0
+        count = 0
+        for loop in loops:
+            m = len(loop)
+            for i in range(m):
+                if frozenset((loop[i], loop[(i + 1) % m])) in residual_pairs:
+                    count += 1
+        return count
+
+_boundary_loops (L1413-1416) gains an optional kwarg residual_out=None
+(additive; return shape UNCHANGED - direct tests depend on the loops list).
+
+Inside the boundary-extraction loop (L1484-1511), per directed edge pair:
+
+    net = fwd - rev
+    if net != 1 and net != -1:
+        # |net| >= 2: the edge survived cancellation unbalanced - a
+        # residual non-manifold boundary edge (seam too wide to close).
+        residual_pairs.add(frozenset((a, b)))
+        pre_pinch_residual_count += abs(net)
+
+    loops = _split_pinch_loops(_chain_directed_edges(boundary))
+    if residual_out is not None:
+        residual_out.update({
+            "residual_pairs": residual_pairs,
+            "pre_pinch_residual_count": pre_pinch_residual_count,
+            "post_pinch_residual_count":
+                _count_residual_loop_edges(loops, residual_pairs),
+        })
+
+decompose_mesh_faces:
+  - L1698: has_warnings = False (init before group loop)
+  - L1711/1716: residual_out: Dict = {} passed into _boundary_loops call
+  - L1804-1814: per face, compute post-pinch count from the face's FINAL
+    loops (outer + holes vi) and build the warnings list; set has_warnings.
+  - L1838: "has_warnings": has_warnings in the success return dict
+  - L1665, L1845: "has_warnings": False in empty-input and error fallbacks
+
+Per-face construction:
+
+    face_loops_vi = [outer["vi"]] + [h["vi"] for h in hole_list]
+    unpaired_edges = _count_residual_loop_edges(
+        face_loops_vi, residual_out.get("residual_pairs", set()))
+    warnings = ([{"type": "unpaired_boundary_edges", "count": unpaired_edges}]
+                if unpaired_edges > 0 else [])
+    if warnings:
+        has_warnings = True
+    ... "warnings": warnings, ... appended to each planar face dict
+
+--------------------------------------------------------------------------------
+4. PRE/POST-PINCH COUNTS ON THE WARNING FIXTURE
+--------------------------------------------------------------------------------
+Fixture: 0.1 cm offset seam (offset = 0.1), 3 coplanar quads:
+  quad1 (0,0)-(4,0)-(4,4)-(0,4); quad2 (4,0)-(6,0)-(6,4)-(4,4);
+  quad3 (4.1,0)-(6,0)-(6,4)-(4.1,4)   [quad3 is quad2 duplicated at x+0.1]
+
+Pipeline numbers (extent=6.0, quant_step=0.0, eps=6e-7, snap_tol=0.003):
+  - weld: quads 2&3 share REAL vertices (6,0),(6,4) -> welded to v4,v5;
+    seam vertices (4,·) and (4.1,·) stay distinct (0.1 >> eps).
+  - snap remap = {} -> the 0.1 seam does NOT snap closed (0.1 > snap_tol).
+  - grouping: all 6 triangles in ONE planar group (quads 2&3 connected via
+    welded far vertices, quad1 connected to quad2).
+  - _boundary_loops residual_out:
+      residual_pairs = {{4,5},{4,6},{5,7}}   (net = 2 each)
+      pre_pinch_residual_count  = 6   (2 copies each: (4,5)x2,(6,4)x2,(5,7)x2)
+      post_pinch_residual_count = 6   (group-level, over the 2 pinch-split loops)
+    Why: T-junction splitting (tjunc_tol=snap_tol) splits quad2's seam edges
+    at the (4.1,·) fragment vertices, and the duplicated far edge (6,0)-(6,4)
+    plus the split sub-edges each survive cancellation 2:0 -> net=2.
+  - decompose per-face: the inner loop [6,4,5,7] merges into the outer via
+    _merge_loop_into_outer (shared residual edges cancel), leaving the merged
+    face loop with 3 residual occurrences -> warning count = 3.
+  - result: has_warnings=True, 1 face, area 24.0, warnings
+    [{"type": "unpaired_boundary_edges", "count": 3}].
+
+Fixture iteration note: a plain 0.1 gap (NO shared far vertices) produces
+TWO separate planar groups / two clean faces with NO residuals - the offset
+seam must keep the duplicated fragment connected to the base fragment via
+shared (welded) vertices for the edge imbalance to materialise. The chosen
+fixture does exactly that and the warning is genuinely exercised (remap={}
+proves the seam did not snap).
+
+--------------------------------------------------------------------------------
+5. NEW TESTS (tests/test_decompose_faces_fix.py, appended at end)
+--------------------------------------------------------------------------------
+  test_clean_mesh_no_warnings
+      - _two_touching_coplanar_quads() (perfect seam match)
+      - asserts has_warnings is False and every face warnings == []
+  test_offset_seam_emits_unpaired_warning
+      - the 0.1 offset-seam fixture above
+      - asserts has_warnings is True and >= 1 face with
+        {"type":"unpaired_boundary_edges","count":N}, N > 0
+  test_warnings_additive_contract
+      - asserts _REQUIRED_FACE_KEYS.issubset(face.keys()), "warnings" in
+        face (list), "has_warnings" in result (bool), and the legacy
+        components_detected/planar_faces/curved_patches keys still present
+
+--------------------------------------------------------------------------------
+6. TEST RESULTS
+--------------------------------------------------------------------------------
+Target file:
+  py -3.14 -m pytest tests/test_decompose_faces_fix.py -v
+  -> 45 passed in 5.28s   (42 existing + 3 new)
+
+Full headless suite:
+  py -3.14 -m pytest tests/ -k "not live"
+  -> 149 passed, 18 deselected in 6.30s   (no regressions)
+
+Syntax check: py -3.14 -m py_compile mcp_server/mesh_analysis.py
+             tests/test_decompose_faces_fix.py  -> OK
+LSP (basedpyright) not installed (user previously declined); py_compile +
+full pytest suite used as the gate instead.
+
+--------------------------------------------------------------------------------
+7. T14 (R-8) CONSUMER NOTE
+--------------------------------------------------------------------------------
+Total residual edge count is the SUM of per-face warning counts:
+    total = sum(face["warnings"][0]["count"]
+                for face in result["planar_faces"] if face["warnings"])
+Compare against >5% of triangle edges (sum of face["triangle_count"]*3
+over planar faces, or the input triangle count) to decide
+strategy_fallback_suggested = "organic". Per-group pre/post-pinch counts are
+additionally available on _boundary_loops' residual_out dict, and
+has_warnings True means total > 0.
+
+================================================================================
+END OF EVIDENCE LOG
+================================================================================

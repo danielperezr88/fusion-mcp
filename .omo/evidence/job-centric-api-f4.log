@@ -1,0 +1,108 @@
+
+============================================================
+F4 SCOPE FIDELITY - FINAL VERIFICATION WAVE
+Date: 2026-08-10T10:23:48
+============================================================
+
+VERDICT: APPROVE
+
+== 1. Modified files (git status --short) ==
+Modified (tracked): 8 total
+  mcp_server/fusion_server.py          ALLOWED (conversion file)
+  mcp_server/jobs.py                   ALLOWED (pool + vocabulary)
+  tests/test_job_tools.py              ALLOWED (test)
+  tests/test_jobs.py                   ALLOWED (test - T1 pool tests)
+  tests/test_mesh_to_brep_live.py      ALLOWED (test; job_id="sync" added)
+  tests/test_structure_graph_tool.py   ALLOWED (test; job_id="sync" + guard msg)
+  README.md                            ALLOWED (docs)
+  .omo/plans/mesh-graph-pipeline.md    PRE-EXISTING unrelated change (verified
+                                       below; NOT scope creep)
+
+  => NO file outside the 8-file allowed set is modified.
+
+== 2. test_import_live.py ==
+  ZERO changes (absent from git status modified list). Confirmed.
+
+== 3. Untracked files ==
+  ALL untracked (??) under .omo/ and .sisyphus/ (evidence logs, notepads,
+  plans, boulder state, transcripts). NO stray files in mcp_server/, tests/,
+  or repo root.
+
+== 4. FusionMCP.py / requirements.txt ==
+  git diff FusionMCP.py => NO DIFF (byte-identical to HEAD).
+  git diff mcp_server/requirements.txt => NO DIFF (no new deps).
+
+== 5. git diff mcp_server/fusion_server.py (hunk-by-hunk) ==
+  Contains ONLY:
+  (a) _job_status/_launch_job rework: queued+position branch; complete/failed
+      vocabulary; _launch_job now reads actual status via get_job.
+  (b) 10 tool conversions, each -@mcp.tool() def X(...) -> +def _X_sync(...)
+      + +@mcp.tool() def X(..., job_id="") wrapper:
+      1. export_as_stl   6. import_mesh_file
+      2. export_as_step  7. analyze_mesh
+      3. export_as_3mf   8. structure_graph
+      4. export_as_f3d   9. slice_mesh
+      5. import_cad_file 10. compare_mesh_to_brep
+  (c) _call timeout=330 on the 6 import/export sync bodies
+      (export_as_stl/step/3mf/f3d, import_cad_file, import_mesh_file).
+  (d) query_structure_graph guard message (async-aware text).
+  (e) _review_reconstruction_sync internal call-site switched from the
+      now-job-centric compare_mesh_to_brep to _compare_mesh_to_brep_sync
+      (+ comment) - REQUIRED consistency follow-through of conversion (b).
+  NO other function appears in any hunk. capture_screenshot, import_sketch_file,
+  import_mesh_data and all other tools appear only as unchanged context.
+  No new top-level imports.
+
+== 6. _call() byte-identical check ==
+  def _call(command: str, params: dict = None, timeout: int = 60) -> str:
+  at L297-310. First diff hunk starts at L316 (_job_status) -> L297-315
+  untouched. BYTE-IDENTICAL to HEAD.
+
+== 7. git diff mcp_server/jobs.py ==
+  Pool + vocabulary only per T1 spec:
+  - import queue (stdlib), MAX_CONCURRENT = 4, _QUEUE, _WORKERS_STARTED,
+    _ensure_workers(), _worker_loop(), _compute_position()
+  - launch_job enqueues (status "queued") instead of direct spawn
+  - get_job adds "position" key for queued records
+  - status vocabulary: queued / running / complete / failed
+  - Record keys UNCHANGED: status/result/error/created/finished
+  - launch_job/get_job names STABLE
+  No unrelated edits. (Minor: trailing newline lost at EOF - cosmetic only.)
+
+== 8. Grep guardrail checks ==
+  threading.Thread in mcp_server/ -> ONLY jobs.py:50 (daemon worker pool).
+  persist|cancel|retry in jobs.py -> ONLY docstring negation L16-17
+    ("no cancellation, no persistence across restarts, no retry").
+  job_id: str = "" count in fusion_server.py -> 15 (multi-line aware scan).
+  Tool names with job_id: export_as_stl, export_as_step, export_as_3mf,
+    export_as_f3d, import_cad_file, import_mesh_file, run_scad, update_scad_body,
+    analyze_mesh, structure_graph, slice_mesh, compare_mesh_to_brep,
+    annotate_mesh_parameters, review_reconstruction, create_from_scad.
+  = 10 NEW conversions + 5 pre-existing = 15/15. capture_screenshot and
+  query_structure_graph correctly remain synchronous (no job_id).
+
+== 9. README L92-122 cross-check vs code ==
+  - README 15 tool names == 15 signatures found in fusion_server.py. PASS.
+  - MAX_CONCURRENT = 4 == mcp_server/jobs.py L35. PASS.
+  - Launch envelope {"job_id", "status": "queued"/"running"} == _launch_job. PASS.
+  - Poll statuses queued(+position)/running/complete(+result)/failed(+error)/
+    not_found == _job_status L313-327. PASS.
+  - query_structure_graph stays synchronous claim == code (no job_id). PASS.
+
+== 10. .omo/plans/mesh-graph-pipeline.md diff ==
+  Content: mesh_analysis tolerance model (ToleranceConfig), plane-fit residual
+  grouping, voxel/SDF fallback detection, presets. ZERO job/queue/worker/status
+  vocabulary. Unrelated to job-centric-api plan. PRE-EXISTING. Not scope creep.
+
+== 11. Test diffs ==
+  tests/test_jobs.py: vocabulary rename (complete/failed/queued) + 3 new
+    deterministic pool tests (saturation/position/drain-to-failed). T1 scope.
+  tests/test_job_tools.py: vocabulary updates + structure_graph launch-poll-
+    complete test + pool saturation test. In scope.
+  tests/test_structure_graph_tool.py: job_id="sync" on direct tool calls +
+    guard-message text update. In scope.
+  tests/test_mesh_to_brep_live.py: job_id="sync" added to 2 calls. In scope.
+
+CONCLUSION: Every changed file is inside the allowed set; no out-of-scope
+code changes; no new deps; record keys and public names stable; _call
+untouched; FusionMCP.py untouched; README matches reality. VERDICT: APPROVE.

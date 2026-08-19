@@ -1,0 +1,37 @@
+﻿F3 ATOMIC COMMIT EVIDENCE - fix-foundational-tool-rough-edges
+=============================================================
+Date: 2026-08-10
+
+COMMIT LANDED:
+  d7acf5a  fix: foundational tool rough edges from live reconstruction demo
+  (on master, NEW_COMMITS_ONLY - no amend/force/branch)
+
+FILES (19 total = 6 code/test + 13 fix-* evidence logs):
+  FusionMCP.py                       +131  (compare UV sampling, exec scope)
+  mcp_server/fusion_server.py        +28   (timeout 30->60 + explicit 120s)
+  mcp_server/workflow_guide.py       +10   (vision-subagent notes steps 4/8)
+  mcp_server/mesh_slicer.py          +15   (thin-band fixes A+B)
+  mcp_server/mesh_graph.py           +34   (F3 Failure-QA: DuckDB persist
+                                            executemany -> temp-CSV read_csv)
+  tests/test_mesh_slicer.py          +93   (T7 regression tests)
+  .omo/evidence/fix-*.log x13              (T1-T7 + F1 + F2 + F3 evidence)
+  19 files changed, 1031 insertions(+), 20 deletions(-)
+
+PRE-COMMIT WORKTREE CHECK: PASS
+  Only modified tracked files were the 6 in-scope + .omo/plans/mesh-graph-
+  pipeline.md (pre-existing, DIFFERENT plan - explicitly NOT staged per F1).
+
+POST-COMMIT git status: CLEAN for this plan's scope
+  git log --oneline -1 = d7acf5a (subject exact)
+  git show --stat HEAD = exactly the 19 mandated paths
+  Remaining status entries: .omo/plans/mesh-graph-pipeline.md (pre-existing
+  mod, untouched) + untracked plan tooling (.omo/boulder.json, notepads,
+  drafts, other plans' evidence, .sisyphus) - none committed.
+
+F3 VERDICT: ALL ACCEPTANCE CRITERIA MET
+  1. compare_mesh_to_brep max 0.979808 <= 1.5       PASS
+  2. execute_script nested functions work           PASS
+  3. structure_graph completes without timeout      PASS
+     (persist fix live-verified after MCP server restart, PID 23360)
+  4. git log --oneline -1 shows atomic commit       PASS (d7acf5a)
+  5. git status clean (excluding .omo/notepads)     PASS

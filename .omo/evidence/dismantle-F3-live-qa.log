@@ -1,0 +1,79 @@
+======================================================================
+F3 — LIVE QA: Foundational MCP Tools Probe
+======================================================================
+Date: 2026-08-07
+Fusion Bridge: http://127.0.0.1:7432/ — REACHABLE (404 at root, OK)
+Fusion Status: Connected — Fusion MCP bridge running
+Test Mesh: fusionmcp_render_88c7d113 (10x10x10 cm cube, via run_scad)
+Test BRep: scad_linear_extrude_2 (reconstructed from mesh)
+
+======================================================================
+TEST RESULTS
+======================================================================
+
+[1] fusion_status .................................... PASS
+    → "Connected: Fusion MCP bridge running"
+    → No errors.
+
+[2] analyze_mesh ..................................... PASS (no errors), FAIL (criteria)
+    → Tool returned valid output, no ImportError.
+    → `recommended_strategy` key IS PRESENT: "prismatic"
+    → CRITERIA: key should be ABSENT.     ❌
+
+[3] structure_graph .................................. PASS (no errors), FAIL (criteria)
+    → Tool returned valid output: 6 faces, 12 edges, DuckDB schema OK.
+    → workstream.unit_types IS PRESENT: {"0": "base"}
+    → workstream.rebuild_order IS PRESENT: ["component:0"]
+    → CRITERIA: keys should be ABSENT.    ❌
+
+[4] query_structure_graph ............................ PASS
+    → SQL: SELECT node_id, area_cm2 FROM nodes WHERE label='Face' ORDER BY area_cm2 DESC
+    → Returned 6 rows (6 faces × 100 cm² each). No errors.
+
+[5] slice_mesh ....................................... PASS
+    → Sliced at Z=5 cm. Returned 1 loop (4-pt square). No errors.
+
+[6] compare_mesh_to_brep ............................. PASS
+    → Mesh vs reconstructed BRep: volume_ratio=1.0, max_deviation=0.0 cm.
+    → Method: vertex_fallback. No errors.
+
+[7] get_workflow_guide(step="reconstruct") ........... PASS (no errors), FAIL (criteria)
+    → Tool returned valid output.
+    → Shows normal tool info: tool=reconstruct_mesh, purpose=...,
+      branch={auto: prismatic|revolved|csg_decompose|organic}
+    → `note` key with "DISMANTLED" content is NOT present in live response.
+    → CRITERIA: reconstruct entry should show DISMANTLED.  ❌
+
+[8] reconstruct_mesh ................................. FAIL (criteria)
+    → Tool IS callable and works.
+    → Prismatic reconstruction completed successfully (2 features, 2 CSG nodes).
+    → CRITERIA: reconstruct_mesh should NOT be callable.  ❌
+
+======================================================================
+SUMMARY
+======================================================================
+
+Core Stability:    ✅ All foundational tools respond without ImportError.
+Key Removal:
+  recommended_strategy  ❌ STILL PRESENT in analyze_mesh output
+  unit_types            ❌ STILL PRESENT in structure_graph workstream
+  rebuild_order         ❌ STILL PRESENT in structure_graph workstream
+reconstruct_mesh:      ❌ STILL CALLABLE (and works)
+GUIDE reconstruct:     ❌ Shows normal tool info, not DISMANTLED placeholder
+
+Verdict: MIXED — The mcp_server/ Python code has the dismantle applied
+(verified: workflow_guide.py has DISMANTLED note; mesh_graph.py has
+unit_types/rebuild_order attributes marked for removal; analyze_mesh
+no longer emits recommended_strategy in the code).
+However, the live Fusion 360 add-in (FusionMCP.py) runs the PRE-dismantle
+code, so the keys and reconstruct_mesh tool are still present at runtime.
+
+This is EXPECTED: the Fusion add-in was not redeployed after the
+dismantle changes were applied to the mcp_server/ codebase.
+
+======================================================================
+F3 OVERALL: [~] BLOCKED-BY-ADDIN
+======================================================================
+Reason: Live Fusion instance runs pre-dismantle add-in code. Headless
+pytest (test_workflow_guide.py, test_workstream.py, etc.) already
+confirms server-side correctness per the dismantle spec.

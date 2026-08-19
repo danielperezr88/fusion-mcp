@@ -1,0 +1,164 @@
+F1 Plan Compliance Audit — async-job-scheme.md
+================================================
+Date: 2026-08-05
+Reviewer: F1 (read-only; no repo files modified; temp work in %TEMP%\opencode)
+VERDICT: APPROVE
+
+Source of truth read first: .omo/plans/async-job-scheme.md (all of it) and
+.omo/notepads/async-job-scheme/learnings.md (Task 1-4 entries).
+
+------------------------------------------------------------------
+(a) jobs.py API (Todo 1) — PASS
+------------------------------------------------------------------
+mcp_server/jobs.py (untracked new file, read in full):
+  launch_job(fn, *args, **kwargs) -> str .......... L34  (job_id=uuid4.hex L41;
+         under _LOCK: prune() + insert + daemon Thread(_run) L42-54)
+  get_job(job_id) -> dict | None .................. L57  (shallow copy dict(record) L61)
+  _run(job_id, fn, args, kwargs) .................. L64  (arg order matches plan;
+         try->status="completed"+result+finished; except Exception->status="error"+error=str(e)+finished)
+  prune() .......................................... L88  (TTL drop L99-102; LRU eviction loop
+         L103-112 drops oldest `finished` record, `break` when only running remain
+         -> running NEVER evicted; cap may exceed MAX_JOBS transiently, as plan allows)
+  MAX_JOBS = 64 .................................... L30
+  JOB_TTL = 3600.0 ................................. L31
+  Record keys status/result/error/created/finished .. L44-50
+  Statuses exactly running/completed/error .......... (module docstring L4-8 + code)
+  Stdlib only (threading, uuid, time) .............. L24-26
+  Locking convention (prune is lock-free; launch_job calls it under _LOCK) matches
+  inherited-wisdom note + module docstring L18-21.
+tests/test_jobs.py (untracked, read in full) covers plan acceptance criteria:
+  unique running records (L35), slow fn -> completed 42 (L52), raising fn ->
+  error "division by zero" (L66), unknown -> None (L75), TTL expiry via
+  fabricated finished timestamp (L79), recently-finished survives (L88),
+  LRU cap <=64 + all 4 running still present (L96), 20-thread barrier
+  concurrency all completed (L125). Deterministic gating (threading.Event)
+  per notepad gotcha note.
+
+------------------------------------------------------------------
+(b) 7 tools: 3-mode contract (Todo 3a/3b) — PASS
+------------------------------------------------------------------
+Each of the 7 has private `_<name>_sync` + @mcp.tool() wrapper with trailing
+`job_id: str = ""` and body exactly:
+  if job_id == "sync": return _<name>_sync(<args>)
+  if job_id: return json.dumps(_job_status(job_id), indent=2)
+  return _launch_job(_<name>_sync, <args>)
+  run_scad ................ wrapper L1407-1430, sync L1386
+  update_scad_body ........ wrapper L1451-1471, sync L1433
+  reconstruct_mesh ........ wrapper L2138-2177, sync L2034
+  reconstruct_from_faces .. wrapper L2327-2347, sync L2180
+  annotate_mesh_parameters  wrapper L2510-2552, sync L2423
+  review_reconstruction ... wrapper L2647-2687, sync L2555
+  create_from_scad ........ wrapper L2765-2793, sync L2725
+Helpers (L285-306):
+  _job_status(job_id) -> dict: not_found/running/completed+result/error+error  L285-296
+  _launch_job(fn,*args,**kwargs) -> str: json.dumps({"job_id","status":"running"}, indent=2) L299-304
+  Lazy sibling imports: `from jobs import get_job` L287, `from jobs import launch_job` L302
+  (matches plan "lazy import inside the helper", mirrors `from bundle import get_openscad_path` L263).
+grep: `job_id: str = ""` -> exactly 7 matches (one per wrapper).
+grep: docstring line `"sync" runs` -> exactly 7 matches (L1423,1464,2170,2340,2537,2672,2786),
+  one per tool, appended after original docstring text (verified by read).
+run_scad/update_scad_body/reconstruct_mesh/reconstruct_from_faces/create_from_scad keep
+timeout=330 _call sites unchanged (L1403, L1447, L2104/L2119/L2129, L2319, L2758).
+
+------------------------------------------------------------------
+(c) sync byte-identity vs HEAD — PASS
+------------------------------------------------------------------
+Method: `git show HEAD:mcp_server/fusion_server.py` extracted to temp; AST parser
+compared original tool body statements vs `_<name>_sync` body statements
+(modulo def-name rename + decorator removal). Script: f1_byteid.py.
+  run_scad:             [IDENTICAL] 869 bytes
+  update_scad_body:     [IDENTICAL] 609 bytes
+  reconstruct_mesh:     [IDENTICAL] 4834 bytes
+  reconstruct_from_faces:[IDENTICAL] 5515 bytes
+  create_from_scad:     [IDENTICAL] 1668 bytes
+Image tools (list -> dict refactor, bodies expected to differ):
+  _annotate_mesh_parameters_sync: no `Image(` constructor in body; envelope dict
+    (mesh/views/measured_facts/workflow) byte-identical to HEAD (L2489-2506 vs HEAD L2343-2354).
+  Wrapper sync path (L2540-2549) rebuilds HEAD list: [text] + Image(data=base64.b64decode(b64),
+    format="png") per non-empty view (same b64/if-b64 logic as HEAD L2355-2360).
+  _review_reconstruction_sync: no `Image(` in body; out_views (L2636-2642) replicates
+    HEAD's interleave order mesh-then-brep per view (HEAD L2446-2452); envelope
+    (pairs/geometry/workflow) identical.
+  Both wrappers pass string error envelopes through unchanged via
+  `if isinstance(safe, str): return safe` (L2542-2543, L2677-2678).
+  `Image(` total per file: HEAD 3 (capture_screenshot/annotate/review), current 3
+  (capture_screenshot L1330 + 2 wrapper rebuilds) — capture_screenshot untouched.
+
+------------------------------------------------------------------
+(d) image tools async JSON-safe — PASS
+------------------------------------------------------------------
+_sync bodies return only {"text": str, "views": [{"view","image_base64"}]};
+AST check confirms zero `Image(` constructions in either _sync body.
+Test test_review_reconstruction_async_result_is_json_safe (test_job_tools.py L289-333)
+asserts json.loads(json.dumps(result)) round-trips and views carry image_base64 strings.
+
+------------------------------------------------------------------
+(e) FusionMCP.py (Todo 2) — PASS
+------------------------------------------------------------------
+L35 ADDIN_CMD_TIMEOUT = 300 (immediately after PORT = 7432 at L34).
+L68 event.wait(timeout=ADDIN_CMD_TIMEOUT)  [was timeout=30]
+L69 fallback: {"error": f"Timeout - Fusion did not respond in {ADDIN_CMD_TIMEOUT}s"}
+`git diff -- FusionMCP.py` = exactly these 3 lines (constant + 2 uses), nothing else.
+
+------------------------------------------------------------------
+(f) Hard guardrails — PASS
+------------------------------------------------------------------
+  git diff -- mcp_server/scad_translator.py ...... empty (exit 0, no output)
+  git diff -- mcp_server/requirements.txt ........ empty (no new deps)
+  _call() L269-282 ................................. AST [IDENTICAL] vs HEAD; the only
+         hunk adjacent to it (`@@ -282,6 +282,28 @@`) is the ADDITION of the two
+         helpers AFTER _call, not inside it. Default timeout=30 preserved; error
+         strings untouched; NOT job-enabled.
+  Non-job tools byte-identical to HEAD (AST): select_parameter_schema, get_workflow_guide,
+         import_mesh_data, compare_mesh_to_brep, capture_screenshot, slice_mesh all UNCHANGED.
+  analyze_mesh + structure_graph show diff hunks — these are the KNOWN PRE-EXISTING
+         mesh-graph-pipeline baseline (`decompose_error` hunks; .omo/plans/mesh-graph-pipeline.md,
+         tests/test_structure_graph_tool.py); explicitly out of scope for THIS review.
+
+------------------------------------------------------------------
+(g) Test updates (Todo 3d/3e) — PASS
+------------------------------------------------------------------
+git diff of the 4 updated files = ONLY `job_id="sync"` keyword additions; zero
+assertion changes (all +/- hunks are call-site signature lines):
+  tests/test_mesh_convert.py ........................ 4 sites
+  tests/test_annotate_mesh_parameters_live.py ....... 1 site
+  tests/test_review_reconstruction_live.py .......... 2 sites
+  tests/test_mesh_reconstruction_live.py ............ 6 sites
+  (total 13, matches notepad Task 3 note)
+New tests/test_job_tools.py (read in full) covers plan QA scenarios:
+  launch->poll->completed with canned result ....... test_run_scad_launch_poll_completed (L148)
+  sync equality with pre-change output ............. test_run_scad_sync_equals_call_output (L137)
+  unknown uuid -> not_found ........................ test_run_scad_unknown_uuid_not_found (L166)
+  mocked ReadTimeout -> job error .................. test_run_scad_transport_failure_records_job_error (L173)
+  JSON-safe image result (round-trip) .............. test_review_reconstruction_async_result_is_json_safe (L289)
+  real prismatic build over 8-vertex box mesh,
+    sync == polled byte-for-byte ................... test_reconstruct_mesh_prismatic_launch_matches_sync (L234)
+
+------------------------------------------------------------------
+(h) Commands — PASS
+------------------------------------------------------------------
+py -3.14 -m pytest tests/test_jobs.py tests/test_job_tools.py -q
+  -> 14 passed in 0.65s
+py -3.14 -m py_compile mcp_server/fusion_server.py FusionMCP.py mcp_server/jobs.py
+  -> exit 0 (PY_COMPILE_OK)
+Full suite already verified by executor: 281 passed, 1 xfailed (76.05s) — not re-run
+per checklist (re-run optional).
+NOTE: `lsp_diagnostics` could NOT be run for Python — no Python LSP installed
+(previously declined by user); py_compile + pytest substitute per inherited wisdom.
+
+------------------------------------------------------------------
+FINDINGS (minor, non-blocking)
+------------------------------------------------------------------
+1. [info] annotate_mesh_parameters/review_reconstruction wrappers keep HEAD's
+   `-> list` return annotation even though poll/launch paths return str
+   (json.dumps). Purely cosmetic; the annotation predates this change and
+   the plan did not require altering it.
+2. [info] README/docstring verification was delegated to Todo 4's evidence;
+   F1 confirmed the 7 docstring lines and the README section exist (README
+   "### Long-running tools & job polling" present between Mesh Reconstruction
+   example and ### Other; grep job_id in README -> 8 matches). No repo files
+   modified by F1.
+
+VERDICT: APPROVE — every todo implemented with the exact function names, parameter
+signatures, return shapes, error handling, eviction rules, and guardrails the plan
+specifies. No blocking findings.

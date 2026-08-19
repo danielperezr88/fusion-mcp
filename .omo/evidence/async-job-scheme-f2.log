@@ -1,0 +1,197 @@
+F2 - Code quality review - async-job-scheme
+============================================
+Reviewer: F2 | Date: 2026-08-05 | Read-only review (no files modified)
+Plan: .omo/plans/async-job-scheme.md
+Notepad read first: .omo/notepads/async-job-scheme/learnings.md (task-1/test-design gotchas + task-3 details confirmed)
+
+VERDICT: APPROVE
+----------------
+No blocking defects. All checklist items (a)-(g) verified. Minor observations
+recorded below are informational; none changes the verdict.
+
+============================================
+(a) jobs.py thread-safety  [mcp_server/jobs.py]
+============================================
+- All mutations under _LOCK: launch insert + Thread.start() (L42-53), _run
+  status/result/error/finished writes (L73-85), prune deletions (L99-111,
+  caller holds _LOCK per module docstring L18-21). get_job reads + shallow
+  copy under lock (L59-61). PASS.
+- No TOCTOU on record reads: get_job returns dict(record) taken atomically
+  under _LOCK; _run writes status/result/finished inside one lock block, so a
+  copy never observes a mid-transition status. PASS.
+- Insert-before-start invariant: _JOBS[job_id] = {...} (L44) precedes
+  Thread.start() (L51-53), both inside the lock. _run's first statement is the
+  fn call (no lock), and its status write needs _LOCK, which launch_job holds
+  until after start(). => the record ALWAYS exists before any status write;
+  no window where a fast job completes before launch_job returns the id.
+  (The record may legitimately already be "completed" at first poll - the
+  contract only promises the id is valid, not that status==running.)
+  PASS.
+- Exception capture: _run wraps fn in try/except Exception (L70-79); error
+  recorded under lock; threads never die silently. Note: BaseException (e.g.
+  KeyboardInterrupt/SystemExit) is NOT caught - a worker raising those would
+  die with no record. In a server process this is a non-issue; theoretical
+  only. PASS with note.
+- Daemon threads: Thread(..., daemon=True) (L52). No process-hang. PASS.
+
+Races considered (none blocking):
+  R1 (theoretical): get_job's shallow copy aliases the mutable result object
+  stored in _JOBS; a hypothetical consumer mutating result would corrupt the
+  registry. Current consumers only json.dumps the copy. No fix needed.
+  R2 (accepted design): cap can exceed 64 while >64 jobs run concurrently
+  (running never evicted); a client spamming launches spawns unbounded
+  concurrent threads. Explicitly documented plan trade-off (todo 1 spec
+  "NEVER evict running"; plan acceptance criterion allows transient over-cap).
+  Not a deviation.
+  R3 (accepted): prune() is lock-free by convention; direct calls are safe
+  only when no other thread mutates _JOBS. All in-repo call sites satisfy
+  this (launch_job under lock; test calls after _run threads finished or
+  while the 4 running jobs are Event-blocked, i.e. not touching _LOCK).
+  PASS.
+
+============================================
+(b) Eviction correctness  [jobs.py L88-112]
+============================================
+- TTL: drops only records with finished is not None and now-finished>JOB_TTL
+  (L101). Running records (finished=None) never TTL-dropped. PASS.
+- LRU cap: while len>MAX_JOBS, collects only finished records; if none, break
+  (running-only, cap may transiently exceed 64 - plan-accepted); else evicts
+  min by finished timestamp (L103-111). Running NEVER evicted. PASS.
+- Call-site consistency: launch_job calls prune() under _LOCK (L43) matching
+  the documented lock-free prune convention. PASS.
+
+============================================
+(c) 7 tool wrappers  [mcp_server/fusion_server.py]
+============================================
+All 7 wrappers verified individually (file:line):
+- run_scad L1407-1430; update_scad_body L1451-1471; reconstruct_mesh
+  L2138-2177; reconstruct_from_faces L2327-2347; annotate_mesh_parameters
+  L2510-2552; review_reconstruction L2647-2687; create_from_scad L2765-2793.
+- job_id is the LAST parameter in every wrapper. PASS (no positional
+  breakage: all pre-existing params keep their positions).
+- Positional args passed to _<name>_sync match each sync signature order
+  (sync signatures byte-identical to HEAD def lines):
+  run_scad(code,params,quality,units) / update_scad_body(body,params,code) /
+  reconstruct_mesh(mesh,strategy,units,params) /
+  reconstruct_from_faces(mesh,units) /
+  annotate(mesh,views,units) / review(mesh,body,views) /
+  create_from_scad(code,units,fallback_to_mesh). PASS.
+- Branch order: `if job_id == "sync"` is FIRST in all 7, then `if job_id:`
+  poll, then launch. "sync" (truthy) never hits the poll branch. PASS.
+- Docstrings: original text preserved verbatim + exactly one appended job_id
+  line per tool (grep count = 7 occurrences, lines 1423/1464/2170/2340/2537/
+  2672/2786). PASS.
+- str-returning tools pass error envelopes unchanged: the sync body IS the
+  original _call body (git diff shows only the def-line rename + wrapper
+  insertion; bodies byte-identical). PASS.
+- _job_status (L285-296) returns the 4 envelopes; _launch_job (L299-304)
+  returns the launch envelope. Both lazy `from jobs import ...` matching the
+  file's existing lazy sibling-import style. PASS.
+
+============================================
+(d) Image-tool two-phase refactor
+============================================
+annotate_mesh_parameters:
+- _sync (L2423-2506) builds {"text": str, "views":[{view,image_base64}]} -
+  NO Image objects; image_base64 are base64 strings. PASS.
+- Wrapper sync path (L2540-2549) reconstructs [text] + Image(b64decode, png)
+  per view in the SAME order as HEAD (dict comprehension preserves
+  cap["views"] order; verified against git show HEAD L2355-2360). Byte
+  identical. PASS.
+- Error passthrough: _sync returns str for all error paths ("Cannot reach",
+  "Unexpected error", json.dumps({"error":...})); wrapper's
+  isinstance(safe, str) returns them as-is, NOT wrapped in a dict. Matches
+  HEAD behavior. PASS.
+review_reconstruction:
+- _sync (L2555-2643) identical structure; the out_views loop (L2636-2642)
+  replicates HEAD's nested loop `for v in views: for cap in (mesh_cap,
+  brep_cap): for vv in cap.get("views", [])` (HEAD L2446-2453) with the same
+  filter (vv["view"]==v and image_base64 truthy) => mesh/brep interleaved per
+  view in the same order. Wrapper (L2675-2684) rebuilds Image objects in that
+  same order. Byte identical to HEAD. PASS.
+- isinstance(safe, str) error passthrough correct (same reasoning). PASS.
+- The "geometry" compare error is embedded in the envelope (as in HEAD), not
+  a top-level failure. PASS.
+
+============================================
+(e) Test quality
+============================================
+tests/test_job_tools.py (6 tests):
+- Mocked transport faithful to _call's contract: _CommandCall returns
+  pre-serialized json.dumps(data, indent=2) strings keyed on command name,
+  exactly what _call returns on success; raise_on models transport
+  exceptions. Strict: unexpected command => AssertionError. PASS.
+- Polling: _poll_tool uses 10.0s deadline with 0.02s sleeps - generous, no
+  flaky timing asserts. PASS.
+- Real-behavior asserts (not tautological): sync==expected byte-equality
+  proves the wrapper does not wrap/re-encode _call output (would fail if the
+  sync branch json.dumps'd the string again); reconstruct prismatic test runs
+  the REAL mesh_csg.build_csg_tree over a box mesh and asserts async result ==
+  sync result byte-for-byte; review test asserts json.loads(json.dumps(r))==r
+  round-trip (would raise TypeError if any Image object were present) +
+  text/views shape + base64 strings. PASS.
+- Minor coverage gap (non-blocking): no test asserts the timeout=330 reaches
+  the mocked _call (the fakes accept and ignore timeout).
+tests/test_jobs.py (8 tests):
+- LRU test (L96-122): threading.Event gates make "66 finish later, 4 stay
+  running" fully deterministic (launch order cannot evict just-finished jobs
+  because the fast gate blocks completion during the launch loop). PASS.
+- TTL test (L79-85): fabricates finished = now - JOB_TTL - 5, deterministic.
+  PASS.
+- 20-thread barrier test (L125-148): real concurrency, 21-barrier, 20 unique
+  ids all completed. PASS.
+- Nondeterminism audit: none found. test_slow_fn_completes_with_result's
+  immediate `status=="running"` assert after launch relies on the 0.05s sleep
+  making completion impossible at that instant (assert is also redundant:
+  launch guarantees the initial status is running). Informational only.
+- All polling uses deadline loops with 0.01-0.02s sleeps, 5s+ bounds. PASS.
+
+============================================
+(f) Regression risk
+============================================
+- 4 updated test files diffed via git diff: PURE job_id="sync" additions,
+  ZERO assertion changes (test_mesh_convert.py 4 sites, test_annotate_
+  mesh_parameters_live.py 1, test_review_reconstruction_live.py 2,
+  test_mesh_reconstruction_live.py 6). PASS.
+- Grep of the 7 tool names across tests/ (8 files matched):
+  * test_workflow_guide.py: string references + inspect.getsource only, no
+    calls. PASS.
+  * test_mesh_to_brep_live.py: comment only. PASS.
+  * test_openscad_live.py: local create_from_scad helper drives FusionMCP
+    handlers directly; zero _FS./fs. server-module calls. PASS.
+  * test_mesh_convert.py, test_annotate/test_review/test_mesh_reconstruction
+    _live.py: every synchronous caller passes job_id="sync". PASS.
+  * test_job_tools.py: sync callers pass job_id="sync"; launch callers omit
+    it intentionally and poll via the job_id kwarg. PASS.
+- No other test calls the 7 tools synchronously without job_id="sync". PASS.
+
+============================================
+(g) Test run
+============================================
+py -3.14 -m pytest tests/test_jobs.py tests/test_job_tools.py -q
+=> 14 passed in 0.61s (8 + 6, matches expected 14). PASS.
+Full suite per task-3 evidence: 281 passed, 1 xfailed (baseline 275+1).
+LSP: basedpyright not installed (user declined); static review + passing
+tests used as the verification signal instead.
+
+============================================
+Non-blocking observations (informational)
+============================================
+O1. annotate_mesh_parameters / review_reconstruction keep `-> list` return
+    annotations, but the launch/poll paths return str envelopes; annotation
+    is now only accurate for the sync-success path. Cosmetic; FastMCP
+    serializes a str return as text content regardless of the annotation.
+O2. jobs.py catches Exception, not BaseException; a worker raising
+    KeyboardInterrupt/SystemExit would vanish without a record (theoretical
+    in a server process).
+O3. get_job shallow copy aliases the stored mutable result (theoretical
+    mutation vector; no current consumer mutates).
+O4. No test asserts the 330s timeout propagation to _call for the str tools.
+O5. Polling a completed image job re-serializes the full base64 payload on
+    every poll until TTL; clients are expected to stop polling after
+    completed. Minor.
+
+Pre-existing mesh-graph-pipeline baseline (analyze_mesh/structure_graph hunks
+in fusion_server.py diff, test_structure_graph_tool.py, README 2 bullets,
+.omo/plans/mesh-graph-pipeline.md) NOT attributed to this plan. Confirmed
+absent from the 7-wrapper refactor diff.

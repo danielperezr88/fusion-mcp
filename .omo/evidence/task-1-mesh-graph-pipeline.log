@@ -1,0 +1,104 @@
+================================================================================
+TASK 1 (R-1): Quantization-step-derived weld/snap tolerances
+File: C:\Users\danie\fusion-mcp
+Date: 2026-08-05
+================================================================================
+
+1. BASELINE (unchanged code)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/test_decompose_faces_fix.py -v
+Result:  30 passed in 1.30s
+Summary: all 30 pre-existing tests green on baseline commit 5fbd729.
+
+2. CHANGE SUMMARY
+--------------------------------------------------------------------------------
+mcp_server/mesh_analysis.py (only file modified; scad_translator.py untouched):
+  * imports: added `Counter` to `from collections import ...` (L36).
+  * NEW function `_detect_quantization_step(node_list)` at L880-910.
+  * `decompose_mesh_faces` (L1445-1449): weld eps now
+        quant_step = _detect_quantization_step(node_list)
+        eps = max(max(1e-9, 1e-7 * extent), 3 * quant_step)
+  * `decompose_mesh_faces` (L1477): snap_tol now
+        snap_tol = max(1e-5, max(5e-4 * extent, 2 * quant_step))
+  * `analyze_mesh_data` (L1664-1669): weld call uses same formula
+        max(max(1e-9, 1e-7 * extent), 3 * quant_step)
+  * No other lines touched; additive-only (no output-dict keys removed/renamed).
+
+3. FUNCTION ADDED
+--------------------------------------------------------------------------------
+    _QUANT_REL_CAP = 1e-3   # quantization steps are tiny relative to extent
+
+    def _detect_quantization_step(node_list):
+        extent = _max_extent_nodes(node_list)
+        cap = max(1e-4, _QUANT_REL_CAP * extent)
+        steps = Counter()
+        for k in range(3):
+            vals = sorted({p[k] for p in node_list})
+            for a, b in zip(vals, vals[1:]):
+                d = round(abs(b - a), 9)
+                if 0 < d <= cap:
+                    steps[d] += 1
+        if not steps or max(steps.values()) < 2:
+            return 0.0
+        return max(steps, key=lambda d: (steps[d], -d))
+
+  Design notes:
+  * Histogram of nonzero absolute deltas between sorted unique coords per axis,
+    rounded to 9 decimals for stable bucketing (float noise collapses to the
+    true grid step). Deterministic: Counter + sorted iteration + explicit
+    (count, -step) tie-break.
+  * "small step" cap = max(1e-4, 1e-3*extent): separates exporter rounding
+    (absolute 1e-6..1e-4) from real geometry deltas (integer / fractional
+    coordinate spacing), so unit-cube and integer-coordinate fixtures are
+    untouched (quant_step = 0.0 -> exact old behavior).
+  * Recurrence guard `max(steps.values()) >= 2`: a genuine global grid recurs;
+    a one-off seam gap does not. Keeps all seam/snap fixtures bit-identical.
+  * Uniform / no-nonzero-difference input -> 0.0 (safe default). The caller
+    formulas then guarantee eps >= max(1e-9, 1e-7*extent) and snap_tol >= 1e-5
+    via the max() floors; no division, no empty-histogram crash.
+
+4. NEW TESTS (appended to tests/test_decompose_faces_fix.py)
+--------------------------------------------------------------------------------
+  test_detect_quantization_step_6decimal       -> 1e-6 step detected
+  test_detect_quantization_step_4decimal       -> 1e-4 step detected
+  test_detect_quantization_step_uniform        -> all-identical coords -> 0.0,
+                                                  floors still satisfied
+  test_detect_quantization_step_integer_coords -> integer geometry deltas -> 0.0
+                                                  (fallback preserved)
+  test_weld_with_quant_step                    -> quant-derived eps merges
+                                                  displayMesh dups + a hub written
+                                                  at 3 adjacent 1e-6 grid points
+                                                  (5 welded vertices, expected
+                                                  tri remap; quant term is binder)
+  test_decompose_faces_quantized_quad          -> end-to-end: 1 face, area 0.5,
+                                                  vertex_count 4, no holes
+
+5. TARGETED TEST RESULT
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/test_decompose_faces_fix.py -v
+Result:  36 passed in 1.46s  (30 baseline + 6 new, all green)
+
+6. FULL HEADLESS SUITE RESULT
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -v -k "not live"
+Result:  140 passed, 18 deselected in 6.01s
+Note:    18 deselected = *_live.py tests (require Fusion 360 / bridge).
+
+7. VERIFICATION
+--------------------------------------------------------------------------------
+  py_compile mcp_server\mesh_analysis.py tests\test_decompose_faces_fix.py: OK
+  basedpyright LSP not installed (user previously declined) - no LSP run.
+  scad_translator.py: NOT touched (hard guardrail respected).
+  _group_planar_triangles / _snap_group_vertices: NOT touched (other tasks).
+
+8. DEVIATIONS FROM PLAN SPEC
+--------------------------------------------------------------------------------
+  None in behavior. One test-fixture iteration during development: the first
+  `test_weld_with_quant_step` fixture placed a duplicate corner on a diagonal
+  at a 1e-6 offset that straddled a weld-cell boundary (the rounded-key grid
+  weld cannot merge points across a cell boundary even within eps); the fixture
+  was redesigned as a quad fan whose hub vertex is written at three adjacent
+  1e-6-grid points that share one weld cell, which is the honest displayMesh /
+  6-decimal-STL seam pattern. The tolerance formulas themselves are exactly as
+  specified (k=3 weld, k=2 snap_tol).
+================================================================================

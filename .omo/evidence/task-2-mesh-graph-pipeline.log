@@ -1,0 +1,137 @@
+================================================================================
+TASK 2 (R-2) — Connectivity-constrained grouping (primary), global as fallback
+Date: 2026-08-05
+Scope: mcp_server/mesh_analysis.py — _group_planar_triangles only (+2 new
+       helpers); _snap_group_vertices / _weld_vertices untouched (T3/T1 scope).
+       New tests appended to tests/test_decompose_faces_fix.py.
+================================================================================
+
+1. BASELINE (UNCHANGED CODE)
+---------------------------
+Command: py -3.14 -m pytest tests/test_decompose_faces_fix.py -v
+Result:  36 passed in 1.44s  (all green — T1's 6 R-1 tests included)
+
+2. DESIGN INVESTIGATION — WHY STRICT WELDED-EDGE ADJACENCY IS NOT ENOUGH
+-----------------------------------------------------------------------
+The plan says to build face adjacency from the welded triangle soup f_arr.
+Diagnostic on the seam fixture (test_seam_duplicated_touching_quads_merge):
+
+  offset = 1.5e-4; extent = 4.0; quant_step = 0.0 (single-occurrence delta
+  ignored by the recurrence guard); eps = max(1e-9, 1e-7*extent) = 4e-7.
+  Welded tris: [(0,1,2),(0,2,3),(4,5,6),(4,6,7)] — quad1 = verts {0,1,2,3},
+  quad2 = verts {4,5,6,7}. NO shared edge: the 1.5e-4 seam gap is NOT bridged
+  by welding (4e-7 << 1.5e-4) and is NOT bridged by the quant-derived eps
+  (quant_step=0 there).
+
+  The separated fixture welds to the SAME shape. So welded f_arr alone cannot
+  distinguish the seam case (MUST merge, test asserts 1 face) from the
+  genuinely-separated case (MUST NOT merge, tests assert 2 faces). A strict
+  welded-edge map would split the seam tests => BUG (previously-merged
+  touching case now splits).
+
+  RESOLUTION: cluster vertices within edge_adj_tol = max(1e-5, 5e-4*extent)
+  — the extent-based floor of snap_tol, i.e. the exact criterion under which
+  _snap_group_vertices would merge the seam vertices anyway. Two edges whose
+  endpoints are nearer than that are the same seam edge. Verifies against the
+  whole fixture family:
+    1.5e-4 seam   <= 2e-3  (extent 4)   -> merged
+    2e-4  seam   <= 1.5e-3 (extent 3)   -> merged
+    1.5e-4 seam   <= 3e-3  (extent 6)   -> merged
+    2.0   gap    >> 2e-3  (extent 4)   -> NOT merged
+    vertex-only touch: no edge pair within tol -> NOT merged
+
+3. IMPLEMENTATION
+-----------------
+mcp_server/mesh_analysis.py (line numbers post-edit):
+
+  _coplanar_with_region(face_plane, region_plane, cos_tol, offset_tol)  L958
+    The isolated coplanarity predicate (same cos_tol + offset_tol as the
+    global first-match path). T12/R-7 swap point for the running plane-fit.
+
+  _cluster_near_vertices(v_arr, tol)                                     L974
+    Deterministic grid-based union-find vertex clustering: each vertex
+    probes the 27 cells around its round(coord/tol) key, unions with earlier
+    vertices within tol. Returns {vertex_index: cluster_id}.
+
+  _group_planar_triangles(v_arr, f_arr, tri_normals, angle_tol_deg, extent) L1032
+    Structure:
+      a) Per-face canonical (normal, offset) plane + area, in index order;
+         degenerate faces -> None plane (skipped exactly as before).
+      b) O(F) edge -> face-list map over the welded soup keyed by CLUSTERED
+         vertex ids; symmetric adjacency sets per face.
+      c) CONNECTIVITY FIRST PASS (primary): seeds = all valid faces sorted by
+         (-area, ti); for each unassigned seed, BFS region-growing over
+         sorted(adj[cur]) neighbors that pass _coplanar_with_region against
+         the SEED's plane. Deterministic: largest-area seed (smallest index
+         on tie), sorted neighbor traversal, region tri_indices sorted.
+      d) GLOBAL FALLBACK (unchanged first-match path): remaining unassigned
+         faces matched only against fallback-created groups (never against
+         connectivity groups — that would re-merge separated coplanar
+         patches and defeat R-2). Predicate, group dict shape and skip of
+         degenerate faces are byte-identical to the pre-change code.
+    Group dict shape unchanged: {"normal", "offset", "tri_indices"}.
+
+  Function signature unchanged. No new dependencies (numpy + stdlib only).
+
+4. NEW TESTS (tests/test_decompose_faces_fix.py, appended, R-2 section)
+----------------------------------------------------------------------
+  test_connectivity_constrained_touching_coplanar       - 1 group (edge-touch)
+  test_connectivity_constrained_separated_coplanar      - 2 groups (NEW behavior)
+  test_connectivity_constrained_non_coplanar_adjacent   - 2 groups (different
+                                                            normals, edge-adj)
+
+  Group-level assertions via a _planar_groups_of() helper that replicates the
+  caller's weld -> vectorise -> tri_normals prefix and calls
+  _group_planar_triangles directly (the public API hides group structure).
+
+5. TARGET FILE RESULT
+---------------------
+Command: py -3.14 -m pytest tests/test_decompose_faces_fix.py -v
+Result:  39 passed in 1.13s  (36 existing + 3 new)
+
+  All 7 critical tests pass unchanged:
+    test_coplanar_merge_touching_one_face            PASSED
+    test_coplanar_separated_two_faces                PASSED
+    test_edge_connected_strips_one_face              PASSED
+    test_seam_duplicated_touching_quads_merge        PASSED
+    test_seam_snap_no_spurious_hole                  PASSED
+    test_genuinely_separated_quads_no_hole_no_merge  PASSED
+    test_unit_cube_face_decomposition                PASSED
+
+6. FULL HEADLESS SUITE RESULT
+-----------------------------
+Command: py -3.14 -m pytest tests/ -v -k "not live"
+Result:  143 passed, 18 deselected in 2.44s  (0 failures, 0 regressions)
+
+7. BEHAVIOR CHANGES vs BASELINE
+------------------------------
+  * Group STRUCTURE for coplanar-but-disconnected patches changed from ONE
+    group (global first-match, 2 loops -> 2 faces) to TWO groups (1 loop
+    each -> 2 faces). Face-level output (count, area, vertex count, holes)
+    is identical for every existing test — the R-2 purpose is to prevent the
+    group-level over-merge that the boundary-loop phase then has to untangle.
+  * Verified no previously-merged touching case now splits: touching,
+    edge-connected-strips, frame-with-hole, seam (1.5e-4 / 2e-4), stacked
+    strips, cube, box and quantized-fan fixtures all still merge exactly as
+    before (one face, correct area).
+
+8. LOC / QUALITY GATES
+----------------------
+  _coplanar_with_region       L958-973   pure 13 lines
+  _cluster_near_vertices      L974-1031  pure 51 lines
+  _group_planar_triangles     L1032-1158 pure 108 lines
+  (all under the 250 pure-LOC ceiling; file total 1931 lines is pre-existing
+   — plan mandates surgical edits, no whole-file rewrite)
+  basedpyright LSP not installed on this machine (previously declined);
+  verification gate = full pytest headless suite above.
+
+9. GUARDRAILS RESPECTED
+-----------------------
+  scad_translator.py:        untouched
+  _snap_group_vertices:      untouched (T3 scope)
+  _weld_vertices:            untouched (T1 scope)
+  function signature:        unchanged
+  group dict keys:           unchanged (additive only, none added)
+  dependencies:              none added
+  git:                       no git commands run
+================================================================================

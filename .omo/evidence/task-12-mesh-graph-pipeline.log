@@ -1,0 +1,119 @@
+================================================================================
+Task 12 (R-6+R-7): Unified tolerance model + plane-fit residual in grouping
+Wave W7 - mcp_server/mesh_analysis.py
+Date: 2026-08-05
+================================================================================
+
+--------------------------------------------------------------------------------
+1. BASELINE (unchanged code)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result: 229 passed, 18 deselected in 14.12s
+No failures, no errors.
+
+--------------------------------------------------------------------------------
+2. FILES MODIFIED
+--------------------------------------------------------------------------------
+- mcp_server/mesh_analysis.py  (R-6+R-7 implementation)
+- tests/test_tolerance_plane_fit.py  (NEW – 7 tests)
+
+Guardrails respected: scad_translator.py untouched; no existing test files
+modified; no new dependencies beyond stdlib + numpy; decompose return dict
+unchanged (additive only); _group_planar_triangles backward-compat via tol=None.
+
+--------------------------------------------------------------------------------
+3. R-6: _ToleranceConfig dataclass
+--------------------------------------------------------------------------------
+
+Implemented at L~47 (after Float3 type alias).
+
+Fields:
+  quant_step: float
+  extent: float
+  weld_eps: float   = max(max(1e-9, 1e-7 * extent), 3 * quant_step)
+  snap_tol: float   = max(1e-5, max(5e-4 * extent, 2 * quant_step))
+  offset_tol: float = max(1e-6, 1e-4 * extent)
+  simp_tol: float   = max(1e-6, 1e-4 * extent)
+  tjunc_tol: float  = snap_tol
+
+classmethod from_(quant_step, extent) -> _ToleranceConfig computes all values.
+
+Replaced inline tolerance computations:
+  - decompose_mesh_faces: weld eps (was L1875), snap_tol (was L1905), simp_tol
+    (was L1904) → single tol = _ToleranceConfig.from_(quant_step, extent)
+  - analyze_mesh_data: weld eps (was L2377) → tol.weld_eps
+  - _group_planar_triangles: offset_tol → tol.offset_tol when tol provided
+  - _snap_group_vertices call: tol.snap_tol
+  - _boundary_loops call: tol.tjunc_tol
+  - _simplify_2d_keep call: tol.simp_tol
+
+_accept_by_running_plane_fit (L~1165): running plane-fit acceptance predicate.
+  - cnt < 3: uses seed_normal (covariance rank-deficient)
+  - cnt >= 3: _smallest_eigenvector_3x3 from accumulated centroid covariance
+  - Checks: face normal within cos_tol AND centroid distance < offset_tol
+
+_smallest_eigenvector_3x3 (L~88): analytic 3x3 symmetric eigenvector.
+  - Characteristic polynomial → depressed cubic → trigonometric solution
+  - Smallest eigenvalue → adjugate row cofactors → unit eigenvector
+  - Degenerate (zero cov) → Z-axis fallback
+  - O(1), no np.linalg.eigh
+
+_triangle_centroid (L~1147): centroid of triangle ti as (float,float,float).
+
+Connectivity pass bug fix: added assigned[nbr] guard to prevent cross-seed
+re-absorption. Previously, a second seed's region could absorb triangles
+already assigned by the first seed (only checked `seen`, not `assigned`).
+
+--------------------------------------------------------------------------------
+4. FORMULA VERIFICATION (test_tolerance_r1_r6_agree)
+--------------------------------------------------------------------------------
+R-1 formula:  eps = max(max(1e-9, 1e-7 * extent), 3 * quant_step)
+R-6 formula:  TolerangeConfig.weld_eps same.
+
+Tested across 6 inputs: (0,4), (0,100), (1e-6,10), (1e-4,50), (0.01,500), (0,0)
+All match exactly (assert approx with rel=1e-15).
+
+Additional ToleranceConfig value tests: 3 input cases, all 5 fields verified.
+
+--------------------------------------------------------------------------------
+5. TEST RESULTS
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/test_tolerance_plane_fit.py -v
+
+tests/test_tolerance_plane_fit.py::test_tolerance_config_values PASSED
+tests/test_tolerance_plane_fit.py::test_tolerance_r1_r6_agree PASSED
+tests/test_tolerance_plane_fit.py::test_plane_fit_residual_grouping PASSED
+tests/test_tolerance_plane_fit.py::test_order_independence PASSED
+tests/test_tolerance_plane_fit.py::test_smallest_eigenvector_3x3_plane PASSED
+tests/test_tolerance_plane_fit.py::test_smallest_eigenvector_3x3_isotropic PASSED
+tests/test_tolerance_plane_fit.py::test_smallest_eigenvector_3x3_zero PASSED
+
+7 passed in ~1.2s.
+
+--------------------------------------------------------------------------------
+6. FULL REGRESSION SUITE
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result: 236 passed, 18 deselected in 13.95s
+Baseline was 229 passed → +7 (new tests). ZERO regressions.
+
+Command: py -3.14 -m py_compile mcp_server/mesh_analysis.py
+Result: clean (no output, zero errors).
+
+--------------------------------------------------------------------------------
+7. VERIFIED CHECKLIST
+--------------------------------------------------------------------------------
+[x] Files created/modified: mesh_analysis.py (R-6+R-7), test_tolerance_plane_fit.py
+[x] No inline magic tolerance constants remain in decompose pipeline paths
+[x] ToleranceConfig(quant_step, extent) produces all 5 values per formulas
+[x] test_tolerance_r1_r6_agree: R-1 and R-6 weld_eps identical for same inputs
+[x] Running plane-fit: accumulated centroid covariance, smallest eigenvector refit
+[x] Order independence: shuffled triangles → identical groups
+[x] Connectivity semantics preserved (edge-adjacent region growing, fallback only
+    on fallback-created groups)
+[x] Determinism: sorted seeds, sorted neighbors, sorted tri_indices, no set iter
+[x] Backward compat: _group_planar_triangles with tol=None uses static predicate
+[x] scad_translator.py untouched
+[x] No existing test files modified
+[x] py_compile clean
+[x] Full suite passes with zero regressions

@@ -1,0 +1,21 @@
+==============================================================================
+F3 live QA: async-job-scheme (REAL Fusion 360 add-in via real _call/HTTP)
+timestamp: 2026-08-06 08:34:56
+FUSION_URL = http://127.0.0.1:7432
+driver: C:\Users\danie\AppData\Local\Temp\opencode\f3_live_driver.py
+server module: C:\Users\danie\fusion-mcp\mcp_server\fusion_server.py
+
+--- (a) execute_script 35s succeeds under 300s cap elapsed=35.02s ---
+  [PASS] elapsed=35.02s resp={"success": true, "output": "done"} (add-in 300s cap active; pre-reload would have failed at 30s)
+--- (b) run_scad launch->poll->completed + mesh envelope elapsed=5.51s ---
+  [PASS] launch={"job_id": "3fe794d30a554e48933762516cf49fac", "status": "running"} rounds=12 polled_keys=['rendered', 'mesh_body', 'scad_source_stored', 'render_time_s']
+--- (c) run_scad(job_id='sync') same envelope sync elapsed=5.44s ---
+  [PASS] sync_ok=True result_keys=['rendered', 'mesh_body', 'scad_source_stored', 'render_time_s']
+--- (b)==(c) polled vs sync same result format ---
+  [PASS] identical key sets + both succeed (values differ: add-in re-rendered the mesh; format is the same)
+--- (d) unknown uuid -> not_found elapsed=0.00s ---
+  [PASS] resp={   "job_id": "00000000-0000-0000-0000-000000000000",   "status": "not_found" }
+--- (e) fast tools unchanged via sync path + body exists elapsed=0.20s ---
+  [PASS] no_error_in_all_responses=True bodies_after_extrude=1 resp={"create_sketch": {"sketch": "Boceto3", "plane": "XY"}, "draw_center_rectangle": {"sketch": "Boceto3", "center_rectangle": "center=(0.0,0.0), 4.0x3.0", "profiles": 1}, "extrude_sketch": {"extruded": "Boceto3", "distance_cm": 2.0, "bodies": 1}, "get_bodies_info": {"bodies_count": 1}}
+
+VERDICT: APPROVE  (PASSED 6 / FAILED 0)

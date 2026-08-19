@@ -1,0 +1,147 @@
+================================================================================
+TASK 8 EVIDENCE LOG — MCP tool `query_structure_graph` with SQL
+Plan: .omo/plans/mesh-to-parametric.md, Todo 8 (Wave W4 task 2 of 2)
+Date: 2026-08-05
+================================================================================
+
+--------------------------------------------------------------------------------
+1. BASELINE (UNCHANGED CODE)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result:  180 passed, 18 deselected in 13.69s
+(Confirmed BEFORE any code change — the 180 existing tests are green.)
+
+--------------------------------------------------------------------------------
+2. FILES MODIFIED
+--------------------------------------------------------------------------------
+- mcp_server/fusion_server.py (ADD-only: imports + 2 helpers + 1 tool)
+    - imports added: `import re`, `from decimal import Decimal`
+    - `_assert_read_only_sql(sql)`        -> L1596
+    - `_json_safe_cell(value)`            -> L1631
+    - `@mcp.tool() query_structure_graph(mesh: str = "0", sql: str = "")` -> L1647
+      (inserted directly after `structure_graph` / before `slice_mesh`)
+- tests/test_structure_graph_tool.py (APPEND-only: 9 new tests reusing the
+  existing `fs` fixture, `_run`, `_FakeCall`, `_box_payload`,
+  `_clear_graph_db_cache`)
+
+--------------------------------------------------------------------------------
+3. `_assert_read_only_sql` — READ-ONLY ENFORCEMENT (THE CRITICAL PIECE)
+--------------------------------------------------------------------------------
+Verified fact (T6/T7 learnings, re-confirmed): duckdb 1.5.5 CANNOT flip a
+running in-memory connection to read-only. `SET access_mode='read_only'` (and
+SET GLOBAL) raise InvalidInputException ("it must be set when opening or
+attaching"); `duckdb.connect(":memory:", read_only=True)` raises
+CatalogException ("Cannot launch in-memory database in read-only mode!");
+`ATTACH ':memory:' (READ_ONLY)` fails too. => enforcement is STATEMENT-LEVEL.
+
+Implementation (comment stripping -> semicolon rule -> keyword prefix check):
+
+    def _assert_read_only_sql(sql):
+        stripped = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)   # block cmts
+        stripped = re.sub(r"--[^\n]*", "", stripped)                # line cmts
+        stripped = stripped.strip()
+        if stripped.endswith(";"):
+            stripped = stripped[:-1].strip()                        # <=1 trailing ;
+        if ";" in stripped:
+            raise ValueError("only SELECT queries are allowed")     # multi-stmt
+        first_word = re.split(r"\s+", stripped, maxsplit=1)[0].lower()
+        # first word must be a PREFIX of SELECT or WITH (case-insensitive):
+        if not ("select".startswith(first_word) or "with".startswith(first_word)):
+            raise ValueError("only SELECT queries are allowed")
+        return stripped
+
+Design decisions:
+- COMMENT STRIPPING happens BEFORE the keyword/semicolon checks, so
+  `-- x\nDROP TABLE` and `/* x */ DROP TABLE` are both rejected. Both regexes
+  are non-greedy / to-end-of-line; a `;` hidden inside a string literal is
+  over-strictly rejected (safe failure, never a false accept).
+- KEYWORD CHECK = "first word is a prefix of select/with". Rationale: the
+  spec's syntax-error test requires `SELEC 1` to reach the DuckDB parser
+  (-> "SQL error: ..."). A strict prefix (selec, w, ...) can NEVER begin a
+  valid DuckDB statement, so only exact `select`/`with` first words execute;
+  truncated-keyword typos fall through to DuckDB's ParserException. All real
+  destructive keywords (DROP/INSERT/UPDATE/DELETE/ALTER/CREATE/...) are
+  rejected because their first word is not a select/with prefix.
+- SEMICOLON RULE: at most ONE trailing `;` (stripped before validation);
+  any remaining `;` (e.g. `SELECT 1; DROP TABLE nodes`) is rejected.
+- KNOWN RESIDUAL (documented, acceptable): `SELECT * INTO t FROM nodes`
+  creates a table via the SELECT keyword. The plan's design is statement-level
+  best-effort; the agent is trusted (per task spec: "Use conn.execute(sql)
+  directly (the agent is trusted)"). Not a security boundary.
+
+--------------------------------------------------------------------------------
+4. `query_structure_graph` BEHAVIOUR (per plan section 2)
+--------------------------------------------------------------------------------
+1. Empty/whitespace sql         -> {"error": "sql parameter is required"}
+2. _get_graph_db KeyError       -> {"error": "no graph built for mesh 'X'.
+                                     Call structure_graph first."}  (mesh param)
+3. _assert_read_only_sql reject -> {"error": "only SELECT queries are allowed"}
+4. conn.execute(sql), description -> columns, fetchall() -> rows
+5. Deterministic ordering:
+     - cells JSON-safed via _json_safe_cell (bytes->utf-8 str, Decimal->float)
+     - no "order by" in cleaned SQL (case-insensitive substring) -> sort rows
+       by first column with `key=lambda r: (r[0] is None, r[0])` (NULLs last;
+       guards the real case `SELECT area_cm2 FROM nodes` -> [4.0 x6, None])
+     - "order by" present -> SQL ordering preserved
+6. Result envelope: {"mesh", "columns", "rows", "row_count"} (indent=2);
+   row_count = len(rows)
+7. Execution errors            -> {"error": "SQL error: <msg>"}
+Tool does NOT call `_call` (no Fusion round-trip) and does NOT open a new
+duckdb connection (uses the cached one from `_persist_to_duckdb`).
+
+Docstring documents: full nodes/edges schema (all possible columns + types +
+which are conditional), the 10 relation types, and 3 query examples
+(COUNT(*), concave-face filter, 2-hop recursive CTE traversal).
+
+--------------------------------------------------------------------------------
+5. EMPIRICAL FACTS (sanity script, real pipeline)
+--------------------------------------------------------------------------------
+- DuckDB names `SELECT COUNT(*)` column "count_star()".
+- Box graph: 6 faces (face:0..face:5); face:0 has 4 EDGE_ADJACENT neighbours
+  (face:2,3,4,5); 2-hop EDGE_ADJACENT closure from any face = all 6 faces.
+- Box nodes table columns (19): node_id, label, area_cm2, centroid,
+  component_id, convexity, curve_type, face_count, face_index,
+  interior_angles, is_articulation_point, is_base_candidate,
+  mean_curvature, normal_x, normal_y, normal_z, plane_id, triangle_count,
+  vertex_count.
+- Box edges table columns (8): source, target, relation, convexity,
+  dihedral_angle_deg, extrusion_direction, orientation, shared_edge_length.
+  (No VERTEX_TOUCH/SAME_ORIENTATION/COPLANAR edges on a box => no
+  shared_vertex/shared_vertex_count/normal_dot/normal_x/y/z columns.)
+- `SELECT area_cm2 FROM nodes` -> [4.0,4.0,4.0,4.0,4.0,4.0,None]
+  (Component node has no area_cm2) => confirms the None-guard on sort is real.
+
+--------------------------------------------------------------------------------
+6. NEW TEST RESULTS (tests/test_structure_graph_tool.py)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/test_structure_graph_tool.py -v
+Result:  14 passed in 3.99s  (5 existing T7 + 9 new T8)
+  - test_query_structure_graph_count                    PASSED  (rows [[7]])
+  - test_query_structure_graph_face_attrs               PASSED  (6 x 4.0)
+  - test_query_structure_graph_recursive_cte            PASSED  (all 6 faces)
+  - test_query_structure_graph_empty_sql                PASSED
+  - test_query_structure_graph_no_graph                 PASSED
+  - test_query_structure_graph_syntax_error             PASSED  ("SQL error:")
+  - test_query_structure_graph_read_only                PASSED
+    (DROP / "SELECT 1; DROP" / INSERT / "-- x\nDROP" / "/* x */ DROP" all
+    rejected; table survives)
+  - test_query_structure_graph_comments_and_trailing_semicolon PASSED
+  - test_query_structure_graph_deterministic_order      PASSED
+    (same query twice identical; no-ORDER-BY sorted by col 0; explicit
+    ORDER BY DESC preserved)
+
+--------------------------------------------------------------------------------
+7. FULL HEADLESS SUITE (REGRESSION)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result:  189 passed, 18 deselected in 14.68s   (180 baseline + 9 new = 189)
+
+--------------------------------------------------------------------------------
+8. OTHER GATES
+--------------------------------------------------------------------------------
+- py -3.14 -m py_compile mcp_server/fusion_server.py tests/test_structure_graph_tool.py -> OK
+- LSP (basedpyright) NOT installed (user previously declined) -> py_compile used instead.
+- Hard guardrails respected: scad_translator.py, mesh_analysis.py, mesh_graph.py,
+  structure_graph, and all existing tools/modules UNTOUCHED.
+- No git commands run.
+================================================================================

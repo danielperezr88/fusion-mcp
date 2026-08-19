@@ -1,0 +1,29 @@
+﻿=== job-centric-api T3: test-suite fix ===
+date: 2026-08-10
+python: py -3.14
+
+Changes:
+- tests/test_structure_graph_tool.py: _run(fs) helper + analyze_mesh preset test +
+  structure_graph preset test now pass job_id='sync' (no-arg default launches a job);
+  test_query_structure_graph_no_graph pins the new async guard message.
+- tests/test_job_tools.py: _poll_tool polls until status leaves {queued,running};
+  status vocabulary completed->complete, error->failed; launch asserts accept
+  {queued,running}; ADDED test_structure_graph_launch_poll_complete (mocked _call,
+  launch->poll->complete, result holds summary) and test_pool_saturation_queued_with_position
+  (MAX_CONCURRENT=1, Event-gated single worker, extra launch queued w/ position=0,
+  both drain to complete).
+- tests/test_mesh_to_brep_live.py: test_compare_mesh_to_brep_server_path passes
+  job_id='sync' at both direct compare_mesh_to_brep call sites.
+- tests/test_import_live.py: NO change needed -- standalone __main__ script (0 pytest
+  tests collected); drives FusionMCP.py add-in handlers via execute_script/fresh-module,
+  never calls converted fusion_server tools directly.
+
+VERIFY (target files):
+py -3.14 -m pytest tests/test_job_tools.py tests/test_structure_graph_tool.py tests/test_mesh_to_brep_live.py -q
+=> 31 passed in 10.99s
+
+VERIFY (full suite):
+py -3.14 -m pytest tests/ -q
+=> 253 passed, 1 xfailed in 52.06s
+
+GATE: 0 failures (253 passed + 1 xfailed of 254 collected = 252 baseline + 2 new tests).

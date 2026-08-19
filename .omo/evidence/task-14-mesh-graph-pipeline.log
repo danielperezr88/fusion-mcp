@@ -1,0 +1,129 @@
+================================================================================
+Task 14 (R-8): Voxel/SDF fallback detection + warning propagation
+Wave W7 - mcp_server/mesh_analysis.py + mcp_server/fusion_server.py
+Date: 2026-08-05
+================================================================================
+
+--------------------------------------------------------------------------------
+1. BASELINE (unchanged code)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result: 236 passed, 18 deselected in 13.59s
+No failures, no errors.
+
+--------------------------------------------------------------------------------
+2. FILES MODIFIED
+--------------------------------------------------------------------------------
+- mcp_server/mesh_analysis.py  (+32 lines: R-8 detection block + return-dict keys)
+- mcp_server/fusion_server.py  (+7 lines: fallback_strategy in structure_graph summary)
+- tests/test_r8_fallback_detection.py  (NEW — 4 tests, ~162 LOC)
+
+Guardrails respected:
+- scad_translator.py untouched
+- No existing test files modified
+- No new dependencies (ratio check uses basic arithmetic)
+- No voxelization/SDF repair code written (detection + reporting ONLY)
+- decompose_mesh_faces signature unchanged (no new params)
+- _boundary_loops signature unchanged
+- structure_graph signature unchanged
+- Empty-input early-return path unchanged (verified by test)
+- Additive only: new keys appear ONLY when triggered
+- mesh_graph.py untouched (R-8 wired into structure_graph TOOL summary, not graph attrs)
+
+--------------------------------------------------------------------------------
+3. R-8 DETECTION (mesh_analysis.py — decompose_mesh_faces)
+
+Insertion point: AFTER the face construction loop (after line 2299, before
+curved patches extraction).  AFTER all per-face warnings are computed from
+_count_residual_loop_edges (L2278-2279), so the total unpaired count is
+deterministic.
+
+Residual-edge source (same as R-4 per-face warnings):
+  unpaired_total = sum(face["warnings"][0]["count"]
+                       for face in planar_faces if face.get("warnings"))
+
+This is the SAME source R-4 uses at L2278-2284: _count_residual_loop_edges
+counts how many residual_pairs from _boundary_loops appear as consecutive
+vertex pairs in the final face loops.  Every residual_pair corresponds to a
+non-manifold edge with |net| >= 2 in _boundary_loops' edge cancellation.
+
+Ratio formula:
+  ratio = unpaired_total / (3 * len(welded_tris))
+  where welded_tris is the welded triangle count (post _weld_vertices)
+
+Threshold: > 5% (0.05).  When triggered, TWO new keys in return dict:
+  "strategy_fallback_suggested": "organic"
+  "unpaired_pct": round(100.0 * unpaired_total / (3 * n_welded_tris), 1)
+
+When NOT triggered, NO new keys appear — the return dict is byte-identical
+to pre-R-8 output for existing tests.
+
+The empty-input early-return path (L2097-2099) is unchanged: its hardcoded
+dict never includes the new keys.
+
+Wire-up to return dict: changed from inline dict literal to named variable
+(result) so keys can be conditionally added before return.
+
+--------------------------------------------------------------------------------
+4. R-8 PROPAGATION (fusion_server.py — structure_graph tool)
+
+Insertion point: in the summary dict assembly, AFTER the workstream entry
+(~L1616), BEFORE the closing brace.
+
+Logic:
+  if decompose_result.get("strategy_fallback_suggested"):
+      summary["fallback_strategy"] = {
+          "strategy": "organic",
+          "reason": "high residual non-manifold edge count (>5% of triangle edges)",
+          "unpaired_pct": decompose_result["unpaired_pct"],
+      }
+
+When the decompose flag is absent, fallback_strategy does NOT appear in the
+summary (no behavior change for clean meshes).
+
+--------------------------------------------------------------------------------
+5. TEST FIXTURES
+
+test_high_unpaired_triggers_fallback:
+  Uses _seam_mismatched_mesh() — three-quad strip with 0.003 cm offset seam.
+  Topology mirrors the proven R-4 offset-seam fixture but with tighter offset
+  (0.003 > snap_tol ~0.002 for extent 4.0).  6 welded triangles → 18 tri edges.
+
+  Ratio math (from actual decompose output):
+  - unpaired_total = sum of per-face warning counts
+  - expected_pct = round(100.0 * unpaired_total / 18.0, 1)
+  - Verified: ratio > 0.05 (seam offset >> snap_tol)
+
+test_clean_mesh_no_fallback:
+  Uses _watertight_box() — 8 vertices, 12 triangles, closed unit cube.
+  Asserted: strategy_fallback_suggested NOT in result, unpaired_pct NOT in result.
+
+test_empty_input_no_fallback_keys:
+  Empty nodes + indices → early return must be byte-identical to pre-R-8.
+
+test_additive_contract_fallback_triggered:
+  All pre-existing keys present with correct types when fallback IS triggered.
+
+--------------------------------------------------------------------------------
+6. FINAL COUNTS
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result: 240 passed, 18 deselected in 13.87s
+
+New tests: 4 (test_r8_fallback_detection.py)
+Baseline: 236 → Final: 240
+Zero regressions. Zero failures.
+py_compile clean on mesh_analysis.py and fusion_server.py.
+
+--------------------------------------------------------------------------------
+7. T11 WELD-REORDER ARTIFACT (design decision)
+
+T11 learnings document that the weld's rounded-key grid can reorder vertex
+indices, creating INTERMEDIATE non-manifold edges in _boundary_loops'
+residual_pairs even on a clean mesh.  The 5% threshold is the guard against
+this: a watertight box produces zero post-pinch residuals (loop-chaining
+handles the intermediates), so the ratio stays at 0.0.  Even if a specific
+weld order produced a few spurious residuals, they'd be far below 5%.
+
+The clean-mesh test explicitly asserts strategy_fallback_suggested NOT in
+result, confirming the threshold works against this artifact.

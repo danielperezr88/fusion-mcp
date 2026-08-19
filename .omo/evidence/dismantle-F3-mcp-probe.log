@@ -1,0 +1,103 @@
+======================================================================
+F3 - fresh-process MCP probe (dismantle-one-shot-reconstruction)
+timestamp : 2026-08-07T14:38:33
+server    : C:\Users\danie\fusion-mcp\mcp_server\fusion_server.py
+bridge    : http://127.0.0.1:7432  (add-in is UNCHANGED pre-dismantle)
+
+======================================================================
+MCP REGISTRY CHECK  (fs.mcp._tool_manager._tools)
+======================================================================
+registered tool count : 98
+tool list             : ["add_constraint", "add_construction_axis", "add_construction_plane", "add_parameter", "add_sketch_dimension", "add_sketch_fillet", "add_thread", "analyze_mesh", "annotate_mesh_parameters", "apply_appearance", "capture_screenshot", "chamfer_edges", "circular_pattern_body", "clear_design", "combine_bodies", "compare_mesh_to_brep", "copy_body", "create_as_built_joint", "create_component", "create_from_scad", "create_helix", "create_hole", "create_joint", "create_new_document", "create_pipe", "create_sketch", "create_sketch_on_face", "delete_body", "delete_sketch", "draft_face", "draw_arc", "draw_center_rectangle", "draw_circle", "draw_ellipse", "draw_line", "draw_polygon", "draw_rectangle", "draw_slot", "draw_spline", "draw_text", "execute_script", "export_as_3mf", "export_as_f3d", "export_as_step", "export_as_stl", "extrude_sketch", "fillet_edges", "finish_sketch", "fusion_status", "get_bodies_info", "get_design_info", "get_edge_info", "get_face_info", "get_oriented_bounding_box", "get_physical_properties", "get_sketch_info", "get_timeline_info", "get_workflow_guide", "import_cad_file", "import_mesh_data", "import_mesh_file", "import_sketch_file", "inspect_body", "list_appearances", "list_parameters", "loft_sketches", "measure_angle", "measure_between", "measure_body", "mirror_body", "mirror_sketch", "move_body", "move_body_to_component", "offset_sketch", "press_pull_face", "query_structure_graph", "rectangular_pattern_body", "rectangular_pattern_sketch", "redo", "rename_body", "review_reconstruction", "revolve_sketch", "rotate_body", "run_scad", "save_as", "save_design", "scale_body", "select_parameter_schema", "set_body_color", "shell_body", "slice_mesh", "structure_graph", "sweep_sketch", "thicken_sketch", "toggle_body_visibility", "undo", "update_parameter", "update_scad_body"]
+forbidden key 'reconstruct_mesh' present : False
+forbidden key 'reconstruct_from_faces' present : False
+[PASS] registry_excludes_removed_tools
+        tool_count=98
+        reconstruct_mesh absent=True
+        reconstruct_from_faces absent=True
+
+======================================================================
+BODY DISCOVERY (reuse existing bodies; create only if missing)
+======================================================================
+get_bodies_info -> 1 BRep body/bodies
+    BRep: index=0 name=Cuerpo75 size_cm={'x': 10.0, 'y': 10.0, 'z': 10.0}
+mesh discovered: 0 (analyze_mesh returned a valid report)
+using mesh_ref='0' brep_ref='0'
+
+======================================================================
+FOUNDATIONAL TOOL SEQUENCE
+======================================================================
+[PASS] fusion_status
+        output: Connected: Fusion MCP bridge running
+[PASS] analyze_mesh (no recommended_strategy; primitive_hints kept)
+        json_ok=True
+        top-level keys: ['bounding_box_cm', 'face_decomposition', 'manifold', 'mesh', 'primitive_hints', 'symmetry', 'triangle_count', 'units', 'vertex_count', 'volume_cm3', 'watertight']
+        recommended_strategy present: False
+        primitive_hints present: True
+[PASS] structure_graph (no unit_types/rebuild_order; base_face/dag kept)
+        json_ok=True
+        workstream present: True
+        workstream keys: ['base_face_per_component', 'dag_has_cycles']
+        unit_types present: False
+        rebuild_order present: False
+        base_face_per_component present: True
+        dag_has_cycles present: True
+        component_count=1 face_count=57
+[PASS] query_structure_graph (returns valid rows)
+        json_ok=True
+        sql: SELECT node_id, area_cm2 FROM nodes WHERE label='Face' ORDER BY area_cm2 DESC LIMIT 5
+        row_count=5
+        first_row: ['face:2', 107.160227]
+[PASS] slice_mesh (returns loops)
+        json_ok=True
+        loops count: 4
+        loop[0] is_hole=False pts=8  loop_shapes=[8, 4, 4, 8]
+[PASS] compare_mesh_to_brep (geometry summary)
+        json_ok=True
+        keys: ['bbox_max_deviation_cm', 'brep', 'mesh', 'method', 'sampled_deviation_cm', 'volume_ratio']
+        volume_ratio=0.121663
+        method=vertex_fallback
+[PASS] get_workflow_guide(step='reconstruct') (DISMANTLED placeholder)
+        json_ok=True
+        tool: reconstruct_mesh
+        note contains 'DISMANTLED': True
+        branch: None
+        fallback: None
+[PASS] annotate_mesh_parameters (no workflow dict; image block kept)
+        content items: 5
+        image blocks present: 4
+        envelope keys: ['measured_facts', 'mesh', 'views']
+        workflow present: False
+        mesh: MeshBody1  views: 4
+        measured_facts present: True
+[PASS] review_reconstruction (no workflow dict; image block kept)
+        content items: 7
+        image blocks present: 6
+        envelope keys: ['geometry', 'pairs']
+        workflow present: False
+        pairs present: True  geometry present: True
+        pairs count: 3
+[PASS] select_parameter_schema (unchanged behavior)
+        json_ok=True
+        keys: ['class', 'description', 'parameters', 'strategy_hint', 'unmatched_roles']
+        parameters count: 3
+
+sample JSON written -> C:\Users\danie\fusion-mcp\.omo\evidence\dismantle-F3-sample.json
+
+======================================================================
+F3 SUMMARY
+======================================================================
+  [PASS] registry_excludes_removed_tools
+  [PASS] fusion_status
+  [PASS] analyze_mesh (no recommended_strategy; primitive_hints kept)
+  [PASS] structure_graph (no unit_types/rebuild_order; base_face/dag kept)
+  [PASS] query_structure_graph (returns valid rows)
+  [PASS] slice_mesh (returns loops)
+  [PASS] compare_mesh_to_brep (geometry summary)
+  [PASS] get_workflow_guide(step='reconstruct') (DISMANTLED placeholder)
+  [PASS] annotate_mesh_parameters (no workflow dict; image block kept)
+  [PASS] review_reconstruction (no workflow dict; image block kept)
+  [PASS] select_parameter_schema (unchanged behavior)
+
+F3 OVERALL: OVERALL PASS
+F3 VERDICT: OVERALL PASS -- foundational toolset verified against working-tree fusion_server.py (C:\Users\danie\fusion-mcp\mcp_server\fusion_server.py)

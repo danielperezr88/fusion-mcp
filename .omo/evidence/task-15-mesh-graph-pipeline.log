@@ -1,0 +1,186 @@
+================================================================================
+Task 15 (R-9): Expose tolerances + presets on decompose_mesh_faces, wire through MCP tools
+Wave W7 - mcp_server/mesh_analysis.py + mcp_server/fusion_server.py
+Date: 2026-08-05
+================================================================================
+
+--------------------------------------------------------------------------------
+1. BASELINE (unchanged code)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result: 240 passed, 18 deselected in 13.90s
+No failures, no errors.
+
+--------------------------------------------------------------------------------
+2. FILES MODIFIED
+--------------------------------------------------------------------------------
+- mcp_server/mesh_analysis.py
+  * decompose_mesh_faces signature: +offset_tol, +snap_tol, +simp_tol, +preset
+  * angle_tolerance_deg -> Optional[float]=None (sentinel for explicit-vs-default)
+  * Preset resolution block inserted after _ToleranceConfig.from_() call
+  * effective_angle flows into _group_planar_triangles call
+  * analyze_mesh_data signature: +5 params (angle_tolerance_deg, offset_tol,
+    snap_tol, simp_tol, simplify_vertices, preset) after normals
+  * analyze_mesh_data decompose_mesh_faces call now passes all params
+- mcp_server/fusion_server.py
+  * +from typing import Optional
+  * analyze_mesh tool: +5 params, docstring updated, passes to analyze_mesh_data
+  * structure_graph tool: +5 params, docstring updated, passes to decompose_mesh_faces
+- tests/test_presets_tolerances.py (NEW -- 6 tests)
+
+Guardrails respected:
+- scad_translator.py untouched
+- No existing test files modified
+- No new dependencies
+- Default behavior unchanged (test_default_no_params_unchanged proves byte-identical)
+- Additive only: no keys removed from decompose/structure_graph/analyze_mesh returns
+- simp_tol stays mesh_analysis-layer only (NOT on MCP tools)
+- weld_eps/tjunc_tol NEVER overridden by presets
+
+--------------------------------------------------------------------------------
+3. PRESET MATH
+--------------------------------------------------------------------------------
+
+Preset mapping applied AFTER _ToleranceConfig.from_(quant_step, extent):
+
+  "accurate": angle=0.1 deg, offset_tol=max(1e-8, 1e-6*extent), snap_tol=max(1e-8, 1e-6*extent)
+  "balanced":  defaults (angle=0.5 deg, offset_tol/snap_tol/simp_tol from from_)
+  "coarse":    angle=1.0 deg, offset_tol=max(1e-6, 1e-3*extent), snap_tol=max(1e-5, 1e-3*extent)
+
+Applied via dataclasses.replace() on the frozen _ToleranceConfig.
+Individual params (offset_tol/snap_tol/simp_tol) override BOTH defaults AND presets.
+
+Angle resolution order:
+  1. Start with angle_tolerance_deg parameter (None = "not supplied")
+  2. If preset provides angle value AND caller did NOT supply, use preset's value
+  3. If caller DID supply angle_tolerance_deg, explicit value always wins
+
+At the mesh_analysis layer: angle_tolerance_deg is Optional[float] with default None.
+At the MCP tool layer: angle_tolerance_deg is float with default 0.5 (always explicit).
+
+--------------------------------------------------------------------------------
+4. TEST DETAILS
+--------------------------------------------------------------------------------
+
+test_preset_accurate_more_faces:
+  Fixture: 2 triangles at ~0.17 deg dihedral (h=0.0299, L=100, perp=10)
+  Balanced: centroid dist 0.009967 < 0.01 -> offset passes; angle 0.17 < 0.5 -> merges (1 face)
+  Accurate: centroid dist 0.009967 > 0.0001 -> offset fails -> splits (2 faces)
+  Result: accurate (2) > balanced (1)
+
+test_preset_coarse_fewer_faces:
+  Fixture: 2 triangles at ~0.69 deg dihedral (h=0.122, L=100, perp=10)
+  Balanced: angle 0.69 > 0.5 -> splits (2 faces)
+  Coarse: centroid dist 0.0407 < 0.1 -> offset passes; angle 0.69 < 1.0 -> merges (1 face)
+  Result: coarse (1) < balanced (2)
+
+test_individual_override:
+  Single coplanar face; v4+v5 at gap 0.02 cm
+  Default snap_tol ~0.005: not merged -> higher vertex_count
+  snap_tol=0.5: merged -> lower vertex_count
+
+test_preset_and_individual_override:
+  preset="accurate" + snap_tol=0.5 -> individual wins, vertices merge
+
+test_invalid_preset_raises:
+  preset="ultra" -> returned error dict with "unknown preset" message
+  (decompose_mesh_faces catches ValueError and returns error dict)
+
+test_default_no_params_unchanged:
+  decompose_mesh_faces(nodes, indices) == decompose_mesh_faces(nodes, indices, ...all defaults)
+  Proven byte-identical via json.dumps comparison.
+
+--------------------------------------------------------------------------------
+5. VERIFICATION RESULTS
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/test_presets_tolerances.py -v
+Result: 6 passed in 1.02s
+
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result: 246 passed, 18 deselected in 13.56s
+Zero regressions (baseline was 240 passed).
+
+Command: py -3.14 -m py_compile mcp_server/mesh_analysis.py mcp_server/fusion_server.py
+Result: clean (no output)
+
+--------------------------------------------------------------------------------
+6. DESIGN NOTES
+--------------------------------------------------------------------------------
+
+Running-plane-fit offset check coupling:
+  The _accept_by_running_plane_fit offset check (L1212-1215) ties centroid
+  distance to the dihedral angle: both scale with the height of the tilted
+  vertex.  Test fixtures use a perpendicular distance of only 10 cm from the
+  shared edge (0.1x the model extent) to keep centroid displacement small
+  enough to pass the balanced tolerance while still discriminating at accurate.
+
+  Formula for the bent-strip fixture:
+    dot(n1, n2) = 0.1L / sqrt(h^2 + 0.01L^2)
+    angle = arccos(dot)
+    centroid dist = h/3  (running fit, cnt=1 -> seed normal)
+    offset_tol = max(1e-6, 1e-4*extent) for balanced
+    offset_tol = max(1e-8, 1e-6*extent) for accurate
+
+--------------------------------------------------------------------------------
+7. POST-REVIEW FIXES (2026-08-05)
+--------------------------------------------------------------------------------
+
+Bug A — analyze_mesh dead params:
+  The analyze_mesh tool accepted the 5 new params in its signature but never
+  forwarded them to analyze_mesh_data.  Fixed: the call now passes
+  angle_tolerance_deg, offset_tol, snap_tol, simplify_vertices, preset.
+
+Bug B — preset angle dead zone (None sentinel):
+  With angle_tolerance_deg: float = 0.5 on analyze_mesh_data AND both MCP tools,
+  the literal 0.5 was always forwarded to decompose, so preset angle overrides
+  (e.g. preset="accurate" -> 0.1 deg) never activated through the tool path.
+  Changed all three layers to Optional[float] = None, preserving baseline
+  behavior (None -> decompose default 0.5) while allowing the preset's angle
+  to take effect when angle is unspecified.
+
+Regression tests added (tests/test_presets_tolerances.py):
+  - test_analyze_mesh_data_preset_passthrough: preset="accurate" through
+    analyze_mesh_data -> 2 faces (vs 1 for default, proves preset reaches
+    decompose through the intermediate layer)
+  - test_analyze_mesh_data_angle_override_wins: preset="coarse" + angle=0.05
+    -> 2 faces (vs 1 for coarse alone, proves explicit float beats preset)
+
+Verification:
+  Command: py -3.14 -m pytest tests/test_presets_tolerances.py -v
+  Result: 8 passed (6 original + 2 new)
+  Command: py -3.14 -m pytest tests/ -k "not live" -q
+  Result: 248 passed, 18 deselected
+  Command: py -3.14 -m py_compile mcp_server/mesh_analysis.py mcp_server/fusion_server.py
+  Result: clean
+
+--------------------------------------------------------------------------------
+2b. ROUND 2 (verification fixes): Bug A + Bug B at the MCP tool layer
+--------------------------------------------------------------------------------
+Found in orchestrator Phase-1 review (new tests only exercised decompose directly):
+
+Bug A: analyze_mesh tool (fusion_server.py L1487) accepted the 5 new params but
+  the call to analyze_mesh_data(nodes, indices, normals) was never updated -
+  preset/tolerances silently dropped. FIXED: call now forwards angle_tolerance_deg,
+  offset_tol, snap_tol, simplify_vertices, preset by keyword.
+
+Bug B (preset angle dead zone): analyze_mesh_data + both MCP tools defaulted
+  angle_tolerance_deg=0.5 and forwarded the literal, so decompose's None sentinel
+  never triggered through the tool path - preset angle mapping (accurate->0.1,
+  coarse->1.0) was dead outside direct decompose calls. FIXED: all three layers
+  now default angle_tolerance_deg=Optional[float]=None and forward it; explicit
+  values still override presets.
+
+New regression tests (tests/test_presets_tolerances.py, +2 -> 8 total):
+  - test_analyze_mesh_data_preset_passthrough: preset='accurate' via analyze_mesh_data
+    -> more planar faces than default (proves sentinel flows through intermediate layer)
+  - test_analyze_mesh_data_angle_override_wins: preset='coarse' + angle_tolerance_deg=0.05
+    -> more faces than coarse alone (proves explicit beats preset)
+
+Verification (orchestrator-executed):
+  - Full suite: 248 passed, 18 deselected (240 baseline + 8 new, zero regressions)
+  - py_compile clean (mesh_analysis.py, fusion_server.py)
+  - Runtime signature check under server interpreter (py -3.13): analyze_mesh and
+    structure_graph both expose the 5 params, angle/preset default None
+  - Tool-path smoke test: default=1 face, accurate=2, coarse=1, coarse+0.05deg=2;
+    all 10 report keys intact (additive contract holds)
+  - Stale comment corrected (sentinel now flows from every layer, not just MCP)

@@ -1,0 +1,174 @@
+================================================================================
+TASK 6 — DuckDB persistence (_persist_to_duckdb from NetworkX graph)
+Pipeline: mesh-graph-pipeline | Date: 2026-08-05
+================================================================================
+
+1. BASELINE (unchanged code, BEFORE any edits)
+------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result:  169 passed, 18 deselected in 8.49s
+git state: T1-T5 committed (5fbd729, 74ab529, 3118888, 061617c, b559bb7, d5b1ddd).
+File state: mcp_server/mesh_graph.py 482 lines (T5), duckdb 1.5.5 installed,
+duckdb>=1.5.5 present in mcp_server/requirements.txt.
+
+2. FILES MODIFIED
+------------------------------------------------
+- mcp_server/mesh_graph.py   (ADD-only; build_structure_graph + all T5 helpers
+                              untouched — verified: the only edits were the
+                              import block, the module docstring, and a new
+                              appended persistence section after _plane_id)
+- tests/test_mesh_graph_db.py (NEW, 130 awk-style pure LOC) — chosen as a new
+                              file rather than appending to the 320-line
+                              test_mesh_graph.py: the DuckDB sink is a distinct
+                              concern from the graph-builder contracts, and a
+                              new file keeps the T5 suite untouched.
+
+3. FUNCTIONS ADDED (mcp_server/mesh_graph.py)
+------------------------------------------------
+  L518  MAX_GRAPHS = 16                          module-level LRU capacity
+  L521  _GRAPH_DBS: OrderedDict[...] = OrderedDict()   module-level LRU cache
+  L529  _safe_ident(name)                       validates SQL identifier (values
+                                                are parameterized; only column
+                                                names reach SQL text)
+  L537  _column_type(values)                    per-column DuckDB type inference
+                                                from the non-None values
+  L559  _sql_value(value, col_type)             value normalisation for binding
+  L574  _tabulate(rows, core)                   (columns, aligned_rows) flatten:
+                                                fixed core + sorted union of
+                                                attr keys, rows aligned w/ None
+  L588  _create_table(conn, table, rows, core, primary_key)
+                                                CREATE TABLE + parameterized
+                                                executemany bulk insert
+  L616  _persist_to_duckdb(graph, mesh_key)     main entry: in-memory conn,
+                                                BEGIN/COMMIT transaction,
+                                                LRU insert/replace/evict
+  L660  _get_graph_db(mesh_key)                 cached conn (MRU promote) or
+                                                KeyError (ephemeral message)
+
+4. DYNAMIC SCHEMA DESIGN
+------------------------------------------------
+Columns = fixed core + SORTED union of attr keys across all rows (separately
+for nodes and edges).  Sorted (never insertion-ordered) so the schema is
+deterministic regardless of dict iteration order.  New attrs added later
+(T9: base_score / unit_type / rebuild_order on nodes) become columns with no
+change to this code — persist AFTER enrichment.
+
+Final node columns for a full-model graph (box + hole + curved + component):
+  node_id (TEXT PK), label (TEXT),
+  component_id INTEGER, containing_face_id TEXT, face_count INTEGER,
+  face_index INTEGER, plane_id TEXT, area_cm2 DOUBLE, normal_x/y/z DOUBLE,
+  centroid TEXT(JSON), vertex_count INTEGER, triangle_count INTEGER,
+  interior_angles TEXT(JSON), convexity TEXT, is_base_candidate BOOLEAN,
+  is_articulation_point BOOLEAN, mean_curvature DOUBLE, curve_type TEXT,
+  is_filled BOOLEAN
+Final edge columns:
+  source TEXT, target TEXT, relation TEXT,
+  dihedral_angle_deg DOUBLE, convexity TEXT, shared_edge_length DOUBLE,
+  orientation TEXT, shared_vertex TEXT(JSON), shared_vertex_count INTEGER,
+  normal_dot DOUBLE, normal_x/y/z DOUBLE, extrusion_direction TEXT(JSON)
+(columns only appear when the union actually contains them — e.g. a box has
+no normal_dot column because no box pair carries it.)
+
+Type mapping (per column, from the non-None values):
+  bool -> BOOLEAN (checked before int: bool subclasses int)
+  int  -> INTEGER, int/float mix -> DOUBLE (ints widened at bind time)
+  str  -> TEXT
+  list/dict/tuple -> TEXT via json.dumps; round-trip with json.loads
+  None (missing attr) -> NULL
+All values bound with ? placeholders (executemany); column names validated
+by _safe_ident.  No f-string/format of values anywhere.
+
+5. TRANSACTION + LRU SEMANTICS
+------------------------------------------------
+- duckdb.connect(":memory:"); conn.execute("BEGIN") ... DDL + index + inserts
+  ... conn.execute("COMMIT"); on any exception ROLLBACK + conn.close() then
+  re-raise (atomic; partial persists never cached).
+- On success: close any existing connection for the key (no leak), store new
+  conn, move_to_end (MRU), then while len > MAX_GRAPHS: popitem(last=False)
+  (oldest) + close.  MAX_GRAPHS = 16.
+- _get_graph_db: move_to_end then return the SAME connection object (identity
+  — verified by test).  Raises KeyError with:
+  "no graph built for mesh '<key>'. Call structure_graph first (graphs are
+  ephemeral: the MCP server restart drops them)"
+- _get_graph_db never opens a new connection (T8 mutates the same one).
+
+6. READ-ONLY MODE FINDING (IMPORTANT FOR T8)
+------------------------------------------------
+Inherited-wisdom hint claimed "duckdb supports SET access_mode='read_only'
+on an existing in-memory connection".  EMPIRICALLY FALSE for duckdb 1.5.5:
+
+  py -3.14 probe results:
+  - conn.execute("SET access_mode='read_only'")            -> InvalidInputException
+      "Cannot change access_mode setting while database is running - it must
+       be set when opening or attaching the database"
+  - SET GLOBAL access_mode -> same error
+  - duckdb.connect(":memory:", read_only=True)             -> CatalogException
+      "Cannot launch in-memory database in read-only mode!"
+  - duckdb_settings() shows access_mode = 'automatic' (GLOBAL scope, fixed)
+  - ATTACH ':memory:' AS x (READ_ONLY)                     -> CatalogException
+
+=> There is NO way to make an already-running in-memory duckdb connection
+   read-only in 1.5.5.  WORKAROUND for T8 (documented in learnings): the
+   connection is process-local and only the MCP server touches it, so
+   "read-only mode" is enforced at the query layer: T8's query tool issues
+   only SELECT statements (a helper that rejects non-read statements, or
+   simply never issuing writes).  The T6 test test_duckdb_read_only_query
+   locks the actually-required contract: plain SELECTs work on the cached
+   connection and are deterministic (repeatable result sets).
+
+7. TEST RESULTS (tests/test_mesh_graph_db.py, 6 tests)
+------------------------------------------------
+py -3.14 -m pytest tests/test_mesh_graph_db.py -v
+  test_persist_to_duckdb_round_trip     PASSED  (counts match G.node/edge count;
+                                                 _get_graph_db identity check)
+  test_duckdb_schema_columns            PASSED  (core + per-type attrs; JSON
+                                                 round-trip centroid/interior_
+                                                 angles/shared_vertex)
+  test_duckdb_query_neighbors           PASSED  (SQL finds 4 EDGE_ADJACENT
+                                                 neighbors of face:0 on the box;
+                                                 matches nx.neighbors exactly)
+  test_duckdb_lru_eviction              PASSED  (17 keys -> 16 kept, mesh:0
+                                                 evicted, KeyError mentions
+                                                 "Call structure_graph first" +
+                                                 "ephemeral", mesh:16 queryable)
+  test_duckdb_read_only_query           PASSED  (deterministic plain SELECTs)
+  test_persist_empty_graph              PASSED  (empty graph -> zero-row tables
+                                                 with core columns; guards the
+                                                 duckdb executemany empty-list
+                                                 InvalidInputException)
+6 passed in 5.44s
+
+8. FULL HEADLESS SUITE
+------------------------------------------------
+py -3.14 -m pytest tests/ -k "not live" -q
+Result:  175 passed, 18 deselected in 12.94s   (169 baseline + 6 new; NO
+         regressions)
+
+9. MANDATORY POST-WRITE REVIEW
+------------------------------------------------
+- Pure LOC: mcp_server/mesh_graph.py 570 awk-style (pre-existing >250 from T5;
+  task-mandated ADD-only location, T5 helpers forbidden to touch -> SIZE_OK
+  exception documented).  tests/test_mesh_graph_db.py 130 awk-style (healthy).
+- py_compile clean on both changed files.
+- basedpyright LSP not installed (previously declined) — compiled + tested
+  instead.
+- No git commands run.
+
+10. DEVIATIONS FROM PLAN SPEC
+------------------------------------------------
+1. SET access_mode='read_only' does not work on the cached in-memory
+   connection in duckdb 1.5.5 (see §6).  T6 test still covers the required
+   read-behaviour; workaround for T8 documented in learnings.  (The plan's
+   spec body §6 and the deliverable report item (h) explicitly allowed
+   reporting "the workaround you used".)
+2. Tests placed in a NEW file tests/test_mesh_graph_db.py (plan allowed either
+   option).  Fixture style mirrors test_mesh_graph.py (_box/_graph through the
+   real decompose pipeline) for consistency.
+3. Added test_persist_empty_graph beyond the 5 required tests — it locks a
+   real bug (duckdb executemany rejects an empty parameter list) that would
+   otherwise crash _persist_to_duckdb on an empty decompose result.
+4. `primary_key` param on _create_table keeps 5 args (Smell 2, >3): each of
+   conn/table/rows/core/primary_key is an independent input used by two call
+   sites with different values; grouping them into a spec object would add a
+   type for zero clarity gain.  Justification recorded.
+================================================================================

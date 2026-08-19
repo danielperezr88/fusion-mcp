@@ -1,0 +1,9 @@
+
+=== F2 Code Quality Review — 2026-08-10 10:47:01 ===
+VERDICT: APPROVE
+FA1 jobs.py thread-safety: All _JOBS mutations under _LOCK; prune caller-held; no lock nesting/deadlock; workers run user code outside lock.
+FA2 Envelope shapes: queued->{job_id,status,position}, running->{job_id,status}, complete->{job_id,status,result}, failed->{job_id,status,error}, not_found unchanged — all JSON-serializable (result is str or dict/list of primitives).
+FA3 Sync-path byte-identity: All 10 _<name>_sync bodies match original tool bodies; only documented timeout bump to 330 on imports/exports. Confirmed via git diff.
+FA4 Wrapper correctness: dispatch job_id=="sync"/truthy/empty; trailing job_id:str=""; docstring line present on all 15 wrappers.
+FA5 Test quality: Event-gated determinism throughout; pool-saturation test quarantines via fresh _QUEUE + _WORKERS_STARTED=False + MAX_CONCURRENT=1; no arbitrary sleeps; assertions real.
+Race: launch_job inserts record under _LOCK BEFORE _QUEUE.put — worker cannot pop before record exists — NO RACE.

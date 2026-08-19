@@ -1,0 +1,82 @@
+# Task 16: R-10 trimesh.facets cross-check diagnostic in tests
+## Evidence log — 2026-08-05
+
+### Baseline (unchanged tree)
+```
+py -3.14 -m pytest tests/ -k "not live" -q
+219 passed, 18 deselected in 17.38s
+```
+
+### Changes (NEW files only — no production code touched)
+- `tests/trimesh_facets_diag.py` (NEW): test-only helper
+  `_compare_with_trimesh_facets(decompose_result, mesh: trimesh.Trimesh)`.
+  Runs `mesh.facets` (trimesh's parallel-adjacency components built on the
+  curvature-adaptive ratio predicate `(radius/span)^2 > 5000`,
+  `tol.facet_threshold == 5000`, `min_len=2` — verified against installed
+  trimesh 5.0.0 source `trimesh/graph.py`), maps every facet's triangles
+  onto our `planar_faces` by plane-offset + centroid-in-polygon containment,
+  and reports discrepancies (a facet not covered by exactly one of our
+  faces). Returns a report dict {our_face_count, trimesh_facet_count,
+  invariant_ok, facets_error, facet_sizes, our_face_triangle_counts,
+  single_face_analogues, plane_facet_groups, discrepancies,
+  discrepancy_count} and emits `warnings.warn` diagnostics. Never raises:
+  `mesh.facets` failures on degenerate input are caught and surfaced as
+  `report["facets_error"]`.
+  - Edge cases documented + handled gracefully:
+    - trimesh issue #347 (single-face facets): trimesh's `facets` uses
+      `connected_components(min_len=2)`, so a facet of one face is NEVER
+      emitted. Our decompose DOES emit single-triangle planar faces; those
+      are counted as `single_face_analogues` (expected, logged).
+    - trimesh issue #1745 (splitting with faces on a plane): facets sharing
+      one plane are counted as `plane_facet_groups` (expected, logged).
+- `tests/test_trimesh_facets_cross_check.py` (NEW): 5 tests
+  - `test_trimesh_facets_cross_check` — unit cube: 6 planar faces, 6
+    trimesh facets (sizes all 2), invariant `our >= trimesh` holds,
+    zero discrepancies, diagnostic summary warning emitted.
+  - `test_trimesh_facets_cross_check_single_face_facet_347` — lone
+    triangle + quad: trimesh drops the single-face facet (1 facet), our
+    decompose emits 2 faces, `single_face_analogues == 1`, #347 warning.
+  - `test_trimesh_facets_cross_check_faces_on_plane_1745` — two separated
+    coplanar quads on z=0: 2 facets sharing a plane,
+    `plane_facet_groups >= 1`, #1745 warning.
+  - `test_trimesh_facets_cross_check_degenerate_graceful` — all-collinear:
+    both sides report 0, invariant holds, no crash.
+  - `test_trimesh_facets_cross_check_facets_error_graceful` — monkeypatches
+    `mesh.facets` (via `property(_boom)`) to raise: helper catches, reports
+    `facets_error`, emits warning, returns report, no exception propagates.
+
+### Debugging note (kept in code as comments)
+Initial coverage matcher used only the dominant-axis 2D projection — parallel
+faces at different offsets (cube z=0 vs z=1) project identically, so every
+facet matched 2 faces (6 discrepancies). Fixed with a plane-offset check
+`|n·centroid − n·poly[0]| <= max(1e-4, 1e-6*|offset|)` in
+`_face_covering_indices`.
+
+### Final counts
+```
+py -3.14 -m pytest tests/ -k "not live" -q
+224 passed, 18 deselected in 16.23s
+(+5 tests, zero regressions vs 219 baseline)
+```
+
+### Targeted test run
+```
+py -3.14 -m pytest tests/test_trimesh_facets_cross_check.py -v
+5 passed in 1.29s
+```
+
+### Diagnostic output demonstration (direct helper call on the unit cube)
+```
+REPORT: {'our_face_count': 6, 'trimesh_facet_count': 6, 'invariant_ok': True,
+ 'facets_error': None, 'facet_sizes': [2, 2, 2, 2, 2, 2],
+ 'our_face_triangle_counts': [2, 2, 2, 2, 2, 2], 'single_face_analogues': 0,
+ 'plane_facet_groups': 0, 'discrepancies': [], 'discrepancy_count': 0}
+WARNINGS:
+   trimesh facets cross-check: our_faces=6 trimesh_facets=6 invariant_ok=True discrepancies=0
+```
+
+### Quality gates
+- py_compile clean on both new files.
+- Helper `tests/trimesh_facets_diag.py`: 239 non-comment lines (< 250 ceiling).
+- No `mcp_server/` files modified; no new dependencies (trimesh 5.0.0 and
+  numpy are already project deps); no git commit (orchestrator's job).

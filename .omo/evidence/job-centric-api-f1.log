@@ -1,0 +1,172 @@
+================================================================================
+F1: PLAN COMPLIANCE AUDIT — .omo/plans/job-centric-api.md
+Reviewer: F1 (final verification wave) | Date: 2026-08-10
+Command: read-only audit (no source/test/README modified)
+Verdict: APPROVE
+================================================================================
+
+SCOPE (git status --short / git diff --stat)
+  Modified (exactly the plan's 8-file guardrail set):
+    mcp_server/jobs.py                 (103)
+    mcp_server/fusion_server.py        (354)
+    tests/test_jobs.py                 (189)
+    tests/test_job_tools.py            (141)
+    tests/test_structure_graph_tool.py ( 17)
+    tests/test_mesh_to_brep_live.py    (  5)
+    README.md                          ( 25)
+    .omo/plans/mesh-graph-pipeline.md  ( 14)  <- PRE-EXISTING, NOT part of this
+                                                 plan (its own F1-F4 checkboxes +
+                                                 checkbox toggles for tasks 12/14/15).
+                                                 Unrelated to job-centric-api. Flagged only.
+  tests/test_import_live.py NOT modified -> consistent with plan (standalone
+  __main__ script, 0 pytest tests, never calls converted tools).
+  No out-of-scope changes found.
+
+--------------------------------------------------------------------------------
+CLAIM 1 — T1 (mcp_server/jobs.py)  -> VERIFIED
+--------------------------------------------------------------------------------
+  - MAX_CONCURRENT = 4                    L35
+  - bounded stdlib queue.Queue pool       L37 (_QUEUE: queue.Queue)
+  - lazily-started daemon workers under _LOCK: _ensure_workers() (L41-51) starts
+    MAX_CONCURRENT daemon threads (threading.Thread(..., daemon=True)); called
+    from launch_job INSIDE `with _LOCK` (L73-83); _WORKERS_STARTED guard against
+    double start (L47-48). Docstring: "Caller MUST already hold _LOCK."
+  - launch_job enqueues with status "queued" (L77) then _QUEUE.put (L83)
+  - worker flips queued->running under _LOCK (L57-62)
+  - _run sets "complete"+result (L136-138) / "failed"+error (L129-131)
+  - MAX_JOBS = 64 (L33), JOB_TTL = 3600.0 (L34) retained; prune semantics kept
+    (TTL expiry L152-155; cap eviction oldest-finished, queued/running NEVER
+    evicted L156-164)
+  - record keys status/result/error/created/finished (L76-82) retained
+  - module docstring updated to bounded-pool + new vocabulary (L1-24)
+  - launch_job (L65) / get_job (L87) names stable; position added ONLY in the
+    get_job copy for queued records (L99-100, _compute_position L104-114)
+  - py_compile exit 0
+
+--------------------------------------------------------------------------------
+CLAIM 2 — T2 (mcp_server/fusion_server.py)  -> VERIFIED
+--------------------------------------------------------------------------------
+  Helpers (L313-337):
+    _job_status:
+      not_found -> {"job_id", "status":"not_found"}  (L317-318, unchanged)
+      queued    -> {"job_id","status":"queued","position":record.get("position")} (L319-321)
+      running   -> {"job_id","status":"running"}      (L322-323)
+      complete  -> {"job_id","status":"complete","result":record["result"]} (L324-326)
+      else      -> {"job_id","status":"failed","error":record["error"]}     (L327)
+    _launch_job (L330-337): reads back ACTUAL status via get_job(job_id)
+      (status = record["status"] if record is not None else "running") -> may be
+      "queued" when pool saturated. Returns EXACTLY {"job_id", "status"} — no
+      position key (position is poll-only).
+  10 conversions (all _<name>_sync + wrapper w/ trailing job_id: str = ""):
+    structure_graph (sync L1789, wrapper L1941)
+    analyze_mesh     (sync L1635, wrapper L1711)
+    slice_mesh       (sync L2167, wrapper L2221)
+    compare_mesh_to_brep (sync L2252, wrapper L2293)
+    import_cad_file  (sync L1433, wrapper L1448)
+    import_mesh_file (sync L1469, wrapper L1482)
+    export_as_stl    (sync L1321, wrapper L1327)
+    export_as_step   (sync L1341, wrapper L1347)
+    export_as_3mf    (sync L1361, wrapper L1367)
+    export_as_f3d    (sync L1381, wrapper L1387)
+    All wrappers dispatch "sync"/truthy/empty exactly (if job_id=="sync" ->
+    _sync(...); if job_id -> _job_status; else _launch_job).
+  Docstring line (verbatim, 15/15): "`job_id`: \"\" (default) launches the job
+    and returns a job id; \"sync\" runs synchronously and returns the full
+    result; a job id polls status/result."
+  Timeouts: 6 import/export sync bodies _call(..., timeout=330) — L1323, 1343,
+    1363, 1383 (4 exports), L1444, 1478 (2 imports). structure_graph/analyze_mesh
+    KEEP extract timeout=120 (L1843, L1679; slice_mesh L2196 also 120).
+    run_scad/update_scad_body/create_from_scad carry 330 (pre-existing).
+  query_structure_graph (L2056, NOT converted, stays sync) guard message
+    (L2145-2149): "no graph built for mesh '<mesh>'. structure_graph is
+    asynchronous: launch structure_graph(mesh='<mesh>') (no job_id), then poll
+    its job_id until status 'complete' before querying." — EXACT match.
+  review_reconstruction: _review_reconstruction_sync calls
+    _compare_mesh_to_brep_sync(mesh=..., body=...) at L2557 (NOT the converted
+    compare_mesh_to_brep TOOL — comment L2551-2555 explains the tool would
+    launch a job). Cross-tool call audit: only internal bare call fixed.
+  py_compile exit 0.
+
+--------------------------------------------------------------------------------
+CLAIM 3 — T3 (tests)  -> VERIFIED
+--------------------------------------------------------------------------------
+  tests/test_structure_graph_tool.py: _run(fs) helper passes job_id="sync"
+    (L118); 2 inline direct calls (test_analyze_mesh_invalid_preset_error_envelope
+    L193-194, test_structure_graph_invalid_preset_error_envelope L212-213) also
+    job_id="sync". test_query_structure_graph_no_graph (L355-362) pins the exact
+    new async-flow guard message. All result-expecting calls use sync.
+  tests/test_mesh_to_brep_live.py: BOTH direct compare_mesh_to_brep call sites
+    gained job_id="sync" (happy L314, error payload L326-328).
+  tests/test_job_tools.py: _poll_tool polls until status not in {queued,running}
+    (L121); launch asserts accept {"queued","running"} (L162,190,300,357,364);
+    poll vocab complete/failed (L168,195,265,306); NEW
+    test_structure_graph_launch_poll_complete (L291-310, mocked _call,
+    box payload -> complete with summary result: mesh=0, component_count=1,
+    face_count=6); NEW test_pool_saturation_queued_with_position (L331-372,
+    monkeypatches top-level `jobs` module: MAX_CONCURRENT=1, fresh _QUEUE,
+    _WORKERS_STARTED=False, Event-gated _call; asserts 2nd launch queued with
+    position==0; gate.set() -> both complete).
+  tests/test_jobs.py: vocab renamed completed->complete / error->failed
+    throughout; 3 NEW deterministic Event-gated pool tests:
+    test_pool_saturation_queued_observed_with_position (queued + position==0),
+    test_pool_saturation_position_ordering (positions 0,1,2),
+    test_pool_failure_drains_to_failed (queued -> failed after drain).
+  Full suite (orchestrator): 253 passed, 1 xfailed, 0 failures.
+
+--------------------------------------------------------------------------------
+CLAIM 4 — T4 (README.md)  -> VERIFIED
+--------------------------------------------------------------------------------
+  Only ONE hunk changed: @@ -91,24 +91,35 @@ (the "Long-running tools & job
+  polling" section + its intro). Verified from current file:
+  - 15 job-enabled tools listed (L92): run_scad, update_scad_body,
+    create_from_scad, annotate_mesh_parameters, review_reconstruction,
+    structure_graph, analyze_mesh, slice_mesh, compare_mesh_to_brep,
+    import_cad_file, import_mesh_file, export_as_stl, export_as_step,
+    export_as_3mf, export_as_f3d
+  - 4 statuses + not_found documented (L104-108): queued (position), running
+    (job_id+status), complete (result), failed (error), not_found
+  - Bounded queue note (L118): "at most MAX_CONCURRENT = 4 jobs run at once and
+    the excess jobs wait as queued."
+  - run_scad example (L111-114): launch line = {job_id, status:"queued"} only
+    (NO position); position appears ONLY on the first poll line
+    ({"job_id", "status":"queued", "position":2}); then running; then complete
+    with result. Matches _launch_job (no position) / _job_status (position).
+  - query_structure_graph note (Notes last bullet): stays sync but needs a
+    finished structure_graph job first (launch -> poll -> complete -> query).
+
+--------------------------------------------------------------------------------
+MECHANICAL GREPS
+--------------------------------------------------------------------------------
+  grep 'job_id: str = ""' mcp_server/fusion_server.py            -> 15  (PASS)
+  grep 'a job id polls status/result' mcp_server/fusion_server.py-> 15  (PASS)
+  grep 'status.*queued' mcp_server/jobs.py                        -> present
+      (L68 docstring, L77 record insert, L99 get_job branch)     (PASS)
+  grep '"status": "completed"' / 'status.*completed' jobs+server -> 0   (PASS)
+  grep '"status": "error"' jobs+server                            -> 0   (PASS)
+      NOTE: "error" appears only as the record KEY / failed-payload field and
+      error-message strings (allowed). "completed" appears ONLY as English prose
+      (fusion_server L2269/L2311 "feature has completed") and one test function
+      NAME test_run_scad_launch_poll_completed (test_job_tools L153) whose body
+      asserts "complete" — neither is a job-status VALUE.
+  py -3.14 -m py_compile mcp_server/jobs.py mcp_server/fusion_server.py -> exit 0 (PASS)
+
+--------------------------------------------------------------------------------
+FINDINGS / DEVIATIONS
+--------------------------------------------------------------------------------
+  None material. Cosmetic only:
+  - test_job_tools.py test function name test_run_scad_launch_poll_completed
+    retains old vocabulary in the NAME (body asserts "complete"). Not a status
+    value, not a spec deviation.
+  - jobs.py has no trailing newline at EOF (cosmetic, pre-existing T1 note).
+  - README example uses illustrative position 2 (0-based positions are real;
+    value is demonstrative, not normative).
+
+--------------------------------------------------------------------------------
+VERDICT: APPROVE
+  All 4 TODOs implemented exactly per spec; 15/15 wrappers + docstring lines;
+  envelope shapes byte-exact; timeouts correct (330 import/export, 120 extract);
+  query_structure_graph guard message exact; review_reconstruction calls the
+  sync helper; test vocabulary + 2 new tests + 3 pool tests present; README
+  section matches reality; scope clean (only the 8 permitted files + unrelated
+  pre-existing plan file); py_compile clean; full suite green (253/1/0).
+================================================================================

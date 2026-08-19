@@ -1,0 +1,96 @@
+async-job-scheme task 4 - README section + docstring verification
+Date: 2026-08-05
+
+================================================================================
+1. Docstring verification: job_id line present exactly once per tool (7 total)
+   grep pattern: job_id`: "" \(default\) launches the job and returns a job id
+   File: mcp_server/fusion_server.py
+   Result: Found 7 match(es)  -> exactly 7 occurrences, one per tool.
+
+   Match lines (grep 'job_id' -n mcp_server/fusion_server.py | docstring lines):
+   1423: `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+   1464: `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+   2170: `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+   2340: `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+   2537: `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+   2672: `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+   2786: `job_id`: "" (default) launches the job and returns a job id; "sync" runs
+
+   CONCLUSION: Todo 3 already appended the line to all 7 tools (run_scad,
+   update_scad_body, reconstruct_mesh, reconstruct_from_faces, create_from_scad,
+   annotate_mesh_parameters, review_reconstruction). NO docstring edits made.
+
+================================================================================
+2. grep 'job_id' in README.md (all 8 matches are inside the new section)
+C:\Users\danie\fusion-mcp\README.md
+  97: Seven long-running tools accept a `job_id` parameter so heavy work (OpenSCAD rendering, mesh reconstruction, screenshot capture) never blocks the caller: `run_scad`, `update_scad_body`, `reconstruct_mesh`, `reconstruct_from_faces`, `create_from_scad`, `annotate_mesh_parameters`, `review_reconstruction`.
+  99: The `job_id` parameter has three modes:
+ 101: - `job_id=""` (default): launches the job in the background and returns `{"job_id": "<id>", "status": "running"}` immediately
+ 102: - `job_id="<id>"`: polls the job, returning `running`, `completed` (with `result`), `error` (with `error`), or `not_found`
+ 103: - `job_id="sync"`: runs in the foreground and returns the full result exactly as before
+ 106: run_scad(code="cube([10,10,10]);")            -> {"job_id": "...", "status": "running"}     # launch
+ 107: run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "running"}     # poll
+ 108: run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "completed", "result": "{...}"}
+
+================================================================================
+3. README diff (new section only; pre-existing mesh-graph-pipeline 2-line diff
+   at lines 75-76 NOT touched, NOT claimed)
+@@ -90,6 +92,27 @@ Example workflow:
+ 5. review_reconstruction(mesh="0", body="0")
+ ```
+
++### Long-running tools & job polling
++
++Seven long-running tools accept a `job_id` parameter so heavy work (OpenSCAD rendering, mesh reconstruction, screenshot capture) never blocks the caller: `run_scad`, `update_scad_body`, `reconstruct_mesh`, `reconstruct_from_faces`, `create_from_scad`, `annotate_mesh_parameters`, `review_reconstruction`.
++
++The `job_id` parameter has three modes:
++
++- `job_id=""` (default): launches the job in the background and returns `{"job_id": "<id>", "status": "running"}` immediately
++- `job_id="<id>"`: polls the job, returning `running`, `completed` (with `result`), `error` (with `error`), or `not_found`
++- `job_id="sync"`: runs in the foreground and returns the full result exactly as before
++
++```text
++run_scad(code="cube([10,10,10]);")            -> {"job_id": "...", "status": "running"}     # launch
++run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "running"}     # poll
++run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "completed", "result": "{...}"}
++```
++
++Notes:
++- Jobs are in-memory only and are lost when the MCP server restarts, so keep polling until a job reaches `completed` or `error`.
++- The Fusion add-in command cap is 300s: each polled job runs to completion or returns its own timeout error.
++- The result of a polled `run_scad` is the same JSON string the tool normally returns; `annotate_mesh_parameters` and `review_reconstruction` return their screenshots as base64 image data.
++
+ ### Other
+ - Execute arbitrary Python scripts inside Fusion 360
+ - Create/clear documents
+
+================================================================================
+4. Rendered README excerpt (section placement: after Mesh Reconstruction's
+   Example workflow block, before ### Other)
+
+### Long-running tools & job polling
+
+Seven long-running tools accept a `job_id` parameter so heavy work (OpenSCAD rendering, mesh reconstruction, screenshot capture) never blocks the caller: `run_scad`, `update_scad_body`, `reconstruct_mesh`, `reconstruct_from_faces`, `create_from_scad`, `annotate_mesh_parameters`, `review_reconstruction`.
+
+The `job_id` parameter has three modes:
+
+- `job_id=""` (default): launches the job in the background and returns `{"job_id": "<id>", "status": "running"}` immediately
+- `job_id="<id>"`: polls the job, returning `running`, `completed` (with `result`), `error` (with `error`), or `not_found`
+- `job_id="sync"`: runs in the foreground and returns the full result exactly as before
+
+```text
+run_scad(code="cube([10,10,10]);")            -> {"job_id": "...", "status": "running"}     # launch
+run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "running"}     # poll
+run_scad(job_id="<the job id above>")         -> {"job_id": "...", "status": "completed", "result": "{...}"}
+```
+
+Notes:
+- Jobs are in-memory only and are lost when the MCP server restarts, so keep polling until a job reaches `completed` or `error`.
+- The Fusion add-in command cap is 300s: each polled job runs to completion or returns its own timeout error.
+- The result of a polled `run_scad` is the same JSON string the tool normally returns; `annotate_mesh_parameters` and `review_reconstruction` return their screenshots as base64 image data.
+
+### Other
+- Execute arbitrary Python scripts inside Fusion 360
+- Create/clear documents
+- Undo/redo
+- Save/save as

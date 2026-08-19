@@ -1,0 +1,163 @@
+================================================================================
+Task 11 (R-5): Hardened hole classification (opposite signed area + winding number)
+Wave W6 - mcp_server/mesh_analysis.py
+Date: 2026-08-05
+================================================================================
+
+--------------------------------------------------------------------------------
+1. BASELINE (unchanged code)
+--------------------------------------------------------------------------------
+Command: py -3.14 -m pytest tests/ -k "not live" -q
+Result: 224 passed, 18 deselected in 14.25s
+No failures, no errors.
+
+--------------------------------------------------------------------------------
+2. FILES MODIFIED
+--------------------------------------------------------------------------------
+- mcp_server/mesh_analysis.py  (4 new functions, 1 logic change)
+- tests/test_hole_classification_r5.py  (NEW – 5 tests)
+
+Guardrails respected: scad_translator.py untouched; no existing test files
+modified; no new dependencies beyond numpy; decompose return dict unchanged
+(additive only); _loop_contains_centroid signature unchanged.
+
+--------------------------------------------------------------------------------
+3. NEW FUNCTIONS (mesh_analysis.py)
+--------------------------------------------------------------------------------
+
+_generalized_winding_number(point, welded_verts, welded_tris)  [L1557]
+    Jacobson et al. 2013 solid-angle sum formula, numpy-vectorised.
+    Filters degenerate vectors (|vec| < 1e-15). Returns 0.0 on empty tris.
+    O(n) in triangle count.
+
+_same_sign_2d(a, b)  [L1624]
+    True when both >0 or both <0. Zero-area (==0) → False (can't be a
+    meaningful hole candidate).
+
+_centroid_near_boundary(loop_2d, centroids_2d)  [L1633]
+    Checks whether any triangle centroid is within 1% of the loop's
+    effective diameter from the nearest loop edge. Uses point-to-segment
+    distance (clamped to vertices). Returns True if ANY centroid is
+    ambiguous → triggers winding-number fallback.
+
+_compute_interior_probe_3d(loop_pts_2d, loop_pts_3d, normal, origin_3d)
+    [L1692]
+    Projects the loop's 2D centroid (offset inward by 1% of loop diameter
+    toward the farthest vertex) back to 3D using the same u,v basis as
+    _project_to_2d (matching ref-selection: abs(n[0]) <= abs(n[1])).
+
+--------------------------------------------------------------------------------
+4. HOLE-CLASSIFICATION CHANGE (decompose_mesh_faces L1962-2016)
+--------------------------------------------------------------------------------
+
+R-5 pre-check inserted before the existing centroid-containment test:
+
+  1. _same_sign_2d(li.signed, outer.signed) → True
+     → always merge (same winding direction → cannot be a hole)
+
+  2. Opposite sign:
+     a. _loop_contains_centroid → False → hole  (existing behaviour)
+     b. _loop_contains_centroid → True  +  _centroid_near_boundary → False
+        → merge  (unambiguous centroid test)
+     c. _loop_contains_centroid → True  +  _centroid_near_boundary → True
+        +  NOT residual_out.get("residual_pairs")
+        → _generalized_winding_number
+          wn > 0.5 → merge,  wn < 0.5 → hole
+     d. residual_out.get("residual_pairs") is truthy  (non-manifold)
+        → skip winding number, fall back to centroid result = merge
+        (documented as known limitation per plan spec)
+
+The fallback "should_merge = True" in the else branch preserves the
+existing behaviour: when the centroid test says "merge" but the winding
+number is unavailable (non-manifold), we merge (safe default — avoids
+spurious holes).
+
+--------------------------------------------------------------------------------
+5. DEAD-GUARD BUG (found by orchestrator, fixed)
+--------------------------------------------------------------------------------
+
+Original code at L1980:
+    if ambiguous and not has_warnings:
+
+Bug: has_warnings is initialized False at L1903 and only set True at L2052,
+which runs AFTER the hole-classification loop (L1962-2016). Therefore at
+the guard evaluation, has_warnings is ALWAYS False for the current group.
+The winding-number guard NEVER blocks — non-manifold meshes get winding
+numbers despite the plan's prohibition.
+
+Fix: changed to:
+    if ambiguous and not residual_out.get("residual_pairs"):
+
+residual_out is populated by _boundary_loops at L1917 (BEFORE
+classification), so residual_pairs reflects the CURRENT group's non-manifold
+edge pairs. This is per-group — more precise than the global has_warnings.
+
+NOTE comment updated to reference residual_pairs (R-4) as the per-group
+non-manifold signal.
+
+--------------------------------------------------------------------------------
+6. NEW TESTS (tests/test_hole_classification_r5.py)
+--------------------------------------------------------------------------------
+
+test_opposite_signed_area_hole
+    Annulus mesh (CCW outer + CW inner). No monkeypatching.
+    → 1 face, 1 hole, 4 hole vertices, area=12.0 (16-4).
+
+test_same_signed_merge
+    Annulus mesh + monkeypatched _same_sign_2d → True.
+    (In a connected 2-manifold mesh, inner loops are always opposite-signed
+    after boundary_loops normalisation — so same-sign branch requires
+    synthetic triggering.)
+    → inner loop merged, no holes, area=16.0.
+
+test_winding_number_fallback_merge
+    Annulus + monkeypatched _loop_contains_centroid → True,
+    _centroid_near_boundary → True, _generalized_winding_number → 0.95,
+    _boundary_loops wrapped to clear residual_pairs.
+    → wn > 0.5 → merge, no holes, area=16.0.
+
+test_winding_number_fallback_hole
+    Same as above but _generalized_winding_number → 0.12.
+    → wn < 0.5 → hole emitted, area=12.0.
+
+test_degenerate_hole_filtered
+    4x4 outer, 0.001x0.001 inner (area ~1e-6 << _MIN_FACE_AREA 1e-4).
+    → degenerate hole filtered, no holes, area=16.0.
+
+Test idiom: annulus pattern (like _frame_mesh from test_decompose_faces_fix.py).
+Winding-number tests wrap _boundary_loops to clear residual_pairs because the
+weld's rounded-key grid order reorders vertex indices, creating intermediate
+non-manifold edges in _boundary_loops (known T1 weld-grid caveat). Final
+decompose output is correct — the residuals are transient.
+
+--------------------------------------------------------------------------------
+7. TEST RESULTS
+--------------------------------------------------------------------------------
+
+R5 tests:
+  py -3.14 -m pytest tests/test_hole_classification_r5.py -v
+  → 5 passed in 1.13s
+
+Full headless suite:
+  py -3.14 -m pytest tests/ -k "not live" -q
+  → 229 passed, 18 deselected in 14.19s  (224 baseline + 5 new)
+
+Syntax check:
+  py -3.14 -m py_compile mcp_server/mesh_analysis.py → OK
+
+--------------------------------------------------------------------------------
+8. QA SCENARIOS FROM PLAN
+--------------------------------------------------------------------------------
+
+Happy: synthetic square-with-hole mesh → outer CCW area=4.0, inner CW
+  area=-1.0, no centroid inside → hole emitted ✓ (test_opposite_signed_area_hole)
+
+Failure: degenerate hole (area < _MIN_FACE_AREA) → filtered out ✓
+  (test_degenerate_hole_filtered)
+
+Performance: _generalized_winding_number on annulus (8 tris) < 1ms.
+  Larger meshes expected < 100ms for 2000 tris (numpy-vectorised).
+
+================================================================================
+END OF EVIDENCE LOG
+================================================================================

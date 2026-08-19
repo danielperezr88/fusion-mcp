@@ -1,0 +1,132 @@
+F4 SCOPE FIDELITY — async-job-scheme
+Date: 2026-08-05
+Reviewer: F4 (read-only; no files modified besides this log + notepad append)
+
+VERDICT: APPROVE
+
+--------------------------------------------------------------------
+(a) fusion_server.py — hunk-by-hunk attribution (git diff, 13 hunks)
+--------------------------------------------------------------------
+H1  @@ -282,6 +282,28 @@   -> _job_status() + _launch_job() helpers inserted AFTER _call(),
+                                        before "# ---- Status & Info ----".  ALLOWED (plan Todo 3a).
+H2  @@ -1361,8 +1383,8 @@   -> run_scad body renamed to _run_scad_sync (decorator removed).
+                                        ALLOWED (7-tool refactor, Todo 3b).
+H3  @@ -1382,7 +1404,34 @@   -> new @mcp.tool() run_scad wrapper w/ trailing job_id + docstring line;
+                                        _update_scad_body_sync rename.  ALLOWED.
+H4  @@ -1398,6 +1447,30 @@   -> new @mcp.tool() update_scad_body wrapper w/ job_id.  ALLOWED.
+H5  @@ -1491,6 +1564,10 @@   -> analyze_mesh: decompose_error guard.
+                                        PRE-EXISTING BASELINE (mesh-graph-pipeline, verified task-3).
+H6  @@ -1599,6 +1676,11 @@   -> structure_graph: decompose_error guard.
+                                        PRE-EXISTING BASELINE (mesh-graph-pipeline, verified task-3).
+H7  @@ -1949,9 +2031,8 @@   -> reconstruct_mesh body renamed _reconstruct_mesh_sync.  ALLOWED.
+H8  @@ -2054,7 +2135,49 @@   -> new @mcp.tool() reconstruct_mesh wrapper w/ job_id.  ALLOWED.
+H9  @@ -2273,10 +2420,9 @@   -> annotate_mesh_parameters -> _annotate_mesh_parameters_sync, JSON-safe
+                                        dict {"text","views[]"} (no Image objects).  ALLOWED (Todo 3c).
+H10 @@ -2352,17 +2498,62 @@   -> new annotate wrapper (sync path rebuilds original list w/ Image);
+                                        _review_reconstruction_sync -> dict.  ALLOWED.
+H11 @@ -2442,15 +2633,58 @@   -> new review_reconstruction wrapper w/ job_id.  ALLOWED.
+H12 @@ -2488,8 +2722,8 @@   -> create_from_scad body renamed _create_from_scad_sync.  ALLOWED.
+H13 @@ -2527,6 +2761,38 @@   -> new @mcp.tool() create_from_scad wrapper w/ job_id.  ALLOWED.
+
+Job-enabled tool count: exactly 7 (run_scad, update_scad_body, reconstruct_mesh,
+reconstruct_from_faces, annotate_mesh_parameters, review_reconstruction,
+create_from_scad).  grep "job_id" in fusion_server.py -> occurrences ONLY in
+the 2 helpers + the 7 wrappers (sig+doc+sync/poll branches): L1408,1452,2139,
+2328,2512,2649,2766.  No other tool gained a job_id param.
+
+NOT job-enabled (verified absent from diff):
+- capture_screenshot:  0 hits in git diff (grep capture_screenshot -> none)
+- slice_mesh:          0 hits in git diff
+- compare_mesh_to_brep: appears ONLY as an unchanged context line
+- analyze_mesh:        only the pre-existing decompose_error hunk (H5); no job_id
+- structure_graph:     only the pre-existing decompose_error hunk (H6); no job_id
+
+_call() L269-282: git show HEAD:mcp_server/fusion_server.py compared -> byte-identical.
+
+--------------------------------------------------------------------
+(b) capture_screenshot untouched
+--------------------------------------------------------------------
+git diff -- mcp_server/fusion_server.py | grep capture_screenshot -> 0 lines.  PASS.
+
+--------------------------------------------------------------------
+(c) bundle.py untouched
+--------------------------------------------------------------------
+git diff -- mcp_server/bundle.py -> EMPTY (file not even in git status).  PASS.
+
+--------------------------------------------------------------------
+(d) scad_translator.py untouched
+--------------------------------------------------------------------
+git diff -- mcp_server/scad_translator.py -> EMPTY.  PASS (hard guardrail).
+
+--------------------------------------------------------------------
+(e) README.md diff
+--------------------------------------------------------------------
+git diff -- README.md = 2 hunks ONLY:
+  Hunk1 @@ -75,6 +75,8 @@  -> pre-existing mesh bullets
+         (structure_graph, query_structure_graph) — BASELINE, not this plan.
+  Hunk2 @@ -90,6 +92,27 @@  -> "### Long-running tools & job polling" (21-line new section).
+No other section edited.  PASS.
+
+--------------------------------------------------------------------
+(f) No feature scope creep (cancellation/persistence/mechanism)
+--------------------------------------------------------------------
+jobs.py: grep cancel|persist|asyncio|queue -> 1 hit, the docstring guardrail
+  "Deliberately minimal: no cancellation, no persistence across restarts, no
+  retry, no callbacks." (comment only — not a feature).  PASS.
+fusion_server.py diff: grep cancel|persist|asyncio|queue|pickle|sqlite|save
+  -> 0 hits.  Mechanism is threading.Thread + in-memory dict only (jobs.py).
+  PASS.
+
+--------------------------------------------------------------------
+(g) requirements.txt untouched
+--------------------------------------------------------------------
+git diff -- mcp_server/requirements.txt -> EMPTY.  Zero new dependencies.  PASS.
+
+--------------------------------------------------------------------
+(h) FusionMCP.py diff (exactly 3 changes, 5 diff lines)
+--------------------------------------------------------------------
+  +ADDIN_CMD_TIMEOUT = 300                 (after PORT = 7432)
+  -event.wait(timeout=30)                  (L67 -> L68)
+  +event.wait(timeout=ADDIN_CMD_TIMEOUT)
+  -result = _results.pop(cmd_id, {"error": "Timeout - Fusion did not respond in 30s"})
+  +result = _results.pop(cmd_id, {"error": f"Timeout - Fusion did not respond in {ADDIN_CMD_TIMEOUT}s"})
+No queue/event/threading restructure, no handler edits.  PASS.
+
+--------------------------------------------------------------------
+(i) Evidence logs present
+--------------------------------------------------------------------
+.omo/evidence/async-job-scheme-task-1.log   (103 B)
+.omo/evidence/async-job-scheme-task-2.log   (1377 B)
+.omo/evidence/async-job-scheme-task-3.log   (736 B)
+.omo/evidence/async-job-scheme-task-4.log   (6243 B)
+All 4 exist.  PASS.
+
+--------------------------------------------------------------------
+(j) Untracked new files accounted for
+--------------------------------------------------------------------
+git status --short shows ?? mcp_server/jobs.py, ?? tests/test_job_tools.py,
+?? tests/test_jobs.py (all plan files, Todos 1/3).  PASS.
+Other untracked (.omo/*, .sisyphus/) are tooling/plans dirs, not code.
+
+--------------------------------------------------------------------
+Out-of-plan modified files (all attributed to KNOWN PRE-EXISTING baseline,
+NOT this plan's scope creep):
+  tests/test_structure_graph_tool.py  -> +2 tests for analyze_mesh/structure_graph
+                                        error envelopes (mesh-graph-pipeline baseline)
+  .omo/plans/mesh-graph-pipeline.md   -> pre-existing plan status edits
+Test file diffs for THIS plan (4 files, 13 call sites) are purely mechanical
+job_id="sync" additions: test_mesh_convert.py (4), test_annotate_mesh_parameters_live.py (1),
+test_mesh_reconstruction_live.py (6), test_review_reconstruction_live.py (2).
+
+--------------------------------------------------------------------
+Findings
+--------------------------------------------------------------------
+- F4-1 (INFO): analyze_mesh structure_graph decompose_error hunks confirmed as
+  the inherited pre-existing baseline; no job_id param introduced there.
+- F4-2 (INFO): image tools' @mcp.tool() wrappers retain `-> list` annotation;
+  async path stores JSON-safe dict, sync path rebuilds [text, Image...] list
+  — matches plan Todo 3c exactly.
+- F4-3 (INFO): evidence logs task-1..4 present with the mesh-graph-pipeline logs
+  and baseline-pretask3.log (pre-existing), confirming the baseline existed.
+
+No out-of-scope code changes found.  APPROVE.

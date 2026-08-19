@@ -1,0 +1,40 @@
+async-job-scheme Task 2 - FusionMCP.py add-in command cap 30s -> 300s
+========================================================================
+Date: 2026-08-05
+Status: DONE
+
+Changes (3, exactly as specified):
+  1. Added module constant ADDIN_CMD_TIMEOUT = 300 next to PORT = 7432.
+  2. event.wait(timeout=30) -> event.wait(timeout=ADDIN_CMD_TIMEOUT)
+  3. Timeout fallback -> f"Timeout - Fusion did not respond in {ADDIN_CMD_TIMEOUT}s"
+
+git diff -- FusionMCP.py
+-----------------------
+diff --git a/FusionMCP.py b/FusionMCP.py
+index d9a1427..3ee2d3d 100644
+--- a/FusionMCP.py
++++ b/FusionMCP.py
+@@ -32,6 +32,7 @@ _result_events: dict = {}
+ 
+ CUSTOM_EVENT_ID = "FusionMCPTickV4"
+ PORT = 7432
++ADDIN_CMD_TIMEOUT = 300
+ 
+ 
+ # ---- HTTP Handler ----
+@@ -64,8 +65,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
+         _cmd_queue.put(data)
+         if app:
+             app.fireCustomEvent(CUSTOM_EVENT_ID, cmd_id)
+-        event.wait(timeout=30)
+-        result = _results.pop(cmd_id, {"error": "Timeout - Fusion did not respond in 30s"})
++        event.wait(timeout=ADDIN_CMD_TIMEOUT)
++        result = _results.pop(cmd_id, {"error": f"Timeout - Fusion did not respond in {ADDIN_CMD_TIMEOUT}s"})
+         _result_events.pop(cmd_id, None)
+         return result
+ 
+
+py_compile check
+----------------
+$ py -3.14 -m py_compile FusionMCP.py
+Result: PASS (exit 0, PY_COMPILE_OK)
