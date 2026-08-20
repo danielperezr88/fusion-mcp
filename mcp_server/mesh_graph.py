@@ -28,8 +28,8 @@ Nodes
                    point loops).
 ``curved:N``       label "CurvedPatch" — one per curved patch
                    (``patch_index``).  Attrs: node_id, label, component_id,
-                   triangle_count, curve_type (the patch ``surface_type``:
-                   cylinder/sphere/cone/freeform), area_cm2.
+                    triangle_count, curve_type (the patch ``surface_type``:
+                    cylinder/sphere/cone/torus/extrusion/freeform), area_cm2.
 ``component:N``    label "Component" — one per detected component plus any
                    component id referenced by a face/patch.  Attrs: node_id,
                    label, component_id, face_count.

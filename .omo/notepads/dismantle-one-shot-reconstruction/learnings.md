@@ -551,3 +551,35 @@ Probe result on filleted cuerpo79: 119P + 4 freeform + 1 cylinder (r=0.37, sweep
 
 ### Key insight
 The (d2) "P=91 C=0" fragmentation issue from the filleted experiment is now understood: it was never a clustering bug — it's that the curved walls are splines, not cylinders. No amount of clustering improvement can make a spline surface pass a cylinder epsilon gate. Future work to recover spline surfaces would need a different approach (e.g., fit a 2D spline to the projected normal-angle vs radius curve).
+
+## 2026-08-20 — Phase 2: spline-extrusion band recovery (124 → 52 faces)
+
+### What was built
+The "different approach" from the key insight above: recover prismatic walls as `surface_type: "extrusion"` faces with adaptive B-spline profiles. Implementation in `mesh_analysis.py`:
+
+1. **Band finding via shared-edge direction votes** (not normal-based partitioning): two small groups band-chain when their shared mesh edge is ≥0.95-parallel to a canonical axis. This is the geometric signature of an extrusion (consecutive faces share axis-parallel edges), chains corners AND smooth junctions, never crosses into caps, and is immune to the normal-direction ambiguity that breaks per-group axis partitioning (groups whose normals are ⊥ to two canonical axes).
+
+2. **PCA axis estimation**: smallest eigenvector of the normal scatter matrix Σnᵢnᵢᵀ replaces cross-product in `_find_extrusion_axis`; canonical candidates win ties (degenerate near-flat bands get arbitrary PCA directions). Out-of-plane eigenvalue gate (λ_min/trace ≥ 0.02) rejects taper/helix.
+
+3. **Twist tripwire**: correlation between projected-normal azimuth and axial coordinate per group; high correlation + axially short strips = helical twist → reject.
+
+4. **Greedy monotonic walk with multi-start**: the band graph (often branched by T-junctions from coplanar-merged strips or non-manifold tessellation) is traversed by smallest normal-turn at each step; trying all degree-1 endpoints and picking best coverage; emits the covered subset (≥50%) as the extrusion face, leftovers stay planar.
+
+5. **Corner-pinned adaptive cubic B-spline ladder**: k=4 start, insert knots at worst-residual midpoints, refit each k; accept at first k with mean residual ≤ ε. Overfit guard: k≥n (underdetermined) or adaptive k−pin_ctrl0 ≥ 0.5·n → reject. Corners detected at >60° normal turns; pin multiplicity 1 (concentrates curvature without forcing C⁰, which would underdetermine fits on bands with many junctions). Lyche–Mørken knot removal post-pass: drop interior knots whose removal bound ≤ ε, one final refit, revert if residual regresses.
+
+6. **Acceptance ladder per band**: closed + ≥8 points → Kasa 360° cylinder first (generalizes meshb2 path); else spline. This means circular arcs still extract as cylinders (by design — cylinder-first), and only non-circular smooth profiles reach the spline rung.
+
+### Key deviations from the locked design (forced by real-mesh behavior)
+- **Edge-vote banding replaces normal partitioning** — the locked "partition by `_group_axis_partition`" breaks on axis-aligned normals (ellipse top chord ⊥ to 2 axes → mispartitioned → band splits). Edge-direction votes are the principled fix.
+- **Corner threshold 60° (not 45°)** — 45° over-detects fillet junctions as corners (8 corners in 19 points → k-guard fires). 60° keeps fillet junctions smooth while pinning real 90° profile corners.
+- **Pin multiplicity 1 (not 3/2)** — multiplicity 3/2 causes underdetermination on real bands with many corners (8×3+4 = 28 ≥ 19 pts). Multiplicity 1 = just a knot at the corner; the spline stays determined and smoothly approximates the corner within ε.
+- **Partial band emission (≥50% coverage)** — real bands are branched (T-junctions); emitting the covered subset (e.g. 66/83 groups = 79%) as one extrusion face, with leftovers staying planar, is a massive win vs all-or-nothing bail.
+
+### Results
+- **cuerpo79 filleted: 124 → 52 total faces** (58% reduction): 44 planar + 3 extrusion + 1 cylinder + 4 freeform. The 3 extrusion patches collapsed ~80 wall/fillet strips. The 4 remaining freeform patches are the X-axis band (35 groups, walk coverage <50% — too branched) and fragments.
+- **meshb2: 32P + 20C r=0.25 UNCHANGED** — band pass never intercepts step-1-consumed clusters.
+- **Full suite: 300 passed, 1 xfailed, 0 failures** (289 baseline + 11 new spline-band tests).
+- **mesh_graph.py: generic `surface_type` handling** — no whitelist, "extrusion" flows through as `curve_type="extrusion"` automatically; docstring updated.
+
+### What would push cuerpo79 below 50
+The 4 remaining freeform patches + the 44 planar groups: the X-band (35 groups, 391 tris) walk-fails at <50% coverage due to extreme branching. A graph-simplification pre-pass (collapse coplanar-merged groups, prune T-junction edges by azimuth consistency) could make that band walkable → 1 more extrusion → ~46 faces. The 44 planar groups include ~22 horizontal caps (truth) + ~22 wall fragments (the T-junction leftovers from the Z-band's 17 uncovered groups). Phase 3: graph simplification + leftover absorption.

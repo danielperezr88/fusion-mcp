@@ -1225,6 +1225,31 @@ _CHAIN_AXIS_PERP_DOT = 0.15   # |mean_normal . axis| < this => the group's
                               # fillet bands (⊥ X/Y) from chaining into
                               # wall bands (⊥ Z) through smooth junctions.
 
+# --- extrusion-band recovery, phase 2: spline profiles (2026-08-20) ---------
+_BAND_EDGE_PARALLEL_DOT = 0.95   # shared mesh edge |d_norm . axis| above this
+                                 # => the edge is parallel to the extrusion
+                                 # axis => band-adjacent (chains corners AND
+                                 # smooth junctions; never chains into caps,
+                                 # whose shared edges are perpendicular)
+_BAND_OUT_OF_PLANE_MAX = 0.02    # lambda_min/trace of the normal scatter
+                                 # matrix at or above this => the normals
+                                 # have systematic out-of-plane tilt (taper
+                                 # or helix lead) — not a prismatic band
+_BAND_TWIST_CORR_MAX = 0.8       # correlation between projected-normal
+                                 # azimuth and axial coordinate above this
+                                 # (with axially short strips) = twist
+_BAND_TWIST_SPAN_FRAC = 0.6      # every group spanning less than this
+                                 # fraction of the band's axial extent is
+                                 # the "short strips" half of the twist test
+_SPLINE_OVERFIT_RATIO = 0.5      # distinct control points at or above this
+                                 # ratio of profile points => the profile is
+                                 # not smooth — reject (overfit guard)
+_BAND_CORNER_DEG = 60.0          # projected-normal turn between consecutive
+                                 # band groups above this = profile corner —
+                                 # pinned as a reduced-continuity knot (60
+                                 # deg keeps fillet junctions at 45 deg smooth
+                                 # while pinning real 90 deg profile corners)
+
 
 def _otsu_threshold(log_values, n_bins=128):
     """Otsu's method: threshold maximizing between-class variance.
@@ -1467,29 +1492,43 @@ def _group_axis_partition(mean_normal):
 
 
 def _find_extrusion_axis(tri_normals, tri_indices):
-    """Candidate extrusion axis for a triangle set, or None.
+    """Authoritative extrusion axis for a triangle set, or None.
 
-    A band of triangles extruded along axis ``a`` has (nearly) all face
-    normals perpendicular to ``a``.  Candidate axes are the
-    cross-product result from ``_find_axis_from_cross_products`` (cross
-    products of normal pairs are parallel to the axis) PLUS the three
-    canonical world axes — the cross-product method alone picks the
-    wrong axis on mixed-topology clusters (e.g. an extruded wall with a
-    minority fillet band whose normals contaminate the cross products),
-    so every candidate is scored by its perpendicular fraction and the
-    highest wins.  Returned only when that fraction is at least
-    ``_SWEEP_AXIS_MIN_FRACTION``.
+    A band extruded along axis ``a`` has (nearly) all face normals
+    perpendicular to ``a``.  Candidate axes are the three canonical
+    world axes plus the smallest eigenvector of the normal scatter
+    matrix ``sum(n n^T)`` — the least-squares plane through the
+    offsetted strip normals, which sits "in between" their alternating
+    deviations.  Canonical axes are listed first so they win ties
+    (degenerate near-flat bands get arbitrary PCA directions).  Every
+    candidate is scored by its perpendicular fraction; the highest wins
+    and is returned only when at least ``_SWEEP_AXIS_MIN_FRACTION``.
+    A separate out-of-plane gate rejects triangle sets whose smallest
+    scatter eigenvalue holds at or above ``_BAND_OUT_OF_PLANE_MAX`` of
+    the trace — systematic normal tilt out of the perpendicular plane
+    (taper, helix lead) is not a prismatic band.
     """
     normals = tri_normals[np.asarray(tri_indices, dtype=np.int64)]
     if len(normals) < 4:
         return None
 
+    scatter = normals.T @ normals
+    eigvals, eigvecs = np.linalg.eigh(scatter)
+    trace = float(eigvals.sum())
+    if trace <= 1e-18:
+        return None
+    if float(eigvals[0] / trace) >= _BAND_OUT_OF_PLANE_MAX:
+        return None
+    pca = np.array(eigvecs[:, 0], dtype=np.float64)
+    big = int(np.argmax(np.abs(pca)))
+    if pca[big] < 0.0:
+        pca = -pca
+    pca = pca / float(np.linalg.norm(pca))
+
     candidates: List[np.ndarray] = []
-    cp = _find_axis_from_cross_products(normals)
-    if cp is not None:
-        candidates.append(cp)
     for c in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
         candidates.append(np.array(c, dtype=np.float64))
+    candidates.append(pca)
 
     best_axis = None
     best_frac = 0.0
@@ -1743,6 +1782,687 @@ def _sweep_recover_cluster(v_arr, f_arr, tri_normals, planar_groups,
     return entries, consumed, consumed_tris
 
 
+# ---------------------------------------------------------------------------
+# Phase 2: extrusion bands with spline profiles (2026-08-20)
+#
+# A prismatic wall — any profile (arcs, corners, fitted splines) extruded
+# along an axis — tessellates into planar chord strips whose shared edges
+# are parallel to the extrusion axis.  The sweep layer above recovers only
+# the constant-radius subsets (cylinder runs); these functions recover the
+# WHOLE band as a single extrusion face by fitting the projected profile
+# with an adaptive corner-pinned cubic B-spline.  Tessellation vertices
+# lie exactly on the design profile (Fusion evaluates the true curve
+# before extruding the polyline approximation), so a genuine band fits
+# within epsilon at a small control count regardless of tessellation
+# coarseness — the k/n overfit ratio, not epsilon, guards against fitting
+# non-smooth garbage.
+# ---------------------------------------------------------------------------
+
+
+def _bspline_basis_matrix(params, knots, degree):
+    """Cox-de Boor basis matrix (n_params, n_ctrl) for a knot vector.
+
+    Vectorized triangular recursion: level 0 marks the half-open knot
+    span [t_i, t_{i+1}) containing each parameter (parameters equal to
+    the final knot are clipped into the last non-empty span so clamped
+    end evaluation works), and each level applies the standard
+    two-neighbour blend.  Repeated knots (zero-width spans) contribute
+    zero through the safe-division guards.
+    """
+    t = np.asarray(knots, dtype=np.float64)
+    u = np.asarray(params, dtype=np.float64).ravel()
+    n_knots = len(t)
+    n_ctrl = n_knots - degree - 1
+    spans = np.searchsorted(t, u, side="right") - 1
+    spans = np.clip(spans, 0, n_ctrl - 1)
+    B = np.zeros((len(u), n_knots - 1), dtype=np.float64)
+    B[np.arange(len(u)), spans] = 1.0
+    for j in range(1, degree + 1):
+        cols = n_knots - 1 - j
+        Bnew = np.zeros((len(u), cols), dtype=np.float64)
+        for k in range(cols):
+            lo = t[k + j] - t[k]
+            if lo > 0.0:
+                Bnew[:, k] += ((u - t[k]) / lo) * B[:, k]
+            hi = t[k + j + 1] - t[k + 1]
+            if hi > 0.0:
+                Bnew[:, k] += ((t[k + j + 1] - u) / hi) * B[:, k + 1]
+        B = Bnew
+    return B
+
+
+def _periodic_profile_knots(knot_list, degree):
+    """Extended evaluation knot vector for a per-period knot list.
+
+    *knot_list* holds the (sorted, possibly repeated) knot parameters of
+    one period, in [0, 1).  Tiling over offsets {-1, 0, +1} and slicing
+    out the window that starts ``degree`` knots before the first 0.0
+    yields the standard periodic window: ``n_c + degree`` extended
+    control points covering the domain [0, 1], where ``n_c`` is the
+    per-period knot count.  Extended control point ``i`` folds to
+    distinct control point ``i mod n_c``.
+    """
+    K = sorted(knot_list)
+    n_c = len(K)
+    tiled = sorted([k - 1.0 for k in K] + K + [k + 1.0 for k in K])
+    i0 = n_c
+    return tiled[i0 - degree: i0 + n_c + degree + 1]
+
+
+def _spline_curve_residual(points, params, knots, degree, ctrl, closed):
+    """Per-point geometric distances from *points* to a B-spline curve.
+
+    Each data parameter is refined by two Newton steps along the local
+    tangent (central finite differences of the evaluated curve); closed
+    profiles wrap refined parameters modulo the period.  Returns
+    ``(mean_distance, per_point_distances)``.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    s = np.asarray(params, dtype=np.float64).copy()
+    delta = 1e-5
+
+    def _eval(q):
+        return _bspline_basis_matrix(q, knots, degree) @ ctrl
+
+    for _ in range(2):
+        c_s = _eval(s)
+        if closed:
+            sp, sm = s + delta, s - delta
+        else:
+            sp = np.clip(s + delta, 0.0, 1.0)
+            sm = np.clip(s - delta, 0.0, 1.0)
+        tangents = (_eval(sp) - _eval(sm))
+        widths = (sp - sm)[:, None]
+        tangents = tangents / np.where(np.abs(widths) > 0.0, widths, 1.0)
+        denom = (tangents * tangents).sum(axis=1)
+        safe = denom > 1e-18
+        step = np.zeros_like(s)
+        step[safe] = ((pts - c_s)[safe] * tangents[safe]).sum(axis=1) \
+            / denom[safe]
+        s = s + step
+        s = np.mod(s, 1.0) if closed else np.clip(s, 0.0, 1.0)
+    c_fin = _eval(s)
+    dists = np.hypot(pts[:, 0] - c_fin[:, 0], pts[:, 1] - c_fin[:, 1])
+    return float(dists.mean()), dists
+
+
+def _lm_removal_bound(knots, ctrl, degree, knot_index):
+    """Lyche-Morken one-step bound for removing a simple interior knot.
+
+    Inverts Boehm insertion over the affected control window: a forward
+    pass from the left window edge and a backward pass from the right
+    edge each reconstruct the pre-insertion control points; when the knot
+    is redundant the two reconstructions agree.  The bound is the summed
+    absolute disagreement over the window (the B-spline basis is bounded
+    by 1, so no extra scaling is needed).  Returns ``(bound, ok)``.
+    """
+    t = knots
+    P = ctrl
+    r = knot_index
+    p = degree
+    lo, hi = r - p, r
+    if lo < 0 or hi >= len(P):
+        return float("inf"), False
+    u = float(t[r])
+    fwd = P.copy()
+    bwd = P.copy()
+    for j in range(lo + 1, hi + 1):
+        span = float(t[j + p] - t[j])
+        if span <= 0.0:
+            return float("inf"), False
+        a = (u - float(t[j])) / span
+        if not (0.0 < a < 1.0):
+            return float("inf"), False
+        fwd[j] = (P[j] - (1.0 - a) * fwd[j - 1]) / a
+    for j in range(hi - 1, lo - 1, -1):
+        span = float(t[j + p] - t[j])
+        if span <= 0.0:
+            return float("inf"), False
+        a = (u - float(t[j])) / span
+        if not (0.0 < a < 1.0):
+            return float("inf"), False
+        bwd[j] = (P[j + 1] - a * bwd[j + 1]) / (1.0 - a)
+    diff = np.abs(fwd[lo + 1:hi] - bwd[lo + 1:hi])
+    return float(diff.sum()), True
+
+
+def _fit_bspline_profile(points, closed, corner_params, epsilon):
+    """Corner-pinned adaptive cubic B-spline fit of a 2D profile.
+
+    Ladder: fit by linear least squares at the minimum non-trivial
+    control count (4 distinct), then insert a knot at the midpoint of
+    the largest knot interval containing the worst-residual parameter
+    and refit, until the mean geometric residual is within *epsilon*.
+    Corner parameters place a knot at each detected corner (multiplicity
+    1 — concentrating curvature without forcing C0, which would
+    underdetermine fits on real meshes with many junctions); the corner
+    positions are recorded in the output for the reconstruction
+    consumer.  Fires the overfit guard (control points at or above n,
+    or adaptive insertions at or above ``_SPLINE_OVERFIT_RATIO`` x n) by
+    returning None — the profile is not smooth.  Accepted fits run a
+    Lyche-Morken removal pass: knots whose removal bound stays within
+    *epsilon* are dropped (least bound first), the reduced knot set is
+    refitted once, and reverted if the residual regresses.
+
+    Returns a dict (profile_closed, profile_degree,
+    profile_control_points_cm, profile_knots, profile_corner_params,
+    residual_cm) or None.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n < 4:
+        return None
+    seg = np.hypot(pts[1:, 0] - pts[:-1, 0], pts[1:, 1] - pts[:-1, 1])
+    total = float(seg.sum())
+    if closed:
+        total += float(np.hypot(pts[0, 0] - pts[-1, 0],
+                                pts[0, 1] - pts[-1, 1]))
+    if total <= 1e-12:
+        return None
+    params = np.concatenate([[0.0], np.cumsum(seg)]) / total
+    degree = 3
+    corner_vals = sorted(float(c) % 1.0 for c in corner_params)
+
+    def _intervals(bounds):
+        out = []
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            if b > a + 1e-12:
+                out.append((a, b))
+        return out
+
+    def _insert_position(bounds, u_worst):
+        cands = [(a, b) for (a, b) in _intervals(bounds)
+                 if a <= u_worst <= b]
+        if not cands:
+            cands = _intervals(bounds)
+        a, b = max(cands, key=lambda iv: iv[1] - iv[0])
+        return 0.5 * (a + b)
+
+    def _fit_once():
+        if closed:
+            t_ext = _periodic_profile_knots(K, degree)
+            m_ext = len(t_ext) - degree - 1
+            a_ext = _bspline_basis_matrix(params, t_ext, degree)
+            design = np.zeros((n, len(K)))
+            np.add.at(design.T, np.arange(m_ext) % len(K), a_ext.T)
+        else:
+            t_ext = np.array(
+                [0.0] * (degree + 1) + interior + [1.0] * (degree + 1))
+            design = _bspline_basis_matrix(params, t_ext, degree)
+        q, *_ = np.linalg.lstsq(design, pts, rcond=None)
+        if closed:
+            ctrl_ext = np.vstack([q, q[:degree]])
+        else:
+            ctrl_ext = q
+        mean_res, dists = _spline_curve_residual(
+            pts, params, t_ext, degree, ctrl_ext, closed)
+        return q, t_ext, ctrl_ext, mean_res, dists
+
+    if closed:
+        K = [0.0, 0.25, 0.5, 0.75]
+        for c in corner_vals:
+            K.append(c)
+        K.sort()
+        interior = None
+        pin_ctrl0 = 4 + len(corner_vals)
+    else:
+        interior = []
+        for c in corner_vals:
+            interior.append(c)
+        interior.sort()
+        K = None
+        pin_ctrl0 = 4 + len(corner_vals)
+
+    while True:
+        q, t_ext, ctrl_ext, mean_res, dists = _fit_once()
+        n_ctrl = len(q)
+        if n_ctrl >= n:
+            return None
+        if mean_res <= epsilon:
+            break
+        if n_ctrl - pin_ctrl0 >= _SPLINE_OVERFIT_RATIO * n:
+            return None
+        u_worst = float(params[int(np.argmax(dists))])
+        if closed:
+            bounds = K + [1.0 + K[0]]
+            pos = _insert_position(bounds, u_worst) % 1.0
+            K.append(pos)
+            K.sort()
+        else:
+            bounds = [0.0] + interior + [1.0]
+            interior.append(_insert_position(bounds, u_worst))
+            interior.sort()
+
+    # --- Lyche-Morken removal pass on the accepted fit ---
+    while True:
+        if closed:
+            removable = [v for v in sorted(set(K))
+                         if K.count(v) == 1 and v != 0.0
+                         and v not in corner_vals]
+        else:
+            removable = [v for v in sorted(set(interior))
+                         if interior.count(v) == 1
+                         and v not in corner_vals]
+        if not removable:
+            break
+        best = None
+        for v in removable:
+            r_idx = int(np.searchsorted(
+                np.asarray(t_ext), v, side="left"))
+            bound, ok = _lm_removal_bound(t_ext, ctrl_ext, degree, r_idx)
+            if ok and bound <= epsilon:
+                if best is None or bound < best[0]:
+                    best = (bound, v)
+        if best is None:
+            break
+        if closed:
+            K.remove(best[1])
+        else:
+            interior.remove(best[1])
+        q_red, t_red, ctrl_red, res_red, _ = _fit_once()
+        if res_red <= epsilon:
+            q, t_ext, ctrl_ext, mean_res = q_red, t_red, ctrl_red, res_red
+        else:
+            if closed:
+                K.append(best[1])
+                K.sort()
+            else:
+                interior.append(best[1])
+                interior.sort()
+            break
+
+    out_knots = sorted(K) if closed else sorted(interior)
+    return {
+        "profile_closed": bool(closed),
+        "profile_degree": degree,
+        "profile_control_points_cm": [
+            [round(float(a), 6), round(float(b), 6)]
+            for a, b in (q if not closed else q)],
+        "profile_knots": [round(float(v), 6) for v in out_knots],
+        "profile_corner_params": [round(float(c), 6)
+                                  for c in corner_vals],
+        "residual_cm": round(float(mean_res), 8),
+    }
+
+
+def _band_walk_profile(band_groups, pair_junctions, planar_groups,
+                       mean_normals, axis, proj, f_arr):
+    """Ordered 2D profile walk over a band's group adjacency graph.
+
+    The band graph is traversed greedily by smallest projected-normal
+    azimuth turn at each step (the geometric continuation of the
+    profile, in the spirit of the sweep run-grower) — this rides
+    through spurious T-junction edges (coplanar-merged strips,
+    non-manifold tessellation) whose azimuth turns are large, instead
+    of bailing on degree >= 3 nodes.  The walk starts at the
+    smallest-index degree-1 group (path endpoint) or smallest group
+    (cycle).  Junction points come from the shared axis-parallel
+    mesh-edge vertex indices (exact, not proximity-matched); open ends
+    take the group's projected vertex farthest from its single
+    junction.  Corners are junctions where consecutive groups'
+    projected mean-normal azimuths turn more than ``_BAND_CORNER_DEG``.
+
+    Returns ``(points, corner_point_indices, closed, visited_groups)`` or
+    None when the walk cannot cover at least 50%% of the band's groups.
+    """
+    bset = set(band_groups)
+    adj: Dict[int, set] = defaultdict(set)
+    for (a, b) in pair_junctions:
+        if a in bset and b in bset:
+            adj[a].add(b)
+            adj[b].add(a)
+    degs = {g: len(adj[g]) for g in band_groups}
+    endpoints = sorted(g for g in band_groups if degs[g] == 1)
+    closed = len(endpoints) == 0
+    starts = endpoints if endpoints else [min(band_groups)]
+    if len(starts) > 12:
+        starts = starts[:12]
+
+    def _azimuth(gi):
+        n_vec = mean_normals[gi]
+        if n_vec is None:
+            return None
+        perp = n_vec - float(n_vec @ axis) * axis
+        ax_abs = np.abs(axis)
+        dom = int(np.argmax(ax_abs))
+        c1, c2 = (1, 2) if dom == 0 else ((0, 2) if dom == 1 else (0, 1))
+        if float(np.hypot(perp[c1], perp[c2])) <= 1e-9:
+            return None
+        return math.atan2(perp[c2], perp[c1])
+
+    def _turn(ga, gb):
+        aa, ab = _azimuth(ga), _azimuth(gb)
+        if aa is None or ab is None:
+            return 0.0
+        return abs((math.degrees(ab - aa) + 180.0) % 360.0 - 180.0)
+
+    best_order = None
+    best_cov = 0
+    for start in starts:
+        cur = start
+        visited = {start}
+        order = [start]
+        while True:
+            nxt_opts = [n for n in adj[cur] if n not in visited]
+            if not nxt_opts:
+                break
+            nxt = min(nxt_opts, key=lambda n: (_turn(cur, n), n))
+            visited.add(nxt)
+            order.append(nxt)
+            cur = nxt
+        if len(visited) > best_cov:
+            best_cov = len(visited)
+            best_order = order
+    if best_order is None or best_cov < 0.5 * len(band_groups):
+        return None
+    order = best_order
+    visited = set(order)
+    covers_all = len(visited) == len(band_groups)
+    closed = closed and covers_all
+    if closed and order[0] not in adj[order[-1]]:
+        return None
+
+    def _junction_2d(ga, gb):
+        key = (min(ga, gb), max(ga, gb))
+        va, vb = pair_junctions[key]
+        return 0.5 * (proj(va) + proj(vb))
+
+    seq: List[np.ndarray] = []
+    corner_idx: List[int] = []
+    if closed:
+        for i in range(len(order)):
+            ga, gb = order[i], order[(i + 1) % len(order)]
+            seq.append(_junction_2d(ga, gb))
+            if _turn(ga, gb) > _BAND_CORNER_DEG:
+                corner_idx.append(len(seq) - 1)
+    else:
+        j_first = _junction_2d(order[0], order[1])
+        pts0 = [proj(v) for v in _group_vertex_ids(
+            planar_groups, order[0], f_arr)]
+        outer0 = max(pts0, key=lambda p: float(
+            np.hypot(p[0] - j_first[0], p[1] - j_first[1])))
+        seq.append(outer0)
+        for i in range(len(order) - 1):
+            ga, gb = order[i], order[i + 1]
+            seq.append(_junction_2d(ga, gb))
+            if _turn(ga, gb) > _BAND_CORNER_DEG:
+                corner_idx.append(len(seq) - 1)
+        j_last = _junction_2d(order[-2], order[-1])
+        pts_e = [proj(v) for v in _group_vertex_ids(
+            planar_groups, order[-1], f_arr)]
+        outer_e = max(pts_e, key=lambda p: float(
+            np.hypot(p[0] - j_last[0], p[1] - j_last[1])))
+        seq.append(outer_e)
+
+    dedup: List[np.ndarray] = []
+    remap: List[int] = []
+    for i, p in enumerate(seq):
+        if dedup and float(np.hypot(
+                p[0] - dedup[-1][0], p[1] - dedup[-1][1])) <= 1e-9:
+            remap.append(len(dedup) - 1)
+        else:
+            dedup.append(p)
+            remap.append(len(dedup) - 1)
+    if len(dedup) < 4:
+        return None
+    corners = sorted({remap[i] for i in corner_idx
+                      if remap[i] < len(dedup)})
+    return np.array(dedup), corners, closed, order
+
+
+def _group_vertex_ids(planar_groups, gi, f_arr):
+    """Sorted unique welded vertex ids used by one planar group."""
+    tri_idx = np.asarray(planar_groups[gi]["tri_indices"], dtype=np.int64)
+    if len(tri_idx) == 0:
+        return []
+    return sorted({int(v) for v in np.unique(f_arr[tri_idx].ravel())})
+
+
+def _recover_extrusion_bands(v_arr, f_arr, tri_normals, planar_groups,
+                             edge_faces, tri_to_group, is_small,
+                             mean_normals, consumed_groups, epsilon,
+                             comp_ids, patch_idx):
+    """Prismatic-band recovery pass over remaining small planar groups.
+
+    Bands are chained DIRECTLY from shared-edge direction votes: a mesh
+    edge shared by two small groups whose direction is at least
+    ``_BAND_EDGE_PARALLEL_DOT``-parallel to a canonical axis unions the
+    groups into that axis's band set.  This is the geometric signature
+    of an extruded surface (all its faces contain the axis direction,
+    and consecutive faces share axis-parallel edges) — it chains
+    corners and smooth junctions alike, never crosses into caps through
+    perpendicular edges, and is immune to the normal-direction
+    ambiguity that mis-partitions groups whose normals are
+    perpendicular to two canonical axes at once.  Per band: the
+    authoritative axis estimation with the out-of-plane eigenvalue gate
+    (taper/helix rejection), the azimuth-vs-height twist tripwire, a
+    deterministic profile walk, and the acceptance ladder — full-circle
+    Kasa cylinder first (closed bands with >= 8 profile points), then
+    the corner-pinned adaptive B-spline extrusion fit.
+
+    Returns ``(patches, consumed_tris, consumed_groups)`` with patch
+    indices continuing from *patch_idx*.
+    """
+    eligible = [gi for gi in range(len(planar_groups))
+                if is_small[gi] and gi not in consumed_groups]
+    if len(eligible) < 2:
+        return [], set(), set()
+    gset = set(eligible)
+
+    edge_info: List[Tuple[int, int, np.ndarray, int, int]] = []
+    for edge, tris in edge_faces.items():
+        ga = gb = None
+        for t in tris:
+            g = tri_to_group.get(t)
+            if g in gset:
+                if ga is None:
+                    ga = g
+                elif g != ga:
+                    gb = g
+                    break
+        if ga is None or gb is None:
+            continue
+        va, vb = int(edge[0]), int(edge[1])
+        d = v_arr[vb] - v_arr[va]
+        dn = float(np.linalg.norm(d))
+        if dn <= 1e-12:
+            continue
+        edge_info.append((min(ga, gb), max(ga, gb), d / dn, va, vb))
+
+    patches: List[Dict] = []
+    used_tris: set = set()
+    used_groups: set = set()
+
+    for axis_i in range(3):
+        axis = _CANON_AXES[axis_i]
+        parent = {gi: gi for gi in eligible}
+        pair_junctions: Dict[Tuple[int, int], Tuple[int, int]] = {}
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for ga, gb, d_hat, va, vb in edge_info:
+            if abs(float(d_hat @ axis)) <= _BAND_EDGE_PARALLEL_DOT:
+                continue
+            key = (ga, gb)
+            if key not in pair_junctions:
+                pair_junctions[key] = (va, vb)
+            ra, rb = _find(ga), _find(gb)
+            if ra != rb:
+                parent[ra] = rb
+
+        comps: Dict[int, List[int]] = defaultdict(list)
+        for gi in eligible:
+            comps[_find(gi)].append(gi)
+
+        for root in sorted(comps, key=lambda r: min(comps[r])):
+            band_groups = sorted(comps[root])
+            if len(band_groups) < 2:
+                continue
+            band_tris = sorted(set(
+                ti for gi in band_groups
+                for ti in planar_groups[gi]["tri_indices"]))
+            if len(band_tris) < 6:
+                continue
+
+            axis_est = _find_extrusion_axis(tri_normals, band_tris)
+            if axis_est is None:
+                continue
+            if _band_twist_rejected(
+                    planar_groups, band_groups, mean_normals,
+                    axis_est, v_arr, f_arr):
+                continue
+
+            band_verts = v_arr[np.unique(
+                f_arr[np.asarray(band_tris, dtype=np.int64)].ravel())]
+            v_mean = band_verts.mean(axis=0)
+            ref = (np.array([1.0, 0.0, 0.0])
+                   if abs(float(axis_est[0])) < 0.9
+                   else np.array([0.0, 1.0, 0.0]))
+            u_ax = np.cross(axis_est, ref)
+            u_ax = u_ax / np.linalg.norm(u_ax)
+            w_ax = np.cross(axis_est, u_ax)
+
+            def _proj(vi):
+                rel = v_arr[int(vi)] - v_mean
+                return np.array([float(rel @ u_ax), float(rel @ w_ax)])
+
+            walk = _band_walk_profile(
+                band_groups, pair_junctions, planar_groups,
+                mean_normals, axis_est, _proj, f_arr)
+            if walk is None:
+                continue
+            points, corner_pts, closed, visited_groups = walk
+            band_tris = sorted(set(
+                ti for gi in visited_groups
+                for ti in planar_groups[gi]["tri_indices"]))
+            if len(band_tris) < 6:
+                continue
+
+            comp = comp_ids[band_tris[0]] if band_tris else 0
+            base_entry = {
+                "component": comp,
+                "triangle_count": len(band_tris),
+                "area": round(_cluster_tri_area(
+                    v_arr, f_arr, band_tris), 6),
+            }
+            axis_heights = band_verts @ axis_est
+            height = float(axis_heights.max() - axis_heights.min())
+
+            accepted = None
+            if closed and len(points) >= 8:
+                # below 8 profile points a circle claim is unfalsifiable
+                # (any 3-4 convex points are cocircular — e.g. a square
+                # tube's corners), so the Kasa rung only fires on bands
+                # coarse-enough-tessellated to test roundness at all
+                fit, res = _fit_sweep_cylinder(
+                    v_arr, f_arr, tri_normals, band_tris, axis_est,
+                    epsilon)
+                if fit is not None:
+                    accepted = dict(fit)
+                    accepted["axis"] = [round(float(c), 6)
+                                        for c in axis_est]
+                    accepted["residual_cm"] = round(float(res), 8)
+                    accepted["recovered_via"] = "band"
+            if accepted is None:
+                corner_params = []
+                if len(points) > 1:
+                    seg = np.hypot(
+                        points[1:, 0] - points[:-1, 0],
+                        points[1:, 1] - points[:-1, 1])
+                    if closed:
+                        seg = np.concatenate([seg, [float(np.hypot(
+                            points[0, 0] - points[-1, 0],
+                            points[0, 1] - points[-1, 1]))]])
+                    csum = np.concatenate([[0.0], np.cumsum(seg)])
+                    denom = float(csum[-1])
+                    if denom > 1e-12:
+                        corner_params = [
+                            float(csum[min(i, len(csum) - 2)])
+                            / float(denom) for i in corner_pts]
+                profile = _fit_bspline_profile(
+                    points, closed, corner_params, epsilon)
+                if profile is not None:
+                    accepted = {
+                        "surface_type": "extrusion",
+                        "axis": [round(float(c), 6) for c in axis_est],
+                        "axis_point_cm": [round(float(c), 6)
+                                          for c in v_mean],
+                        "u_axis": [round(float(c), 6) for c in u_ax],
+                        "w_axis": [round(float(c), 6) for c in w_ax],
+                        "height_cm": round(height, 6),
+                        "recovered_via": "spline_band",
+                    }
+                    accepted.update(profile)
+            if accepted is None:
+                continue
+
+            entry = dict(base_entry)
+            entry["patch_index"] = patch_idx + len(patches)
+            entry.update(accepted)
+            patches.append(entry)
+            used_tris.update(band_tris)
+            used_groups.update(visited_groups)
+
+    return patches, used_tris, used_groups
+
+
+def _band_twist_rejected(planar_groups, band_groups, mean_normals, axis,
+                         v_arr, f_arr):
+    """Azimuth-vs-axial-coordinate twist tripwire for one band.
+
+    A prismatic band's strips each span (nearly) the full axial extent,
+    so their projected-normal azimuths are uncorrelated with their mean
+    axial position.  A helical band's strips are axially short and their
+    azimuths drift monotonically with height — max correlation above
+    ``_BAND_TWIST_CORR_MAX`` with every strip spanning less than
+    ``_BAND_TWIST_SPAN_FRAC`` of the band's axial extent is twist, and
+    the band is rejected (it is not an extrusion of any 2D profile).
+    """
+    thetas: List[float] = []
+    hs: List[float] = []
+    spans: List[float] = []
+    lo, hi = float("inf"), float("-inf")
+    ax_abs = np.abs(axis)
+    dom = int(np.argmax(ax_abs))
+    c1, c2 = (1, 2) if dom == 0 else ((0, 2) if dom == 1 else (0, 1))
+    for gi in band_groups:
+        n_vec = mean_normals[gi]
+        if n_vec is None:
+            return False
+        perp = n_vec - float(n_vec @ axis) * axis
+        if float(np.hypot(perp[c1], perp[c2])) <= 1e-9:
+            return False
+        thetas.append(math.atan2(perp[c2], perp[c1]))
+        g_tris = planar_groups[gi]["tri_indices"]
+        verts = v_arr[np.unique(
+            f_arr[np.asarray(g_tris, dtype=np.int64)].ravel())]
+        proj_ax = verts @ axis
+        hs.append(float(proj_ax.mean()))
+        spans.append(float(proj_ax.max() - proj_ax.min()))
+        lo = min(lo, float(proj_ax.min()))
+        hi = max(hi, float(proj_ax.max()))
+    extent = hi - lo
+    if extent <= 1e-12 or not spans:
+        return False
+    if max(spans) >= _BAND_TWIST_SPAN_FRAC * extent:
+        return False
+    th = np.asarray(thetas, dtype=np.float64)
+    h = np.asarray(hs, dtype=np.float64)
+
+    def _corr(a):
+        sa, sb = float(a.std()), float(h.std())
+        if sa <= 1e-12 or sb <= 1e-12:
+            return 0.0
+        return float(np.corrcoef(a, h)[0, 1])
+
+    return max(abs(_corr(np.cos(th))), abs(_corr(np.sin(th)))) \
+        > _BAND_TWIST_CORR_MAX
+
+
 def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
                                       planar_groups, epsilon, comp_ids):
     """Recover curved patches from small planar groups (fix-e + competition).
@@ -1766,11 +2486,17 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
          (``recovered_via: "sweep"``).  Unconsumed groups (straight runs,
          leftover slivers) stay in the cluster.
       5. Cap-contamination retry: when the competition and the sweep both
-         fail to explain the cluster, falls back to a cylinder-only fit.
-         If the fit fails but produced a valid axis, splits the cluster
-         by |dot(tri_normal, axis)| < 0.15 (side=wall vs non-side=cap).
-         If both exist and the side-only fit passes, emits side tris as
-         one cylinder patch and leaves non-side groups as planar.
+          fail to explain the cluster, falls back to a cylinder-only fit.
+          If the fit fails but produced a valid axis, splits the cluster
+          by |dot(tri_normal, axis)| < 0.15 (side=wall vs non-side=cap).
+          If both exist and the side-only fit passes, emits side tris as
+          one cylinder patch and leaves non-side groups as planar.
+      6. Extrusion-band recovery: remaining small groups chained through
+          shared mesh edges parallel to a canonical axis form prismatic
+          bands; closed bands fitting a circle emit a 360 deg cylinder,
+          and the rest emit ``extrusion`` faces whose profiles are
+          corner-pinned adaptive B-splines (``recovered_via:
+          "spline_band"``).
 
     The retry only fires when the competition AND the direct cylinder fit
     both fail — clusters that pass on the first attempt (fine-tessellation
@@ -2033,6 +2759,20 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
                             recovered_groups.add(gi)
                         # non-side groups stay as planar
                         continue
+
+    # --- (4) Extrusion-band recovery: spline profiles (2026-08-20) ---
+    # Runs over small groups the per-cluster ladder above did NOT
+    # consume; bands chained through axis-parallel shared edges accept
+    # as whole extrusion faces (cylinder for full-circle profiles,
+    # corner-pinned B-spline profiles otherwise).
+    band_patches, band_tris, band_groups_used = _recover_extrusion_bands(
+        v_arr, f_arr, tri_normals, planar_groups, edge_faces,
+        tri_to_group, is_small, mean_normals, recovered_groups,
+        epsilon, comp_ids, patch_idx)
+    if band_patches:
+        recovered_patches.extend(band_patches)
+        recovered_tri_indices.update(band_tris)
+        recovered_groups.update(band_groups_used)
 
     remaining_groups = [g for gi, g in enumerate(planar_groups)
                         if gi not in recovered_groups]
