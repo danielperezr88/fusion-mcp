@@ -583,3 +583,20 @@ The "different approach" from the key insight above: recover prismatic walls as 
 
 ### What would push cuerpo79 below 50
 The 4 remaining freeform patches + the 44 planar groups: the X-band (35 groups, 391 tris) walk-fails at <50% coverage due to extreme branching. A graph-simplification pre-pass (collapse coplanar-merged groups, prune T-junction edges by azimuth consistency) could make that band walkable → 1 more extrusion → ~46 faces. The 44 planar groups include ~22 horizontal caps (truth) + ~22 wall fragments (the T-junction leftovers from the Z-band's 17 uncovered groups). Phase 3: graph simplification + leftover absorption.
+
+## 2026-08-20 (later) — Phase 2b: outer repeat loop + bidirectional all-seed walk (52 → 42)
+
+Two changes hit the ≤50 target without needing edge pruning:
+
+1. **Bidirectional all-seed walk**: every group is tried as a walk seed (not just degree-1 endpoints — a mid-path seed on a branched band often beats endpoints sitting on short side branches); each seed runs a forward greedy pass plus a backward pass from the seed through unblocked neighbours, so one seed covers both profile directions.
+
+2. **Outer repeat loop over the whole 3-axis sweep**: the crucial ordering insight — the X-axis mega-band (35 groups) fails its walk on pass 1, but AFTER the Y/Z passes consume bridging groups, the X leftovers fragment into walkable sub-bands. Re-running all three axes on the shrunken leftover set (until no progress) picks those up. A per-axis repeat loop is NOT enough: axis X runs first, fails, and is never revisited unless the loop wraps all axes.
+
+Also fixed a latent cross-axis double-consumption risk (a group emitted by axis X could be re-emitted by axis Y): `remaining` per pass now subtracts the global `used_groups`.
+
+### Results (cuerpo79 filleted)
+- **52 → 42 total faces** (target ≤50 HIT): 32 planar + 5 extrusion + 1 cylinder + 4 freeform
+- 5 extrusion patches: 165 tris (k=16, 9 corners), 74 (k=11, 5 corners), 94 (k=16), 86 (k=5), 127 (k=5) — the last two are the X-band fragments from the repeat loop; all residuals 1.3e-4..5.7e-4 ≤ epsilon 5.8e-4
+- Coverage tightened 1.0316 → 1.0103 (double-consumption fix)
+- 300 passed, 1 xfailed, 0 failures; meshb2 unchanged (32P + 20C, coverage 1.0425)
+- Edge pruning (op 3) and the Y-band 75° threshold were NOT needed — kept as future options

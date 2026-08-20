@@ -2094,16 +2094,17 @@ def _band_walk_profile(band_groups, pair_junctions, planar_groups,
     profile, in the spirit of the sweep run-grower) — this rides
     through spurious T-junction edges (coplanar-merged strips,
     non-manifold tessellation) whose azimuth turns are large, instead
-    of bailing on degree >= 3 nodes.  The walk starts at the
-    smallest-index degree-1 group (path endpoint) or smallest group
-    (cycle).  Junction points come from the shared axis-parallel
-    mesh-edge vertex indices (exact, not proximity-matched); open ends
-    take the group's projected vertex farthest from its single
-    junction.  Corners are junctions where consecutive groups'
-    projected mean-normal azimuths turn more than ``_BAND_CORNER_DEG``.
+    of bailing on degree >= 3 nodes.  Every group is tried as a
+    bidirectional seed (forward + backward passes from the seed); the
+    longest walk wins.  Junction points come from the shared
+    axis-parallel mesh-edge vertex indices (exact, not
+    proximity-matched); open ends take the group's projected vertex
+    farthest from its single junction.  Corners are junctions where
+    consecutive groups' projected mean-normal azimuths turn more than
+    ``_BAND_CORNER_DEG``.
 
     Returns ``(points, corner_point_indices, closed, visited_groups)`` or
-    None when the walk cannot cover at least 50%% of the band's groups.
+    None when no walk covers at least 50%% of the band's groups.
     """
     bset = set(band_groups)
     adj: Dict[int, set] = defaultdict(set)
@@ -2114,9 +2115,6 @@ def _band_walk_profile(band_groups, pair_junctions, planar_groups,
     degs = {g: len(adj[g]) for g in band_groups}
     endpoints = sorted(g for g in band_groups if degs[g] == 1)
     closed = len(endpoints) == 0
-    starts = endpoints if endpoints else [min(band_groups)]
-    if len(starts) > 12:
-        starts = starts[:12]
 
     def _azimuth(gi):
         n_vec = mean_normals[gi]
@@ -2136,24 +2134,37 @@ def _band_walk_profile(band_groups, pair_junctions, planar_groups,
             return 0.0
         return abs((math.degrees(ab - aa) + 180.0) % 360.0 - 180.0)
 
-    best_order = None
-    best_cov = 0
-    for start in starts:
+    def _greedy(start, blocked):
         cur = start
-        visited = {start}
-        order = [start]
+        vis = {start}
+        out = [start]
         while True:
-            nxt_opts = [n for n in adj[cur] if n not in visited]
-            if not nxt_opts:
+            opts = [n for n in adj[cur]
+                    if n not in vis and n not in blocked]
+            if not opts:
                 break
-            nxt = min(nxt_opts, key=lambda n: (_turn(cur, n), n))
-            visited.add(nxt)
-            order.append(nxt)
+            nxt = min(opts, key=lambda n: (_turn(cur, n), n))
+            vis.add(nxt)
+            out.append(nxt)
             cur = nxt
-        if len(visited) > best_cov:
-            best_cov = len(visited)
+        return out
+
+    # Bidirectional multi-start: every group is tried as a seed (a
+    # mid-path seed on a branched band often beats the degree-1
+    # endpoints, which may sit on short side branches); each seed's
+    # forward pass takes the smallest-turn neighbour and the backward
+    # pass continues from the seed through the remaining neighbours, so
+    # one seed covers both directions of the profile.
+    best_order: Optional[List[int]] = None
+    for seed in sorted(band_groups):
+        forward = _greedy(seed, set())
+        backward = _greedy(seed, set(forward) - {seed})
+        order = list(reversed(backward)) + forward[1:]
+        if best_order is None or len(order) > len(best_order):
             best_order = order
-    if best_order is None or best_cov < 0.5 * len(band_groups):
+        if len(order) == len(band_groups):
+            break
+    if best_order is None or len(best_order) < 0.5 * len(band_groups):
         return None
     order = best_order
     visited = set(order)
@@ -2218,6 +2229,119 @@ def _group_vertex_ids(planar_groups, gi, f_arr):
     return sorted({int(v) for v in np.unique(f_arr[tri_idx].ravel())})
 
 
+def _accept_band(band_groups, pair_junctions, v_arr, f_arr, tri_normals,
+                 planar_groups, mean_normals, epsilon, comp_ids):
+    """Acceptance ladder for one prismatic band (axis gates → walk → fit).
+
+    Runs the authoritative axis estimation (out-of-plane eigenvalue
+    gate), the twist tripwire, the bidirectional profile walk, and the
+    ladder — full-circle Kasa cylinder first (closed bands with >= 8
+    profile points), then the corner-pinned adaptive B-spline.  The
+    walk may cover only part of a branched band; only the covered
+    groups are accepted.
+
+    Returns ``(surface_fields, visited_groups)`` for the caller to
+    stamp into a patch entry, or None.
+    """
+    band_tris = sorted(set(
+        ti for gi in band_groups
+        for ti in planar_groups[gi]["tri_indices"]))
+    if len(band_tris) < 6:
+        return None
+
+    axis_est = _find_extrusion_axis(tri_normals, band_tris)
+    if axis_est is None:
+        return None
+    if _band_twist_rejected(
+            planar_groups, band_groups, mean_normals, axis_est,
+            v_arr, f_arr):
+        return None
+
+    band_verts = v_arr[np.unique(
+        f_arr[np.asarray(band_tris, dtype=np.int64)].ravel())]
+    v_mean = band_verts.mean(axis=0)
+    ref = (np.array([1.0, 0.0, 0.0])
+           if abs(float(axis_est[0])) < 0.9
+           else np.array([0.0, 1.0, 0.0]))
+    u_ax = np.cross(axis_est, ref)
+    u_ax = u_ax / np.linalg.norm(u_ax)
+    w_ax = np.cross(axis_est, u_ax)
+
+    def _proj(vi):
+        rel = v_arr[int(vi)] - v_mean
+        return np.array([float(rel @ u_ax), float(rel @ w_ax)])
+
+    walk = _band_walk_profile(
+        band_groups, pair_junctions, planar_groups,
+        mean_normals, axis_est, _proj, f_arr)
+    if walk is None:
+        return None
+    points, corner_pts, closed, visited_groups = walk
+    band_tris = sorted(set(
+        ti for gi in visited_groups
+        for ti in planar_groups[gi]["tri_indices"]))
+    if len(band_tris) < 6:
+        return None
+
+    comp = comp_ids[band_tris[0]] if band_tris else 0
+    base_entry = {
+        "component": comp,
+        "triangle_count": len(band_tris),
+        "area": round(_cluster_tri_area(
+            v_arr, f_arr, band_tris), 6),
+    }
+    axis_heights = band_verts @ axis_est
+    height = float(axis_heights.max() - axis_heights.min())
+
+    accepted = None
+    if closed and len(points) >= 8:
+        # below 8 profile points a circle claim is unfalsifiable
+        # (any 3-4 convex points are cocircular — e.g. a square
+        # tube's corners), so the Kasa rung only fires on bands
+        # coarse-enough-tessellated to test roundness at all
+        fit, res = _fit_sweep_cylinder(
+            v_arr, f_arr, tri_normals, band_tris, axis_est, epsilon)
+        if fit is not None:
+            accepted = dict(fit)
+            accepted["axis"] = [round(float(c), 6) for c in axis_est]
+            accepted["residual_cm"] = round(float(res), 8)
+            accepted["recovered_via"] = "band"
+    if accepted is None:
+        corner_params = []
+        if len(points) > 1:
+            seg = np.hypot(
+                points[1:, 0] - points[:-1, 0],
+                points[1:, 1] - points[:-1, 1])
+            if closed:
+                seg = np.concatenate([seg, [float(np.hypot(
+                    points[0, 0] - points[-1, 0],
+                    points[0, 1] - points[-1, 1]))]])
+            csum = np.concatenate([[0.0], np.cumsum(seg)])
+            denom = float(csum[-1])
+            if denom > 1e-12:
+                corner_params = [
+                    float(csum[min(i, len(csum) - 2)])
+                    / float(denom) for i in corner_pts]
+        profile = _fit_bspline_profile(
+            points, closed, corner_params, epsilon)
+        if profile is not None:
+            accepted = {
+                "surface_type": "extrusion",
+                "axis": [round(float(c), 6) for c in axis_est],
+                "axis_point_cm": [round(float(c), 6) for c in v_mean],
+                "u_axis": [round(float(c), 6) for c in u_ax],
+                "w_axis": [round(float(c), 6) for c in w_ax],
+                "height_cm": round(height, 6),
+                "recovered_via": "spline_band",
+            }
+            accepted.update(profile)
+    if accepted is None:
+        return None
+    entry = dict(base_entry)
+    entry.update(accepted)
+    return entry, visited_groups
+
+
 def _recover_extrusion_bands(v_arr, f_arr, tri_normals, planar_groups,
                              edge_faces, tri_to_group, is_small,
                              mean_normals, consumed_groups, epsilon,
@@ -2228,17 +2352,16 @@ def _recover_extrusion_bands(v_arr, f_arr, tri_normals, planar_groups,
     edge shared by two small groups whose direction is at least
     ``_BAND_EDGE_PARALLEL_DOT``-parallel to a canonical axis unions the
     groups into that axis's band set.  This is the geometric signature
-    of an extruded surface (all its faces contain the axis direction,
-    and consecutive faces share axis-parallel edges) — it chains
-    corners and smooth junctions alike, never crosses into caps through
+    of an extrusion (all its faces contain the axis direction, and
+    consecutive faces share axis-parallel edges) — it chains corners
+    and smooth junctions alike, never crosses into caps through
     perpendicular edges, and is immune to the normal-direction
     ambiguity that mis-partitions groups whose normals are
-    perpendicular to two canonical axes at once.  Per band: the
-    authoritative axis estimation with the out-of-plane eigenvalue gate
-    (taper/helix rejection), the azimuth-vs-height twist tripwire, a
-    deterministic profile walk, and the acceptance ladder — full-circle
-    Kasa cylinder first (closed bands with >= 8 profile points), then
-    the corner-pinned adaptive B-spline extrusion fit.
+    perpendicular to two canonical axes at once.  Per band the
+    acceptance ladder (``_accept_band``) runs; after each accepted band
+    the consumed groups are removed and band-finding REPEATS on the
+    leftovers — the unconsumed fragments of a branched band often form
+    simple path sub-bands that walk cleanly on the second pass.
 
     Returns ``(patches, consumed_tris, consumed_groups)`` with patch
     indices continuing from *patch_idx*.
@@ -2273,139 +2396,63 @@ def _recover_extrusion_bands(v_arr, f_arr, tri_normals, planar_groups,
     used_tris: set = set()
     used_groups: set = set()
 
-    for axis_i in range(3):
-        axis = _CANON_AXES[axis_i]
-        parent = {gi: gi for gi in eligible}
-        pair_junctions: Dict[Tuple[int, int], Tuple[int, int]] = {}
-
-        def _find(x):
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        for ga, gb, d_hat, va, vb in edge_info:
-            if abs(float(d_hat @ axis)) <= _BAND_EDGE_PARALLEL_DOT:
-                continue
-            key = (ga, gb)
-            if key not in pair_junctions:
-                pair_junctions[key] = (va, vb)
-            ra, rb = _find(ga), _find(gb)
-            if ra != rb:
-                parent[ra] = rb
-
-        comps: Dict[int, List[int]] = defaultdict(list)
-        for gi in eligible:
-            comps[_find(gi)].append(gi)
-
-        for root in sorted(comps, key=lambda r: min(comps[r])):
-            band_groups = sorted(comps[root])
-            if len(band_groups) < 2:
-                continue
-            band_tris = sorted(set(
-                ti for gi in band_groups
-                for ti in planar_groups[gi]["tri_indices"]))
-            if len(band_tris) < 6:
+    # Outer repeat loop over the whole 3-axis sweep: a band that fails
+    # on one pass (e.g. an over-branched mega-band whose walk covers
+    # too little) often fragments into walkable sub-bands once a LATER
+    # axis pass consumes the bridging groups — re-running earlier axes
+    # on the shrunken leftover set picks those up.
+    made_progress = True
+    while made_progress:
+        made_progress = False
+        for axis_i in range(3):
+            axis = _CANON_AXES[axis_i]
+            axis_edges = [
+                (ga, gb, va, vb) for ga, gb, d_hat, va, vb in edge_info
+                if abs(float(d_hat @ axis)) > _BAND_EDGE_PARALLEL_DOT]
+            remaining = set(eligible) - used_groups
+            if len(remaining) < 2:
                 continue
 
-            axis_est = _find_extrusion_axis(tri_normals, band_tris)
-            if axis_est is None:
-                continue
-            if _band_twist_rejected(
-                    planar_groups, band_groups, mean_normals,
-                    axis_est, v_arr, f_arr):
-                continue
+            parent = {gi: gi for gi in remaining}
 
-            band_verts = v_arr[np.unique(
-                f_arr[np.asarray(band_tris, dtype=np.int64)].ravel())]
-            v_mean = band_verts.mean(axis=0)
-            ref = (np.array([1.0, 0.0, 0.0])
-                   if abs(float(axis_est[0])) < 0.9
-                   else np.array([0.0, 1.0, 0.0]))
-            u_ax = np.cross(axis_est, ref)
-            u_ax = u_ax / np.linalg.norm(u_ax)
-            w_ax = np.cross(axis_est, u_ax)
+            def _find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
 
-            def _proj(vi):
-                rel = v_arr[int(vi)] - v_mean
-                return np.array([float(rel @ u_ax), float(rel @ w_ax)])
+            pair_junctions: Dict[Tuple[int, int], Tuple[int, int]] = {}
+            for ga, gb, va, vb in axis_edges:
+                if ga not in remaining or gb not in remaining:
+                    continue
+                pair_junctions[(ga, gb)] = (va, vb)
+                ra, rb = _find(ga), _find(gb)
+                if ra != rb:
+                    parent[ra] = rb
 
-            walk = _band_walk_profile(
-                band_groups, pair_junctions, planar_groups,
-                mean_normals, axis_est, _proj, f_arr)
-            if walk is None:
-                continue
-            points, corner_pts, closed, visited_groups = walk
-            band_tris = sorted(set(
-                ti for gi in visited_groups
-                for ti in planar_groups[gi]["tri_indices"]))
-            if len(band_tris) < 6:
-                continue
+            comps: Dict[int, List[int]] = defaultdict(list)
+            for gi in remaining:
+                comps[_find(gi)].append(gi)
 
-            comp = comp_ids[band_tris[0]] if band_tris else 0
-            base_entry = {
-                "component": comp,
-                "triangle_count": len(band_tris),
-                "area": round(_cluster_tri_area(
-                    v_arr, f_arr, band_tris), 6),
-            }
-            axis_heights = band_verts @ axis_est
-            height = float(axis_heights.max() - axis_heights.min())
-
-            accepted = None
-            if closed and len(points) >= 8:
-                # below 8 profile points a circle claim is unfalsifiable
-                # (any 3-4 convex points are cocircular — e.g. a square
-                # tube's corners), so the Kasa rung only fires on bands
-                # coarse-enough-tessellated to test roundness at all
-                fit, res = _fit_sweep_cylinder(
-                    v_arr, f_arr, tri_normals, band_tris, axis_est,
-                    epsilon)
-                if fit is not None:
-                    accepted = dict(fit)
-                    accepted["axis"] = [round(float(c), 6)
-                                        for c in axis_est]
-                    accepted["residual_cm"] = round(float(res), 8)
-                    accepted["recovered_via"] = "band"
-            if accepted is None:
-                corner_params = []
-                if len(points) > 1:
-                    seg = np.hypot(
-                        points[1:, 0] - points[:-1, 0],
-                        points[1:, 1] - points[:-1, 1])
-                    if closed:
-                        seg = np.concatenate([seg, [float(np.hypot(
-                            points[0, 0] - points[-1, 0],
-                            points[0, 1] - points[-1, 1]))]])
-                    csum = np.concatenate([[0.0], np.cumsum(seg)])
-                    denom = float(csum[-1])
-                    if denom > 1e-12:
-                        corner_params = [
-                            float(csum[min(i, len(csum) - 2)])
-                            / float(denom) for i in corner_pts]
-                profile = _fit_bspline_profile(
-                    points, closed, corner_params, epsilon)
-                if profile is not None:
-                    accepted = {
-                        "surface_type": "extrusion",
-                        "axis": [round(float(c), 6) for c in axis_est],
-                        "axis_point_cm": [round(float(c), 6)
-                                          for c in v_mean],
-                        "u_axis": [round(float(c), 6) for c in u_ax],
-                        "w_axis": [round(float(c), 6) for c in w_ax],
-                        "height_cm": round(height, 6),
-                        "recovered_via": "spline_band",
-                    }
-                    accepted.update(profile)
-            if accepted is None:
-                continue
-
-            entry = dict(base_entry)
-            entry["patch_index"] = patch_idx + len(patches)
-            entry.update(accepted)
-            patches.append(entry)
-            used_tris.update(band_tris)
-            used_groups.update(visited_groups)
+            for root in sorted(comps, key=lambda r: min(comps[r])):
+                band_groups = sorted(comps[root])
+                if len(band_groups) < 2:
+                    continue
+                outcome = _accept_band(
+                    band_groups, pair_junctions, v_arr, f_arr,
+                    tri_normals, planar_groups, mean_normals, epsilon,
+                    comp_ids)
+                if outcome is None:
+                    continue
+                entry, visited_groups = outcome
+                entry["patch_index"] = patch_idx + len(patches)
+                patches.append(entry)
+                band_tris = sorted(set(
+                    ti for gi in visited_groups
+                    for ti in planar_groups[gi]["tri_indices"]))
+                used_tris.update(band_tris)
+                used_groups.update(visited_groups)
+                made_progress = True
 
     return patches, used_tris, used_groups
 
