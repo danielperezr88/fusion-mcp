@@ -1304,6 +1304,13 @@ _RULED_MIN_COVERAGE = 0.7      # chain vertices must cover this fraction
 _RULED_FAMILY_CONE_DEG = 45.0  # rulings stay within a cone this wide
 _RULED_FAMILY_EXTENT_FRAC = 0.6  # ruling chains span most of the axial extent
 _RULED_MAX_FAMILY_TRIES = 6  # seed chains tried when picking the family
+
+_FREEFORM_MAX_TILT_DEG = 60.0   # height-field normals stay this close to the base axis
+_FREEFORM_MIN_VERTS = 24        # data floor before any height-field fit
+_FREEFORM_MAX_CTRL_PER_DIM = 16  # adaptive knot-growth cap per direction
+_FREEFORM_MIN_ASPECT = 0.05     # reject ribbon projections (span ratio floor)
+_FREEFORM_FIT_QUALITY_FRAC = 1e-4  # refinement target, fraction of model diagonal
+_FREEFORM_GRAD_CONE_DEG = 20.0  # colinear height gradients mean extrusion territory
                                   # of the component's vertices
 _PIPE_NORMAL_PLANAR_FRAC = 0.35  # mid/top eigenvalue ratio cap for the
                                   # per-vertex normal fan (pipe walls are
@@ -3175,6 +3182,206 @@ def _band_twist_rejected(planar_groups, band_groups, mean_normals, axis,
         > _BAND_TWIST_CORR_MAX
 
 
+def _clamped_uniform_knots(n_ctrl, degree):
+    """Clamped uniform knot vector for *n_ctrl* control points."""
+    n_int = n_ctrl - degree - 1
+    interior = ([(k + 1.0) / (n_int + 1.0) for k in range(n_int)]
+                if n_int > 0 else [])
+    return ([0.0] * (degree + 1) + interior
+            + [1.0] * (degree + 1))
+
+
+def _freeform_nurbs_entry(v_arr, f_arr, tri_normals, tris, epsilon,
+                          comp_ids, patch_idx):
+    """Height-field NURBS (P5) detection for one leftover component.
+
+    A leftover smooth component whose triangle normals all stay within
+    ``_FREEFORM_MAX_TILT_DEG`` of its flattest PCA axis is single-valued
+    over that axis plane: scale the vertex projection to the unit
+    square and least-squares fit a cubic tensor-product B-spline,
+    growing uniform knots per direction until the residual reaches the
+    quality target or the control cap.  Control points are lifted to
+    3D at their Greville abscissae, ready for NURBS reconstruction.
+    Returns the freeform patch entry or None.
+    """
+    t_arr = np.asarray(tris, dtype=np.int64)
+    vert_ids = np.unique(f_arr[t_arr].ravel())
+    if len(vert_ids) < _FREEFORM_MIN_VERTS:
+        return None
+    verts = v_arr[vert_ids]
+
+    tn = np.asarray(tri_normals, dtype=np.float64)[t_arr]
+    tn = tn / np.maximum(np.linalg.norm(tn, axis=1, keepdims=True), 1e-12)
+
+    # The flattest axis of a SURFACE is the dominant direction of its
+    # (area-weighted) normals, not of its vertex cloud: an asymmetric
+    # bump correlates z with x and tilts vertex-PCA off the true base
+    # normal, while the normal second-moment stays exact.
+    tri_v = v_arr[f_arr[t_arr]]
+    cross12 = np.cross(tri_v[:, 1] - tri_v[:, 0], tri_v[:, 2] - tri_v[:, 0])
+    w = np.linalg.norm(cross12, axis=1)
+    w_sum = float(w.sum())
+    if w_sum <= 1e-12:
+        return None
+    w = w / w_sum
+    tn_w = tn * w[:, None]
+    _, eigvecs = np.linalg.eigh(tn_w.T @ tn)
+    n_hat = eigvecs[:, -1]
+    if float(tn_w.sum(axis=0) @ n_hat) < 0.0:
+        n_hat = -n_hat
+    cos_gate = math.cos(math.radians(_FREEFORM_MAX_TILT_DEG))
+    if float((tn @ n_hat).min()) < cos_gate:
+        return None
+
+    centroid = verts.mean(axis=0)
+    rel = verts - centroid
+    ref = (np.array([1.0, 0.0, 0.0]) if abs(float(n_hat[0])) < 0.9
+           else np.array([0.0, 1.0, 0.0]))
+    u_ax = np.cross(n_hat, ref)
+    u_ax = u_ax / np.linalg.norm(u_ax)
+    v_ax = np.cross(n_hat, u_ax)
+
+    u_c = rel @ u_ax
+    v_c = rel @ v_ax
+    h_c = rel @ n_hat
+
+    # A prismatic wall (the band pass's territory) is single-valued
+    # with its height independent of the extrusion direction: every
+    # vertex gradient of the height field is colinear.  A genuine
+    # freeform's gradients rotate.  Hand 1D fields back to the band
+    # pass instead of stealing them.
+    vnorm = np.zeros((len(vert_ids), 3))
+    local = np.searchsorted(vert_ids, f_arr[t_arr]).ravel()
+    np.add.at(vnorm, local, np.repeat(tn * w[:, None], 3, axis=0))
+    denom = vnorm @ n_hat
+    gvec = np.stack([-(vnorm @ u_ax) / denom,
+                     -(vnorm @ v_ax) / denom], axis=1)
+    gmag = np.linalg.norm(gvec, axis=1)
+    gmask = gmag > 1e-9
+    if int(gmask.sum()) >= 2:
+        ghat = gvec[gmask] / gmag[gmask, None]
+        _, gevecs = np.linalg.eigh(ghat.T @ ghat)
+        gdom = gevecs[:, -1]
+        cone_cos = math.cos(math.radians(_FREEFORM_GRAD_CONE_DEG))
+        if float(np.abs(ghat @ gdom).min()) >= cone_cos:
+            return None
+
+    u0, u1 = float(u_c.min()), float(u_c.max())
+    v0, v1 = float(v_c.min()), float(v_c.max())
+    span_u, span_v = u1 - u0, v1 - v0
+    if span_u <= 1e-12 or span_v <= 1e-12:
+        return None
+    if min(span_u, span_v) / max(span_u, span_v) < _FREEFORM_MIN_ASPECT:
+        return None
+
+    s = (u_c - u0) / span_u
+    t = (v_c - v0) / span_v
+
+    diag = float(np.linalg.norm(
+        verts.max(axis=0) - verts.min(axis=0)))
+    target = max(_FREEFORM_FIT_QUALITY_FRAC * diag, 1e-9)
+    tol = max(epsilon, target)
+
+    degree = 3
+    ncu, ncv = 4, 4
+    best = None
+    while True:
+        if len(vert_ids) < (ncu + 2) * (ncv + 2):
+            return None
+        ku = _clamped_uniform_knots(ncu, degree)
+        kv = _clamped_uniform_knots(ncv, degree)
+        Bu = _bspline_basis_matrix(s, ku, degree)
+        Bv = _bspline_basis_matrix(t, kv, degree)
+        A = (Bu[:, :, None] * Bv[:, None, :]).reshape(
+            len(s), ncu * ncv)
+        sol, *_ = np.linalg.lstsq(A, h_c, rcond=None)
+        max_res = float(np.abs(A @ sol - h_c).max())
+        if best is None or max_res < best[0]:
+            best = (max_res, ncu, ncv, ku, kv, sol)
+        if max_res <= target:
+            break
+        if (ncu >= _FREEFORM_MAX_CTRL_PER_DIM
+                and ncv >= _FREEFORM_MAX_CTRL_PER_DIM):
+            break
+        if ncu < _FREEFORM_MAX_CTRL_PER_DIM:
+            ncu += 1
+        if ncv < _FREEFORM_MAX_CTRL_PER_DIM:
+            ncv += 1
+
+    max_res, ncu, ncv, ku, kv, sol = best
+    if max_res > tol:
+        return None
+
+    greville_u = [float(np.mean(ku[i + 1:i + degree + 1]))
+                  for i in range(ncu)]
+    greville_v = [float(np.mean(kv[j + 1:j + degree + 1]))
+                  for j in range(ncv)]
+    ctrl_pts: List[List[float]] = []
+    for i in range(ncu):
+        for j in range(ncv):
+            p = (centroid
+                 + u_ax * (u0 + greville_u[i] * span_u)
+                 + v_ax * (v0 + greville_v[j] * span_v)
+                 + n_hat * float(sol[i * ncv + j]))
+            ctrl_pts.append([round(float(c), 6) for c in p])
+
+    conf = round(max(0.0, 1.0 - 0.5 * max_res / tol), 4)
+    return {
+        "component": comp_ids[tris[0]] if tris else 0,
+        "patch_index": patch_idx,
+        "triangle_count": len(tris),
+        "area": round(_cluster_tri_area(v_arr, f_arr, tris), 6),
+        "surface_type": "freeform",
+        "recovered_via": "freeform_nurbs",
+        "parameterization": "height_field",
+        "degrees": [degree, degree],
+        "grid_dims": [ncu, ncv],
+        "knots_u": [round(float(k), 6) for k in ku],
+        "knots_v": [round(float(k), 6) for k in kv],
+        "control_points_cm": ctrl_pts,
+        "base_normal_cm": [round(float(c), 6) for c in n_hat],
+        "coverage": 1.0,
+        "residual_cm": round(max_res, 8),
+        "confidence": conf,
+    }
+
+
+def _recover_freeform_nurbs(v_arr, f_arr, tri_normals, planar_groups,
+                            edge_faces, tri_to_group, is_small,
+                            mean_normals, consumed_groups, epsilon,
+                            comp_ids, patch_idx):
+    """Freeform NURBS (P5) recovery pass over remaining small groups.
+
+    The last rung of the surface ladder: leftover smooth components no
+    structured pass claimed recover as tensor-product B-spline height
+    fields instead of staying unclassified triangles.  Returns
+    ``(patches, consumed_tris, consumed_groups)`` with patch indices
+    continuing from *patch_idx*.
+    """
+    comps = _leftover_smooth_components(
+        planar_groups, edge_faces, tri_to_group, is_small,
+        consumed_groups, mean_normals)
+    patches: List[Dict] = []
+    used_tris: set = set()
+    used_groups: set = set()
+    for root in sorted(comps, key=lambda r: min(comps[r])):
+        group_list = comps[root]
+        tris = sorted(set(
+            ti for gi in group_list
+            for ti in planar_groups[gi]["tri_indices"]))
+        if len(tris) < 6:
+            continue
+        entry = _freeform_nurbs_entry(
+            v_arr, f_arr, tri_normals, tris, epsilon, comp_ids,
+            patch_idx + len(patches))
+        if entry is None:
+            continue
+        patches.append(entry)
+        used_tris.update(tris)
+        used_groups.update(group_list)
+    return patches, used_tris, used_groups
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: revolve & helical bands (2026-08-21)
 #
@@ -4036,6 +4243,16 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
           and the rest emit ``extrusion`` faces whose profiles are
           corner-pinned adaptive B-splines (``recovered_via:
           "spline_band"``).
+      8. Freeform NURBS recovery: leftover smooth components whose
+          normals stay within 60 deg of a dominant direction (the
+          height-field gate) and whose vertex gradients are not
+          colinear (prismatic walls stay in the band pass's territory)
+          recover as one cubic tensor-product B-spline height field —
+          ``freeform`` faces (``recovered_via: "freeform_nurbs"``)
+          carrying degrees, knots and a 3D control net at Greville
+          abscissae; runs before the band pass, whose local cylinder
+          fits would otherwise shred freeform shoulders into
+          pseudo-extrusion fragments.
 
     The retry only fires when the competition AND the direct cylinder fit
     both fail — clusters that pass on the first attempt (fine-tessellation
@@ -4355,6 +4572,22 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
         recovered_tri_indices.update(pipe_tris)
         recovered_groups.update(pipe_groups_used)
 
+    # --- (5.7) Freeform NURBS: smooth height fields (2026-08-21) ---
+    # Runs BEFORE the extrusion-band pass: a freeform's near-flat
+    # shoulder regions are locally cylindrical and the band pass would
+    # shred them off as pseudo-extrusion fragments.  The gradient-
+    # colinearity guard hands genuine prismatic walls back, so the
+    # band pass still claims its territory.
+    nurbs_patches, nurbs_tris, nurbs_groups_used = _recover_freeform_nurbs(
+        v_arr, f_arr, tri_normals, planar_groups, edge_faces,
+        tri_to_group, is_small, mean_normals, recovered_groups,
+        epsilon, comp_ids, patch_idx)
+    if nurbs_patches:
+        recovered_patches.extend(nurbs_patches)
+        patch_idx += len(nurbs_patches)
+        recovered_tri_indices.update(nurbs_tris)
+        recovered_groups.update(nurbs_groups_used)
+
     # --- (6) Extrusion-band recovery: spline profiles (2026-08-20) ---
     # Runs over small groups the per-cluster ladder above did NOT
     # consume; bands chained through axis-parallel shared edges accept
@@ -4386,7 +4619,6 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
 
     remaining_groups = [g for gi, g in enumerate(planar_groups)
                         if gi not in recovered_groups]
-
     return recovered_patches, recovered_tri_indices, remaining_groups
 
 
