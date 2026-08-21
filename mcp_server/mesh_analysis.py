@@ -1294,6 +1294,27 @@ _REVOLVE_CLOSED_MIN_DEG = 300.0  # junction-free span fallback requires a
                                   # to the sweep pass
 _REVOLVE_COVER_MIN_FRAC = 0.85  # an axis must explain at least this
                                   # fraction of the cluster's wall tris
+_SMOOTH_COMP_MAX_DEG = 55.0    # leftover-component smoothness gate; a
+                                  # linear-blend loft's corner creases turn
+                                  # normals up to ~45 deg and must stay in
+                                  # one component
+_RULED_MIN_TRACK_EDGES = 2     # a ruling chain spans at least 3 vertices
+_RULED_MIN_TRACKS = 3          # a loft needs at least 3 rulings
+_RULED_MIN_COVERAGE = 0.7      # chain vertices must cover this fraction
+_RULED_FAMILY_CONE_DEG = 45.0  # rulings stay within a cone this wide
+_RULED_FAMILY_EXTENT_FRAC = 0.6  # ruling chains span most of the axial extent
+_RULED_MAX_FAMILY_TRIES = 6  # seed chains tried when picking the family
+                                  # of the component's vertices
+_PIPE_NORMAL_PLANAR_FRAC = 0.35  # mid/top eigenvalue ratio cap for the
+                                  # per-vertex normal fan (pipe walls are
+                                  # locally planar in normal space)
+_PIPE_LONG_EDGE_DOT = 0.7      # edge parallel to both endpoint tangents
+                                  # counts as longitudinal
+_PIPE_MIN_RING_VERTS = 6       # a round ring needs >= 6 vertices
+_PIPE_MIN_STATIONS = 4         # a spine needs >= 4 rings
+_PIPE_MIN_SPINE_BOW = 0.02     # spine must bow this fraction of its
+                                  # chord — straight tubes belong to the
+                                  # extrusion/cylinder passes
 
 
 def _otsu_threshold(log_values, n_bins=128):
@@ -2575,6 +2596,532 @@ def _recover_extrusion_bands(v_arr, f_arr, tri_normals, planar_groups,
     return patches, used_tris, used_groups
 
 
+def _leftover_smooth_components(planar_groups, edge_faces, tri_to_group,
+                                is_small, consumed_groups, mean_normals):
+    """Smooth connected components over leftover small groups.
+
+    Groups union when they share a mesh edge and their mean normals
+    agree within ``_SMOOTH_COMP_MAX_DEG`` — loose enough to keep a
+    loft's corner creases in one component, tight enough not to bridge
+    across the sharp edges of a box.
+    """
+    eligible = [gi for gi in range(len(planar_groups))
+                if is_small[gi] and gi not in consumed_groups]
+    if len(eligible) < 2:
+        return {}
+    gset = set(eligible)
+    cos_gate = math.cos(math.radians(_SMOOTH_COMP_MAX_DEG))
+
+    parent = {gi: gi for gi in eligible}
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for edge, tris in sorted(edge_faces.items()):
+        ga = gb = None
+        for t in tris:
+            g = tri_to_group.get(t)
+            if g in gset:
+                if ga is None:
+                    ga = g
+                elif g != ga:
+                    gb = g
+                    break
+        if ga is None or gb is None:
+            continue
+        na, nb = mean_normals[ga], mean_normals[gb]
+        if na is None or nb is None:
+            continue
+        if abs(float(na @ nb)) < cos_gate:
+            continue
+        ra, rb = _find(ga), _find(gb)
+        if ra != rb:
+            parent[ra] = rb
+
+    comps: Dict[int, List[int]] = defaultdict(list)
+    for gi in eligible:
+        comps[_find(gi)].append(gi)
+    return comps
+
+
+def _component_edges(f_arr, tris):
+    """Sorted unique mesh edges (as vertex-id pairs) of a triangle set."""
+    tset_edges = set()
+    for ti in tris:
+        a, b, c = (int(f_arr[ti, 0]), int(f_arr[ti, 1]),
+                   int(f_arr[ti, 2]))
+        for u, w in ((a, b), (b, c), (a, c)):
+            if u != w:
+                tset_edges.add((min(u, w), max(u, w)))
+    return sorted(tset_edges)
+
+
+def _ruled_band_entry(v_arr, f_arr, planar_groups, group_list, tris,
+                      epsilon, comp_ids, patch_idx):
+    """Ruled-loft detection for one leftover component.
+
+    A linear-blend loft's vertex tracks are STRAIGHT lines, so its
+    inter-ring mesh edges chain into collinear paths (the rulings).
+    Chains are oriented against a reference, their endpoints form the
+    two rail polylines, and rail adjacency comes from the non-chain
+    (ring) edges among the endpoints.  Returns the loft patch entry or
+    None.
+    """
+    edges = _component_edges(f_arr, tris)
+    if len(edges) < 6:
+        return None
+    inc: Dict[int, List[int]] = defaultdict(list)
+    for ei, (u, w) in enumerate(edges):
+        inc[u].append(ei)
+        inc[w].append(ei)
+
+    tol = max(epsilon, 1e-9)
+    eparent = list(range(len(edges)))
+
+    def _efind(x):
+        while eparent[x] != x:
+            eparent[x] = eparent[eparent[x]]
+            x = eparent[x]
+        return x
+
+    for v, eis in sorted(inc.items()):
+        for i in range(len(eis)):
+            for j in range(i + 1, len(eis)):
+                e1, e2 = edges[eis[i]], edges[eis[j]]
+                u1 = e1[0] if e1[1] == v else e1[1]
+                u2 = e2[0] if e2[1] == v else e2[1]
+                d1 = v_arr[v] - v_arr[u1]
+                d2 = v_arr[u2] - v_arr[v]
+                n1 = float(np.linalg.norm(d1))
+                n2 = float(np.linalg.norm(d2))
+                if n1 <= 1e-12 or n2 <= 1e-12:
+                    continue
+                d1h, d2h = d1 / n1, d2 / n2
+                if float(d1h @ d2h) <= 0.0:
+                    continue
+                if float(np.linalg.norm(np.cross(d1h, d2h))) * n2 <= tol:
+                    ra, rb = _efind(eis[i]), _efind(eis[j])
+                    if ra != rb:
+                        eparent[ra] = rb
+
+    chain_map: Dict[int, List[int]] = defaultdict(list)
+    for ei in range(len(edges)):
+        chain_map[_efind(ei)].append(ei)
+
+    chains: List[List[int]] = []
+    for _, eis in sorted(chain_map.items()):
+        if len(eis) < _RULED_MIN_TRACK_EDGES:
+            continue
+        vdeg: Dict[int, int] = Counter()
+        adj_c: Dict[int, List[int]] = defaultdict(list)
+        for ei in eis:
+            u, w = edges[ei]
+            vdeg[u] += 1
+            vdeg[w] += 1
+            adj_c[u].append(w)
+            adj_c[w].append(u)
+        ends = sorted(v for v, d in vdeg.items() if d == 1)
+        if len(ends) != 2:
+            continue
+        order = [ends[0]]
+        cur, prev = ends[0], -1
+        while True:
+            nxt = [n for n in adj_c[cur] if n != prev]
+            if not nxt:
+                break
+            prev, cur = cur, min(nxt)
+            order.append(cur)
+        if len(order) != len(eis) + 1:
+            continue
+        chains.append(order)
+
+    if len(chains) < _RULED_MIN_TRACKS:
+        return None
+
+    # Two transversal straight families live on a closed blend: the
+    # rulings and the straight sides of the ring polylines (a square
+    # side IS straight).  Try each long chain as a seed direction,
+    # keep cone- and extent-compatible chains, and select the family
+    # with the highest vertex coverage: rulings touch every vertex of
+    # a ruled surface, ring-side chains only one ring.
+    def _chain_dir(ch):
+        d = v_arr[ch[-1]] - v_arr[ch[0]]
+        dn = float(np.linalg.norm(d))
+        return d / dn if dn > 1e-12 else None
+
+    chains.sort(key=len, reverse=True)
+
+    comp_vert_count = len(inc)
+    comp_pts = v_arr[list(inc.keys())]
+    cone_cos = math.cos(math.radians(_RULED_FAMILY_CONE_DEG))
+    seeds: List[np.ndarray] = []
+    for ch in chains:
+        d = _chain_dir(ch)
+        if d is None:
+            continue
+        if any(abs(float(d @ sd)) >= cone_cos for sd in seeds):
+            continue
+        seeds.append(d)
+        if len(seeds) >= _RULED_MAX_FAMILY_TRIES:
+            break
+    family: List[List[int]] = []
+    d_ref = None
+    best_cov = 0.0
+    for d in seeds:
+        comp_ext = (comp_pts - comp_pts[0]) @ d
+        comp_span = float(comp_ext.max() - comp_ext.min())
+        if comp_span <= 1e-12:
+            continue
+        fam: List[List[int]] = []
+        for ch in chains:
+            cd = _chain_dir(ch)
+            if cd is None or abs(float(cd @ d)) < cone_cos:
+                continue
+            ext = (v_arr[ch] - v_arr[ch[0]]) @ d
+            if float(ext.max() - ext.min()) < _RULED_FAMILY_EXTENT_FRAC * comp_span:
+                continue
+            fam.append(ch)
+        if len(fam) < _RULED_MIN_TRACKS:
+            continue
+        cov = len({v for ch in fam for v in ch}) / comp_vert_count
+        if cov > best_cov:
+            family, d_ref, best_cov = fam, d, cov
+    if d_ref is None or best_cov < _RULED_MIN_COVERAGE:
+        return None
+
+    oriented: List[List[int]] = []
+    for ch in family:
+        if float((v_arr[ch[-1]] - v_arr[ch[0]]) @ d_ref) < 0.0:
+            ch = list(reversed(ch))
+        oriented.append(ch)
+
+    worst = 0.0
+    chain_edge_set = set()
+    for ch in oriented:
+        a3, b3 = v_arr[ch[0]], v_arr[ch[-1]]
+        ab = b3 - a3
+        abn = float(np.linalg.norm(ab))
+        if abn <= 1e-12:
+            return None
+        ah = ab / abn
+        for vi in ch:
+            dev = v_arr[vi] - a3
+            perp = dev - float(dev @ ah) * ah
+            worst = max(worst, float(np.linalg.norm(perp)))
+        for u, w in zip(ch[:-1], ch[1:]):
+            chain_edge_set.add((min(u, w), max(u, w)))
+    if worst > 2.0 * tol:
+        return None
+
+    comp_verts = set(inc.keys())
+    chain_verts = {v for ch in oriented for v in ch}
+    coverage = len(chain_verts) / max(len(comp_verts), 1)
+    if coverage < _RULED_MIN_COVERAGE:
+        return None
+
+    rail_a_ids = [ch[0] for ch in oriented]
+    rail_b_ids = [ch[-1] for ch in oriented]
+
+    def _order_rail(pt_ids):
+        rail_set = set(pt_ids)
+        adj_r: Dict[int, List[int]] = defaultdict(list)
+        for (u, w) in edges:
+            if (u in rail_set and w in rail_set
+                    and (u, w) not in chain_edge_set):
+                adj_r[u].append(w)
+                adj_r[w].append(u)
+        if not adj_r:
+            return None, None
+        if any(len(adj_r[p]) > 2 for p in pt_ids if p in adj_r):
+            return None, None
+        starts = [p for p in pt_ids if len(adj_r.get(p, ())) == 1]
+        closed = not starts
+        if closed:
+            start = min(rail_set)
+            if len(adj_r.get(start, ())) != 2:
+                return None, None
+        else:
+            if len(starts) != 2:
+                return None, None
+            start = min(starts)
+        order = [start]
+        prev, cur = -1, start
+        while True:
+            nxt = [n for n in adj_r.get(cur, ()) if n != prev]
+            if not nxt or nxt[0] == start:
+                break
+            prev, cur = cur, min(nxt)
+            order.append(cur)
+        if set(order) != rail_set:
+            return None, None
+        return order, closed
+
+    order_a, closed_a = _order_rail(rail_a_ids)
+    order_b, closed_b = _order_rail(rail_b_ids)
+    if order_a is None or order_b is None:
+        return None
+    if closed_a != closed_b:
+        return None
+    pts_a = v_arr[order_a]
+    pts_b = v_arr[order_b]
+    if (len(order_a) > 1 and len(order_b) > 1
+            and float((pts_b[1] - pts_b[0]) @ (pts_a[1] - pts_a[0])) < 0.0):
+        order_b = list(reversed(order_b))
+        pts_b = v_arr[order_b]
+
+    conf = round(max(0.0, 1.0 - 0.5 * worst / tol), 4)
+    return {
+        "component": comp_ids[tris[0]] if tris else 0,
+        "patch_index": patch_idx,
+        "triangle_count": len(tris),
+        "area": round(_cluster_tri_area(v_arr, f_arr, tris), 6),
+        "surface_type": "loft",
+        "recovered_via": "ruled_band",
+        "ruling": "line",
+        "rail_a_points_cm": [
+            [round(float(c), 6) for c in p] for p in pts_a],
+        "rail_b_points_cm": [
+            [round(float(c), 6) for c in p] for p in pts_b],
+        "rails_closed": bool(closed_a),
+        "track_count": len(oriented),
+        "coverage": round(coverage, 4),
+        "residual_cm": round(worst, 8),
+        "confidence": conf,
+    }
+
+
+def _recover_ruled_bands(v_arr, f_arr, tri_normals, planar_groups,
+                         edge_faces, tri_to_group, is_small,
+                         mean_normals, consumed_groups, epsilon,
+                         comp_ids, patch_idx):
+    """Ruled-loft (P2) recovery pass over remaining small groups.
+
+    Linear-blend lofts (square-to-round transitions, draft walls with
+    curved sections) fragment into small planar groups no earlier pass
+    claims; their straight vertex tracks detect them.  Returns
+    ``(patches, consumed_tris, consumed_groups)`` with patch indices
+    continuing from *patch_idx*.
+    """
+    comps = _leftover_smooth_components(
+        planar_groups, edge_faces, tri_to_group, is_small,
+        consumed_groups, mean_normals)
+    patches: List[Dict] = []
+    used_tris: set = set()
+    used_groups: set = set()
+    for root in sorted(comps, key=lambda r: min(comps[r])):
+        group_list = comps[root]
+        tris = sorted(set(
+            ti for gi in group_list
+            for ti in planar_groups[gi]["tri_indices"]))
+        if len(tris) < 6:
+            continue
+        entry = _ruled_band_entry(
+            v_arr, f_arr, planar_groups, group_list, tris, epsilon,
+            comp_ids, patch_idx + len(patches))
+        if entry is None:
+            continue
+        patches.append(entry)
+        used_tris.update(tris)
+        used_groups.update(group_list)
+    return patches, used_tris, used_groups
+
+
+def _pipe_band_entry(v_arr, f_arr, tri_normals, tris, epsilon, comp_ids,
+                     patch_idx):
+    """General-pipe detection for one leftover component.
+
+    A constant-profile tube swept along a curved spine has locally
+    planar normal fans: the null direction of each vertex's incident
+    normal scatter is the local spine tangent.  Edges parallel to both
+    endpoint tangents are longitudinal; removing them leaves the ring
+    loops.  Round congruent rings whose centroids trace a curved spine
+    accept as one pipe face.  Returns the patch entry or None.
+    """
+    tri_arr = np.asarray(tris, dtype=np.int64)
+    verts = np.unique(f_arr[tri_arr].ravel())
+    pos_of = {int(v): i for i, v in enumerate(verts)}
+
+    scatter = np.zeros((len(verts), 3, 3))
+    for ti in tris:
+        n3 = tri_normals[ti]
+        outer = np.outer(n3, n3)
+        for u in f_arr[ti]:
+            scatter[pos_of[int(u)]] += outer
+    try:
+        eigvals, eigvecs = np.linalg.eigh(scatter)
+    except np.linalg.LinAlgError:
+        return None
+    lmid = eigvals[:, 1]
+    lmax = np.maximum(eigvals[:, 2], 1e-18)
+    planar_ok = (lmid <= _PIPE_NORMAL_PLANAR_FRAC * lmax) & (eigvals[:, 2] > 1e-12)
+    if float(planar_ok.mean()) < 0.8:
+        return None
+    tan_of = {int(v): eigvecs[pos_of[int(v)], :, 0]
+              for v in verts if planar_ok[pos_of[int(v)]]}
+
+    edges = _component_edges(f_arr, tris)
+    long_pairs = []
+    ring_parent = {int(v): int(v) for v in verts}
+
+    def _rfind(x):
+        while ring_parent[x] != x:
+            ring_parent[x] = ring_parent[ring_parent[x]]
+            x = ring_parent[x]
+        return x
+
+    for (u, w) in edges:
+        tu, tw = tan_of.get(u), tan_of.get(w)
+        if tu is None or tw is None:
+            continue
+        d = v_arr[w] - v_arr[u]
+        dn = float(np.linalg.norm(d))
+        if dn <= 1e-12:
+            continue
+        dh = d / dn
+        if (abs(float(dh @ tu)) >= _PIPE_LONG_EDGE_DOT
+                and abs(float(dh @ tw)) >= _PIPE_LONG_EDGE_DOT):
+            long_pairs.append((u, w))
+        else:
+            ra, rb = _rfind(u), _rfind(w)
+            if ra != rb:
+                ring_parent[ra] = rb
+
+    ring_of = {int(v): _rfind(int(v)) for v in verts}
+    ring_verts: Dict[int, List[int]] = defaultdict(list)
+    for v in verts:
+        ring_verts[ring_of[int(v)]].append(int(v))
+    rings = {rid: sorted(vs) for rid, vs in ring_verts.items()
+             if len(vs) >= _PIPE_MIN_RING_VERTS}
+    if len(rings) < _PIPE_MIN_STATIONS:
+        return None
+
+    all_ring = set()
+    for vs in rings.values():
+        all_ring.update(vs)
+    if len(all_ring) < 0.9 * len(verts):
+        return None
+
+    centroids: Dict[int, np.ndarray] = {}
+    radii: Dict[int, float] = {}
+    for rid, vs in rings.items():
+        pts = v_arr[vs]
+        c = pts.mean(axis=0)
+        rel = np.linalg.norm(pts - c, axis=1)
+        r_mean = float(rel.mean())
+        if r_mean <= 1e-9:
+            return None
+        if float(np.abs(rel - r_mean).max()) > 2.0 * max(epsilon, 1e-9):
+            return None
+        centroids[rid] = c
+        radii[rid] = r_mean
+
+    med_r = float(np.median(list(radii.values())))
+    if any(abs(r - med_r) > 2.0 * max(epsilon, 1e-9)
+           for r in radii.values()):
+        return None
+
+    adj_r: Dict[int, set] = defaultdict(set)
+    for u, w in long_pairs:
+        ra, rb = ring_of[u], ring_of[w]
+        if ra in rings and rb in rings and ra != rb:
+            adj_r[ra].add(rb)
+            adj_r[rb].add(ra)
+    if not adj_r:
+        return None
+
+    ends = sorted(r for r in rings if len(adj_r.get(r, ())) == 1)
+    start = ends[0] if ends else min(rings)
+    spine_ids = [start]
+    prev, cur = -1, start
+    while True:
+        nxt = [n for n in sorted(adj_r.get(cur, ())) if n != prev]
+        if not nxt or nxt[0] == start:
+            break
+        prev, cur = cur, nxt[0]
+        spine_ids.append(cur)
+    if len(spine_ids) != len(rings):
+        return None
+
+    spine = np.array([centroids[rid] for rid in spine_ids])
+    chord = spine[-1] - spine[0]
+    chord_n = float(np.linalg.norm(chord))
+    if chord_n <= 1e-9:
+        return None
+    dev = spine - spine[0]
+    bow = float(np.max(np.linalg.norm(
+        dev - np.outer(dev @ (chord / chord_n), chord / chord_n),
+        axis=1)))
+    # A straight spine is an extrusion/cylinder, owned by earlier and
+    # later passes — the pipe claim needs genuine spine curvature.
+    if bow <= max(2.0 * epsilon, _PIPE_MIN_SPINE_BOW * chord_n):
+        return None
+
+    gaps = np.linalg.norm(np.diff(spine, axis=0), axis=1)
+    if float(gaps.max()) > 3.0 * max(float(np.median(gaps)), 1e-9):
+        return None
+
+    worst = 0.0
+    for rid, vs in rings.items():
+        rel = np.linalg.norm(v_arr[vs] - centroids[rid], axis=1)
+        worst = max(worst, float(np.abs(rel - med_r).max()))
+
+    tol = max(epsilon, 1e-9)
+    return {
+        "component": comp_ids[tris[0]] if tris else 0,
+        "patch_index": patch_idx,
+        "triangle_count": len(tris),
+        "area": round(_cluster_tri_area(v_arr, f_arr, tris), 6),
+        "surface_type": "pipe",
+        "recovered_via": "pipe_band",
+        "spine_points_cm": [
+            [round(float(c), 6) for c in p] for p in spine],
+        "stations": len(spine_ids),
+        "profile_radius_cm": round(med_r, 6),
+        "spine_bow_cm": round(bow, 6),
+        "residual_cm": round(worst, 8),
+        "confidence": round(max(0.0, 1.0 - 0.5 * worst / tol), 4),
+    }
+
+
+def _recover_pipe_bands(v_arr, f_arr, tri_normals, planar_groups,
+                        edge_faces, tri_to_group, is_small,
+                        mean_normals, consumed_groups, epsilon,
+                        comp_ids, patch_idx):
+    """General-pipe (P4) recovery pass over remaining small groups.
+
+    Constant-section tubes along curved spline spines defeat every
+    prismatic pass; ring-flow detection recovers them before the
+    extrusion-band pass shreds them into locally-axis-parallel
+    fragments.  Returns ``(patches, consumed_tris, consumed_groups)``
+    with patch indices continuing from *patch_idx*.
+    """
+    comps = _leftover_smooth_components(
+        planar_groups, edge_faces, tri_to_group, is_small,
+        consumed_groups, mean_normals)
+    patches: List[Dict] = []
+    used_tris: set = set()
+    used_groups: set = set()
+    for root in sorted(comps, key=lambda r: min(comps[r])):
+        group_list = comps[root]
+        tris = sorted(set(
+            ti for gi in group_list
+            for ti in planar_groups[gi]["tri_indices"]))
+        if len(tris) < 6:
+            continue
+        entry = _pipe_band_entry(
+            v_arr, f_arr, tri_normals, tris, epsilon, comp_ids,
+            patch_idx + len(patches))
+        if entry is None:
+            continue
+        patches.append(entry)
+        used_tris.update(tris)
+        used_groups.update(group_list)
+    return patches, used_tris, used_groups
+
+
 def _band_twist_rejected(planar_groups, band_groups, mean_normals, axis,
                          v_arr, f_arr):
     """Azimuth-vs-axial-coordinate twist tripwire for one band.
@@ -3793,6 +4340,21 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
         recovered_tri_indices.update(helix_tris)
         recovered_groups.update(helix_groups_used)
 
+    # --- (5.5) General-pipe recovery: spline-spine tubes (2026-08-21) ---
+    # Runs BEFORE the extrusion-band pass: a bent tube's longitudinal
+    # edges are locally axis-parallel and the band pass would shred it
+    # into per-segment fragments.  The spine-curvature guard hands
+    # straight tubes back to the prismatic passes.
+    pipe_patches, pipe_tris, pipe_groups_used = _recover_pipe_bands(
+        v_arr, f_arr, tri_normals, planar_groups, edge_faces,
+        tri_to_group, is_small, mean_normals, recovered_groups,
+        epsilon, comp_ids, patch_idx)
+    if pipe_patches:
+        recovered_patches.extend(pipe_patches)
+        patch_idx += len(pipe_patches)
+        recovered_tri_indices.update(pipe_tris)
+        recovered_groups.update(pipe_groups_used)
+
     # --- (6) Extrusion-band recovery: spline profiles (2026-08-20) ---
     # Runs over small groups the per-cluster ladder above did NOT
     # consume; bands chained through axis-parallel shared edges accept
@@ -3807,6 +4369,20 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
         patch_idx += len(band_patches)
         recovered_tri_indices.update(band_tris)
         recovered_groups.update(band_groups_used)
+
+    # --- (6.5) Ruled-band recovery: linear-blend lofts (2026-08-21) ---
+    # Square-to-round transitions and ruled blends fragment into small
+    # groups no prismatic pass claims; collinear vertex tracks (the
+    # rulings) detect them and the track endpoints become the rails.
+    ruled_patches, ruled_tris, ruled_groups_used = _recover_ruled_bands(
+        v_arr, f_arr, tri_normals, planar_groups, edge_faces,
+        tri_to_group, is_small, mean_normals, recovered_groups,
+        epsilon, comp_ids, patch_idx)
+    if ruled_patches:
+        recovered_patches.extend(ruled_patches)
+        patch_idx += len(ruled_patches)
+        recovered_tri_indices.update(ruled_tris)
+        recovered_groups.update(ruled_groups_used)
 
     remaining_groups = [g for gi, g in enumerate(planar_groups)
                         if gi not in recovered_groups]
