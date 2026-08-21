@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import copy
 import math
+import traceback
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace as _dataclasses_replace
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -1250,6 +1251,50 @@ _BAND_CORNER_DEG = 60.0          # projected-normal turn between consecutive
                                  # deg keeps fillet junctions at 45 deg smooth
                                  # while pinning real 90 deg profile corners)
 
+# --- revolve & helical band recovery, phase 3 (2026-08-21) -------------------
+_REVOLVE_EDGE_TAN_DOT = 0.1     # |edge_dir . tangential| below this = a
+                                # meridian edge (along the profile) — unions
+                                # groups into one revolve span; above 0.9 =
+                                # azimuthal edge (along the sweep) — links
+                                # consecutive spans at a profile junction
+_REVOLVE_COPLANAR_FRAC = 0.05   # revolve axis-position fit: mean coplanarity
+                                # residual above this fraction of the
+                                # perpendicular extent = not a revolve (the
+                                # tight acceptance lives in the profile
+                                # rungs' epsilon gates, not here — chord-strip
+                                # centroids carry O(azimuth step) noise)
+_REVOLVE_SPLIT_DEG = 25.0       # profile-normal turn above this splits the
+                                 # walked profile into per-span fits: real CAD
+                                 # kinks (cone-cylinder steps ~28-37 deg) split;
+                                 # smooth tessellation steps (<= 15 deg at
+                                 # 24+ chords) stay merged
+_PROFILE_LINE_MIN_PTS = 2       # profile points needed to CLAIM a line — a
+                                 # 2-point claim (single-span piece) is
+                                 # unfalsifiable from the points alone, so the
+                                 # acceptance is decided by the epsilon
+                                 # verification over ALL span vertices instead
+_PROFILE_CIRCLE_MIN_PTS = 3     # 3 points claim a circle; falsifiability
+                                 # comes from the span-vertex verification and
+                                 # (for closed rings) >= 8 junction points
+_HELICAL_MIN_PHI = 4.712389     # a helix claim needs >= 270 deg of azimuthal
+                                 # sweep to be falsifiable against a revolve
+_REVOLVE_MIN_EXTENT_DEG = 90.0  # a revolve piece whose vertices sweep less
+                                  # azimuth than this around the fitted axis
+                                  # is not a revolution — reject (thin slivers,
+                                  # T-junction fragments)
+_SPLINE_EXACT_TARGET = 1e-4     # post-acceptance quality target for spline
+                                  # profiles; knot-insertion refinement pushes
+                                  # exact data near zero, noisy data stalls
+_SPLINE_POLISH_MAX_CTRL = 12    # control-point cap for the refinement pass
+_REVOLVE_AXIS_MIN_CONF = 0.65   # per-piece confidence floor for accepting
+                                  # an axis's revolve-band result; low
+                                  # confidence = projection artifact
+_REVOLVE_CLOSED_MIN_DEG = 300.0  # junction-free span fallback requires a
+                                  # closed azimuth band; open arcs belong
+                                  # to the sweep pass
+_REVOLVE_COVER_MIN_FRAC = 0.85  # an axis must explain at least this
+                                  # fraction of the cluster's wall tris
+
 
 def _otsu_threshold(log_values, n_bins=128):
     """Otsu's method: threshold maximizing between-class variance.
@@ -1849,14 +1894,9 @@ def _periodic_profile_knots(knot_list, degree):
     return tiled[i0 - degree: i0 + n_c + degree + 1]
 
 
-def _spline_curve_residual(points, params, knots, degree, ctrl, closed):
-    """Per-point geometric distances from *points* to a B-spline curve.
-
-    Each data parameter is refined by two Newton steps along the local
-    tangent (central finite differences of the evaluated curve); closed
-    profiles wrap refined parameters modulo the period.  Returns
-    ``(mean_distance, per_point_distances)``.
-    """
+def _refine_curve_params(points, params, knots, degree, ctrl, closed,
+                         steps=4):
+    """Newton-polish data parameters toward the curve's closest points."""
     pts = np.asarray(points, dtype=np.float64)
     s = np.asarray(params, dtype=np.float64).copy()
     delta = 1e-5
@@ -1864,7 +1904,7 @@ def _spline_curve_residual(points, params, knots, degree, ctrl, closed):
     def _eval(q):
         return _bspline_basis_matrix(q, knots, degree) @ ctrl
 
-    for _ in range(2):
+    for _ in range(steps):
         c_s = _eval(s)
         if closed:
             sp, sm = s + delta, s - delta
@@ -1881,7 +1921,21 @@ def _spline_curve_residual(points, params, knots, degree, ctrl, closed):
             / denom[safe]
         s = s + step
         s = np.mod(s, 1.0) if closed else np.clip(s, 0.0, 1.0)
-    c_fin = _eval(s)
+    return s
+
+
+def _spline_curve_residual(points, params, knots, degree, ctrl, closed):
+    """Per-point geometric distances from *points* to a B-spline curve.
+
+    Each data parameter is refined by two Newton steps along the local
+    tangent (central finite differences of the evaluated curve); closed
+    profiles wrap refined parameters modulo the period.  Returns
+    ``(mean_distance, per_point_distances)``.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    s = _refine_curve_params(pts, params, knots, degree, ctrl, closed,
+                            steps=2)
+    c_fin = _bspline_basis_matrix(s, knots, degree) @ ctrl
     dists = np.hypot(pts[:, 0] - c_fin[:, 0], pts[:, 1] - c_fin[:, 1])
     return float(dists.mean()), dists
 
@@ -2071,6 +2125,55 @@ def _fit_bspline_profile(points, closed, corner_params, epsilon):
                 interior.sort()
             break
 
+    # --- Quality refinement: compress exact data by knot insertion.
+    # Insert at the worst residual while it cuts the residual by 30%+
+    # residual; noise-dominated meshes stall at their floor and keep
+    # the compact epsilon-level fit.
+    while True:
+        n_ctrl = len(K) if closed else 4 + len(interior)
+        if (n_ctrl >= _SPLINE_POLISH_MAX_CTRL
+                or mean_res <= _SPLINE_EXACT_TARGET):
+            break
+        _, dists_now = _spline_curve_residual(
+            pts, params, t_ext, degree, ctrl_ext, closed)
+        u_worst = float(params[int(np.argmax(dists_now))])
+        if closed:
+            bounds = K + [1.0 + K[0]]
+            pos = _insert_position(bounds, u_worst) % 1.0
+            K.append(pos)
+            K.sort()
+        else:
+            bounds = [0.0] + interior + [1.0]
+            pos = _insert_position(bounds, u_worst)
+            interior.append(pos)
+            interior.sort()
+        q2, t2, c2, res2, _ = _fit_once()
+        if res2 < 0.7 * mean_res and len(q2) < n:
+            q, t_ext, ctrl_ext, mean_res = q2, t2, c2, res2
+        else:
+            (K if closed else interior).remove(pos)
+            if closed:
+                K.sort()
+            else:
+                interior.sort()
+            q, t_ext, ctrl_ext, mean_res, _ = _fit_once()
+            break
+
+    if not closed:
+        for _ in range(3):
+            new_params = _refine_curve_params(
+                pts, params, t_ext, degree, ctrl_ext, False, steps=4)
+            new_params[0] = 0.0
+            new_params[-1] = 1.0
+            design = _bspline_basis_matrix(new_params, t_ext, degree)
+            q_new = np.linalg.lstsq(design, pts, rcond=None)[0]
+            res_new, _ = _spline_curve_residual(
+                pts, new_params, t_ext, degree, q_new, False)
+            if res_new >= mean_res:
+                break
+            q, ctrl_ext, mean_res = q_new, q_new, res_new
+            params = new_params
+
     out_knots = sorted(K) if closed else sorted(interior)
     return {
         "profile_closed": bool(closed),
@@ -2086,26 +2189,36 @@ def _fit_bspline_profile(points, closed, corner_params, epsilon):
 
 
 def _band_walk_profile(band_groups, pair_junctions, planar_groups,
-                       mean_normals, axis, proj, f_arr):
+                       mean_normals, axis, proj, f_arr, node_dirs=None,
+                       corner_deg=None):
     """Ordered 2D profile walk over a band's group adjacency graph.
 
-    The band graph is traversed greedily by smallest projected-normal
-    azimuth turn at each step (the geometric continuation of the
-    profile, in the spirit of the sweep run-grower) — this rides
-    through spurious T-junction edges (coplanar-merged strips,
-    non-manifold tessellation) whose azimuth turns are large, instead
-    of bailing on degree >= 3 nodes.  Every group is tried as a
-    bidirectional seed (forward + backward passes from the seed); the
-    longest walk wins.  Junction points come from the shared
-    axis-parallel mesh-edge vertex indices (exact, not
-    proximity-matched); open ends take the group's projected vertex
-    farthest from its single junction.  Corners are junctions where
-    consecutive groups' projected mean-normal azimuths turn more than
-    ``_BAND_CORNER_DEG``.
+    The band graph is traversed greedily by smallest profile-normal turn
+    at each step (the geometric continuation of the profile, in the
+    spirit of the sweep run-grower) — this rides through spurious
+    T-junction edges (coplanar-merged strips, non-manifold
+    tessellation) whose turns are large, instead of bailing on
+    degree >= 3 nodes.  Every group is tried as a bidirectional seed
+    (forward + backward passes from the seed); the longest walk wins.
+    Normal directions for turn measurement default to the
+    axis-perpendicular azimuths of ``mean_normals``; callers working in
+    another quotient space (e.g. the (r, h) meridian half-plane of a
+    revolve) pass ``node_dirs`` — one unit 2D direction per group id
+    (dict or list indexed by group id), None for degenerate.  Junction
+    points come from the shared axis-parallel mesh-edge vertex indices
+    (exact, not proximity-matched); open ends take the group's projected
+    vertex farthest from its single junction.  Corners are junctions
+    where consecutive groups' profile normals turn more than
+    ``corner_deg`` (default ``_BAND_CORNER_DEG``).
 
-    Returns ``(points, corner_point_indices, closed, visited_groups)`` or
-    None when no walk covers at least 50%% of the band's groups.
+    Returns ``(points, corner_point_indices, closed, visited_groups,
+    remap)`` — *remap* maps each pre-dedup sequence position to its
+    final (deduplicated) point index, so callers can translate point
+    positions back to span/group positions — or None when no walk
+    covers at least 50%% of the band's groups.
     """
+    if corner_deg is None:
+        corner_deg = _BAND_CORNER_DEG
     bset = set(band_groups)
     adj: Dict[int, set] = defaultdict(set)
     for (a, b) in pair_junctions:
@@ -2116,7 +2229,9 @@ def _band_walk_profile(band_groups, pair_junctions, planar_groups,
     endpoints = sorted(g for g in band_groups if degs[g] == 1)
     closed = len(endpoints) == 0
 
-    def _azimuth(gi):
+    def _dir(gi):
+        if node_dirs is not None:
+            return node_dirs[gi]
         n_vec = mean_normals[gi]
         if n_vec is None:
             return None
@@ -2126,13 +2241,16 @@ def _band_walk_profile(band_groups, pair_junctions, planar_groups,
         c1, c2 = (1, 2) if dom == 0 else ((0, 2) if dom == 1 else (0, 1))
         if float(np.hypot(perp[c1], perp[c2])) <= 1e-9:
             return None
-        return math.atan2(perp[c2], perp[c1])
+        d2 = np.array([perp[c1], perp[c2]])
+        return d2 / float(np.linalg.norm(d2))
 
     def _turn(ga, gb):
-        aa, ab = _azimuth(ga), _azimuth(gb)
-        if aa is None or ab is None:
+        da, db = _dir(ga), _dir(gb)
+        if da is None or db is None:
             return 0.0
-        return abs((math.degrees(ab - aa) + 180.0) % 360.0 - 180.0)
+        dot = float(da @ db)
+        cross = float(da[0] * db[1] - da[1] * db[0])
+        return math.degrees(math.atan2(abs(cross), dot))
 
     def _greedy(start, blocked):
         cur = start
@@ -2184,7 +2302,7 @@ def _band_walk_profile(band_groups, pair_junctions, planar_groups,
         for i in range(len(order)):
             ga, gb = order[i], order[(i + 1) % len(order)]
             seq.append(_junction_2d(ga, gb))
-            if _turn(ga, gb) > _BAND_CORNER_DEG:
+            if _turn(ga, gb) > corner_deg:
                 corner_idx.append(len(seq) - 1)
     else:
         j_first = _junction_2d(order[0], order[1])
@@ -2196,7 +2314,7 @@ def _band_walk_profile(band_groups, pair_junctions, planar_groups,
         for i in range(len(order) - 1):
             ga, gb = order[i], order[i + 1]
             seq.append(_junction_2d(ga, gb))
-            if _turn(ga, gb) > _BAND_CORNER_DEG:
+            if _turn(ga, gb) > corner_deg:
                 corner_idx.append(len(seq) - 1)
         j_last = _junction_2d(order[-2], order[-1])
         pts_e = [proj(v) for v in _group_vertex_ids(
@@ -2214,11 +2332,11 @@ def _band_walk_profile(band_groups, pair_junctions, planar_groups,
         else:
             dedup.append(p)
             remap.append(len(dedup) - 1)
-    if len(dedup) < 4:
+    if len(dedup) < 2:
         return None
     corners = sorted({remap[i] for i in corner_idx
                       if remap[i] < len(dedup)})
-    return np.array(dedup), corners, closed, order
+    return np.array(dedup), corners, closed, order, remap
 
 
 def _group_vertex_ids(planar_groups, gi, f_arr):
@@ -2276,7 +2394,7 @@ def _accept_band(band_groups, pair_junctions, v_arr, f_arr, tri_normals,
         mean_normals, axis_est, _proj, f_arr)
     if walk is None:
         return None
-    points, corner_pts, closed, visited_groups = walk
+    points, corner_pts, closed, visited_groups, _remap = walk
     band_tris = sorted(set(
         ti for gi in visited_groups
         for ti in planar_groups[gi]["tri_indices"]))
@@ -2510,6 +2628,820 @@ def _band_twist_rejected(planar_groups, band_groups, mean_normals, axis,
         > _BAND_TWIST_CORR_MAX
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: revolve & helical bands (2026-08-21)
+#
+# A surface of revolution — any profile (line, arc, spline) rotated about
+# an axis — tessellates into chord strips whose consecutive spans share
+# AZIMUTHAL edges (the dual of the extrusion pass's axis-parallel
+# edges), while groups within one span share MERIDIAN edges.  Every
+# triangle normal of a revolve lies exactly in a meridian plane, so the
+# axis position falls out of a linear coplanarity least-squares
+# (Pietsch/Märkt-style).  In the (r, h) meridian half-plane the whole
+# band collapses to the profile polyline and the quadric degeneracies
+# fall out of 2D fits: vertical line = cylinder, tilted line = cone,
+# axis-centered circle = sphere, off-axis closed circle = torus,
+# anything smooth = the phase-2 adaptive B-spline.
+#
+# A helical pipe (spring) unwraps the same way: with pitch q, every
+# vertex maps to the (r, v = h - q*phi) half-plane, where the surface
+# is EXACTLY a circle for radial-frame sweeps — pitch becomes a 1-D
+# search whose objective is the phase-2 Kasa residual.
+# ---------------------------------------------------------------------------
+
+
+def _fit_revolve_axis(tri_normals, tri_centroids, axis):
+    """Axis-line position for a candidate revolve, via normal coplanarity.
+
+    Each triangle normal of a surface of revolution lies in a meridian
+    plane through the axis, so the axis point p satisfies
+    (n x a) . (p - c) = 0 per triangle — linear in p.  The system only
+    constrains p's axis-perpendicular components (n x a is perpendicular
+    to a), so lstsq's minimum-norm solution pins the free axial
+    component to the centroid plane.  Returns ``(point, mean_residual)``
+    where the residual carries O(azimuth step) centroid noise — gate it
+    loosely; the profile rungs' epsilon gates do the real accepting.
+    """
+    cross = np.cross(tri_normals, axis)
+    b = np.einsum("ij,ij->i", cross, tri_centroids)
+    try:
+        p, *_ = np.linalg.lstsq(cross, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None, float("inf")
+    resid = float(np.mean(np.abs(cross @ p - b)))
+    return np.asarray(p, dtype=np.float64), resid
+
+
+def _fit_profile_line(pts):
+    """Total-least-squares line fit of 2D profile points.
+
+    Returns ``(direction, point_on_line, mean_perp_residual)`` with the
+    direction sign-normalized (positive dominant component; ties to the
+    lower component index).
+    """
+    center = pts.mean(axis=0)
+    cov = (pts - center).T @ (pts - center)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    d = np.asarray(eigvecs[:, -1], dtype=np.float64)
+    big = int(np.argmax(np.abs(d)))
+    if d[big] < 0.0:
+        d = -d
+    resid = float(np.mean(np.abs((pts - center) @ np.array(
+        [-d[1], d[0]]))))
+    return d, center, resid
+
+
+def _fit_profile_circle(pts):
+    """Kasa algebraic circle fit of 2D profile points.
+
+    Returns ``(center, radius, mean_radial_residual)`` or None when the
+    algebraic solve degenerates.
+    """
+    x = pts[:, 0] - pts[:, 0].mean()
+    y = pts[:, 1] - pts[:, 1].mean()
+    A = np.column_stack([2.0 * x, 2.0 * y, np.ones_like(x)])
+    b = x * x + y * y
+    try:
+        coeffs, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    cx, cy, c = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]))
+    r_sq = cx * cx + cy * cy + c
+    if r_sq <= 1e-12:
+        return None
+    radius = math.sqrt(r_sq)
+    center = pts.mean(axis=0) + np.array([cx, cy])
+    dists = np.hypot(pts[:, 0] - center[0], pts[:, 1] - center[1])
+    return center, radius, float(np.mean(np.abs(dists - radius)))
+
+
+def _span_vertex_rh(v_arr, f_arr, axis, p_axis, tri_indices):
+    """(r, h) meridian coordinates of every vertex used by a span."""
+    ti = np.asarray(sorted(set(tri_indices)), dtype=np.int64)
+    vids = np.unique(f_arr[ti].ravel())
+    rel = v_arr[vids] - p_axis
+    h = rel @ axis
+    perp = rel - np.outer(h, axis)
+    r = np.linalg.norm(perp, axis=1)
+    return r, h
+
+
+def _accept_revolve_piece(pts, piece_closed, span_r, span_h, axis,
+                          p_axis, epsilon):
+    """Acceptance ladder for one walked profile piece of a revolve band.
+
+    Rungs, cheapest model first: line (cylinder / cone by radial drift),
+    circle (sphere / torus / fillet-arc revolve), adaptive B-spline
+    (spline lathe).  A rung accepts only when its residual over the
+    profile points AND the mean distance of EVERY span vertex in the
+    (r, h) half-plane to the fitted profile stay within *epsilon* — the
+    span vertices, not the junction points, are what makes a 2-3 point
+    line/circle claim falsifiable.  Returns a surface-fields dict
+    (schema-matched to the existing cylinder/cone/sphere/torus fits) or
+    None.
+    """
+    n = len(pts)
+    conf = lambda res: round(max(0.0, 1.0 - 0.5 * res / epsilon), 4)
+    h_span = float(span_h.max() - span_h.min()) if n else 0.0
+
+    if n >= _PROFILE_LINE_MIN_PTS:
+        d, p_on, res = _fit_profile_line(pts)
+        if res <= epsilon and abs(d[1]) > 1e-9:
+            slope = abs(float(d[0])) / abs(float(d[1]))
+            vres = float(np.mean(np.abs(
+                (span_r - p_on[0]) * (-d[1])
+                + (span_h - p_on[1]) * d[0])))
+            if vres <= epsilon:
+                if slope * max(h_span, 1e-12) <= epsilon:
+                    radius = float(np.mean(span_r))
+                    return {
+                        "surface_type": "cylinder",
+                        "axis": [round(float(c), 6) for c in axis],
+                        "radius_cm": round(radius, 6),
+                        "height_cm": round(h_span, 6),
+                        "confidence": conf(vres),
+                        "residual_cm": round(vres, 8),
+                    }
+                half_deg = math.degrees(math.atan(slope))
+                h_apex = p_on[1] + (0.0 - p_on[0]) * d[1] / d[0]
+                apex = p_axis + h_apex * axis
+                return {
+                    "surface_type": "cone",
+                    "axis": [round(float(c), 6) for c in axis],
+                    "half_angle_deg": round(half_deg, 4),
+                    "apex_cm": [round(float(c), 6) for c in apex],
+                    "confidence": conf(vres),
+                }
+
+    if n >= _PROFILE_CIRCLE_MIN_PTS:
+        circ = _fit_profile_circle(pts)
+        if circ is not None:
+            center, radius, res = circ
+            if res <= epsilon:
+                dists = np.hypot(span_r - center[0], span_h - center[1])
+                vres = float(np.mean(np.abs(dists - radius)))
+                if vres <= epsilon:
+                    if center[0] > radius * 0.5:
+                        angs = np.mod(np.arctan2(
+                            pts[:, 1] - center[1],
+                            pts[:, 0] - center[0]), 2.0 * math.pi)
+                        angs_sorted = np.sort(angs)
+                        gaps = np.diff(np.concatenate(
+                            [angs_sorted,
+                             [angs_sorted[0] + 2.0 * math.pi]]))
+                        ang_span = float(2.0 * math.pi - np.max(gaps))
+                        if piece_closed or ang_span > 1.5 * math.pi:
+                            centre3 = p_axis + center[1] * axis
+                            return {
+                                "surface_type": "torus",
+                                "axis": [round(float(c), 6) for c in axis],
+                                "center_cm": [round(float(c), 6)
+                                              for c in centre3],
+                                "major_radius_cm": round(float(center[0]), 6),
+                                "minor_radius_cm": round(radius, 6),
+                                "confidence": conf(vres),
+                            }
+                    if abs(center[0]) < radius * 0.2:
+                        centre3 = p_axis + center[1] * axis
+                        return {
+                            "surface_type": "sphere",
+                            "center_cm": [round(float(c), 6)
+                                          for c in centre3],
+                            "radius_cm": round(radius, 6),
+                            "confidence": conf(vres),
+                        }
+                    return {
+                        "surface_type": "revolve",
+                        "profile_kind": "circle",
+                        "axis": [round(float(c), 6) for c in axis],
+                        "profile_center_rh": [
+                            round(float(center[0]), 6),
+                            round(float(center[1]), 6)],
+                        "profile_radius_cm": round(radius, 6),
+                        "profile_closed": bool(piece_closed),
+                        "confidence": conf(vres),
+                        "residual_cm": round(vres, 8),
+                    }
+
+    if n >= 4:
+        profile = _fit_bspline_profile(pts, piece_closed, [], epsilon)
+        if profile is not None:
+            deg = int(profile["profile_degree"])
+            ctrl = np.asarray(
+                profile["profile_control_points_cm"], dtype=np.float64)
+            if profile["profile_closed"]:
+                t_ext = _periodic_profile_knots(
+                    profile["profile_knots"], deg)
+                ctrl_ext = np.vstack([ctrl, ctrl[:deg]])
+            else:
+                t_ext = np.array(
+                    [0.0] * (deg + 1)
+                    + [float(v) for v in profile["profile_knots"]]
+                    + [1.0] * (deg + 1))
+                ctrl_ext = ctrl
+            samp_u = np.linspace(0.0, 1.0, 1025)
+            samp = _bspline_basis_matrix(samp_u, t_ext, deg) @ ctrl_ext
+            vh = np.column_stack([span_r, span_h])
+            d2 = ((vh[:, None, :] - samp[None, :, :]) ** 2).sum(-1)
+            vres = float(np.sqrt(d2.min(axis=1)).mean())
+            if vres <= max(epsilon, 2e-6):
+                out = {
+                    "surface_type": "revolve",
+                    "profile_kind": "spline",
+                }
+                out.update(profile)
+                return out
+    return None
+
+
+def _span_dirs_for_tris(v_arr, f_arr, tri_normals, tris, axis, p_axis):
+    """Mean unit 2D profile-normal direction of one revolve span.
+
+    Returns ``(n . r_hat, n . axis)`` averaged over the span's triangle
+    normals (radial-frame components), or None when every centroid sits
+    on the axis.
+    """
+    ti_s = np.asarray(tris, dtype=np.int64)
+    cents_s = ((v_arr[f_arr[ti_s, 0]] + v_arr[f_arr[ti_s, 1]]
+                + v_arr[f_arr[ti_s, 2]]) / 3.0)
+    rel_s = cents_s - p_axis
+    h_s = rel_s @ axis
+    perp_s = rel_s - np.outer(h_s, axis)
+    r_s = np.linalg.norm(perp_s, axis=1)
+    safe = r_s > 1e-9
+    if not np.any(safe):
+        return None
+    r_hat = perp_s[safe] / r_s[safe, None]
+    dirs_2d = np.column_stack([
+        np.einsum("ij,ij->i", tri_normals[ti_s][safe], r_hat),
+        tri_normals[ti_s][safe] @ axis])
+    mean_dir = dirs_2d.mean(axis=0)
+    norm = float(np.linalg.norm(mean_dir))
+    return mean_dir / norm if norm > 1e-12 else None
+
+
+def _azimuth_extent_deg(v_arr, f_arr, axis, p_axis, tris):
+    """Azimuth covered by a triangle set around (axis, p_axis), degrees.
+
+    Circular max-gap method: sort vertex azimuths, extent is 360 minus
+    the largest gap (a full revolution has extent ~360, an open arc
+    keeps its true sweep).
+    """
+    vids = np.unique(f_arr[np.asarray(tris, dtype=np.int64)].ravel())
+    rel_v = v_arr[vids] - p_axis
+    h_v = rel_v @ axis
+    perp_v = rel_v - np.outer(h_v, axis)
+    dom = int(np.argmax(np.abs(axis)))
+    c1, c2 = ((1, 2) if dom == 0
+              else ((0, 2) if dom == 1 else (0, 1)))
+    phis = np.mod(np.arctan2(perp_v[:, c2], perp_v[:, c1]),
+                  2.0 * math.pi)
+    phis_sorted = np.sort(phis)
+    gaps = np.diff(np.concatenate(
+        [phis_sorted, [phis_sorted[0] + 2.0 * math.pi]]))
+    return math.degrees(2.0 * math.pi - float(np.max(gaps)))
+
+
+def _revolve_piece_entry(v_arr, f_arr, axis, p_axis, epsilon, comp_ids,
+                         patch_idx, seg_pts, piece_closed, all_tris):
+    """Ladder + azimuth-extent gate + patch entry for one profile piece.
+
+    Returns the curved-patch dict (``recovered_via: "revolve_band"``)
+    or None when the ladder rejects the piece or its vertices sweep
+    less than ``_REVOLVE_MIN_EXTENT_DEG`` of azimuth around the axis.
+    """
+    span_r, span_h = _span_vertex_rh(v_arr, f_arr, axis, p_axis, all_tris)
+    surface = _accept_revolve_piece(
+        seg_pts, piece_closed, span_r, span_h, axis, p_axis, epsilon)
+    if surface is None:
+        return None
+    extent_deg = _azimuth_extent_deg(v_arr, f_arr, axis, p_axis, all_tris)
+    if extent_deg < _REVOLVE_MIN_EXTENT_DEG:
+        return None
+    entry = {
+        "component": comp_ids[all_tris[0]] if all_tris else 0,
+        "patch_index": patch_idx,
+        "triangle_count": len(all_tris),
+        "area": round(_cluster_tri_area(v_arr, f_arr, all_tris), 6),
+        "axis_point_cm": [round(float(c), 6) for c in p_axis],
+        "azimuth_extent_deg": round(extent_deg, 3),
+        "recovered_via": "revolve_band",
+    }
+    entry.update(surface)
+    return entry
+
+
+def _revolve_bands_for_groups(v_arr, f_arr, tri_normals, planar_groups,
+                              edge_faces, tri_to_group, mean_normals,
+                              group_list, epsilon, comp_ids, patch_idx):
+    """Surfaces-of-revolution recovery for one small-group cluster.
+
+    Runs per cluster after the full-model competition failed and BEFORE
+    the sweep pass — a lathe's tessellation rows are constant-radius
+    rings, so the sweep pass would otherwise consume every ring as its
+    own thin cylinder and destroy the profile structure.  Per canonical
+    axis: cap groups (|mean normal . axis| > 0.9) are excluded, the
+    axis position comes from the normal-coplanarity least-squares
+    (loosely gated), groups union into profile spans over MERIDIAN
+    shared edges (edge direction perpendicular to the local azimuthal
+    direction — for any surface of revolution the meridian lies in the
+    plane spanned by the radial and axial directions), and spans chain
+    over AZIMUTHAL shared edges (each azimuthal edge's endpoints share
+    one exact (r, h) ring).  The span chain is walked with
+    ``_band_walk_profile`` in the (r, h) half-plane and split at normal
+    turns above ``_REVOLVE_SPLIT_DEG`` (real CAD kinks) into pieces,
+    each fitted by the ladder in ``_accept_revolve_piece``.  Spans with
+    no junctions (cluster split by kinks above the chaining gate, or
+    neighbours already consumed by an earlier pass) fall back to a
+    two-ring profile built from their azimuthal boundary edges.
+
+    Returns ``(patches, consumed_tris, consumed_groups)`` with patch
+    indices continuing from *patch_idx*.
+    """
+    gset = set(group_list)
+    if len(gset) < 2:
+        return [], set(), set()
+
+    shared_edges: List[Tuple[Tuple[int, int], int, int]] = []
+    one_sided: List[Tuple[int, int, int]] = []
+    for edge, tris in sorted(edge_faces.items()):
+        ga = gb = None
+        inner = 0
+        for t in tris:
+            g = tri_to_group.get(t)
+            if g in gset:
+                inner += 1
+                if ga is None:
+                    ga = g
+                elif g != ga:
+                    gb = g
+        if ga is not None and gb is not None:
+            shared_edges.append(
+                ((min(ga, gb), max(ga, gb)), int(edge[0]), int(edge[1])))
+        elif inner == 1:
+            one_sided.append((ga, int(edge[0]), int(edge[1])))
+
+    best_patches: List[Dict] = []
+    best_tris: set = set()
+    best_groups: set = set()
+
+    for axis_i in range(3):
+        patches: List[Dict] = []
+        used_tris: set = set()
+        used_groups: set = set()
+        axis = _CANON_AXES[axis_i]
+        wall_groups = [gi for gi in sorted(gset)
+                       if mean_normals[gi] is not None]
+        if len(wall_groups) < 2:
+            continue
+        wall_tris = sorted(set(
+            ti for gi in wall_groups
+            for ti in planar_groups[gi]["tri_indices"]))
+        if len(wall_tris) < 6:
+            continue
+        ti_arr = np.asarray(wall_tris, dtype=np.int64)
+        cents = ((v_arr[f_arr[ti_arr, 0]] + v_arr[f_arr[ti_arr, 1]]
+                  + v_arr[f_arr[ti_arr, 2]]) / 3.0)
+        p_axis, coplanar_res = _fit_revolve_axis(
+            tri_normals[ti_arr], cents, axis)
+        if p_axis is None:
+            continue
+        rel0 = v_arr[np.unique(f_arr[ti_arr].ravel())] - p_axis
+        perp0 = rel0 - np.outer(rel0 @ axis, axis)
+        perp_extent = float(np.max(np.linalg.norm(perp0, axis=1)))
+        # The coplanarity residual is a tessellation artifact like the
+        # ladder residuals — gate it at the same mesh epsilon, not only
+        # the relative fraction (coarse meshes inflate the normal-line
+        # fit residual past 5% of the radius).
+        if coplanar_res > max(
+                _REVOLVE_COPLANAR_FRAC * max(perp_extent, 1e-9),
+                epsilon):
+            continue
+
+        def _edge_tan_dot(va, vb):
+            d = v_arr[vb] - v_arr[va]
+            dn = float(np.linalg.norm(d))
+            if dn <= 1e-12:
+                return 0.0
+            m = 0.5 * (v_arr[va] + v_arr[vb])
+            radial = m - p_axis
+            radial = radial - float(radial @ axis) * axis
+            rn = float(np.linalg.norm(radial))
+            if rn <= 1e-9:
+                return 0.0
+            return abs(float((d / dn) @ np.cross(axis, radial / rn)))
+
+        wset = set(wall_groups)
+        span_parent = {gi: gi for gi in wall_groups}
+
+        def _sfind(x):
+            while span_parent[x] != x:
+                span_parent[x] = span_parent[span_parent[x]]
+                x = span_parent[x]
+            return x
+
+        pair_junctions: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        junc_rh: Dict[Tuple[int, int], List[np.ndarray]] = defaultdict(list)
+        for (ga, gb), va, vb in shared_edges:
+            if ga not in wset or gb not in wset:
+                continue
+            td = _edge_tan_dot(va, vb)
+            if td < _REVOLVE_EDGE_TAN_DOT:
+                ra, rb = _sfind(ga), _sfind(gb)
+                if ra != rb:
+                    span_parent[ra] = rb
+            elif td > 1.0 - _REVOLVE_EDGE_TAN_DOT:
+                ra, rb = _sfind(ga), _sfind(gb)
+                if ra != rb:
+                    key = (min(ra, rb), max(ra, rb))
+                    if key not in pair_junctions:
+                        pair_junctions[key] = (va, vb)
+                    mid = 0.5 * (v_arr[va] + v_arr[vb]) - p_axis
+                    h_m = float(mid @ axis)
+                    junc_rh[key].append(np.array([
+                        float(np.linalg.norm(mid - h_m * axis)), h_m]))
+
+        final_junctions: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        junc_rh_final: Dict[Tuple[int, int], List[np.ndarray]] = (
+            defaultdict(list))
+        # Re-key with final union-find roots: _sfind() during the loop
+        # returns intermediate roots superseded by later unions.
+        for (ra, rb), vpair in pair_junctions.items():
+            fa, fb = _sfind(ra), _sfind(rb)
+            if fa == fb:
+                continue
+            key = (min(fa, fb), max(fa, fb))
+            if key not in final_junctions:
+                final_junctions[key] = vpair
+            junc_rh_final[key].extend(junc_rh[(ra, rb)])
+        pair_junctions = final_junctions
+
+        # Revolution test: every span junction of a true revolute is a
+        # circle at constant (r, h); an extruded wall's strip junctions
+        # stack at every ring height, spreading far beyond epsilon.
+        is_revolute = True
+        for rh_list in junc_rh_final.values():
+            if len(rh_list) >= 2:
+                arr = np.asarray(rh_list)
+                spread = float(np.max(np.linalg.norm(
+                    arr - arr.mean(axis=0), axis=1)))
+                if spread > 2.0 * epsilon:
+                    is_revolute = False
+                    break
+        if not is_revolute:
+            continue
+
+        span_map: Dict[int, List[int]] = defaultdict(list)
+        for gi in wall_groups:
+            span_map[_sfind(gi)].append(gi)
+        span_tris: Dict[int, List[int]] = {
+            sid: sorted(set(
+                ti for gi in span_map[sid]
+                for ti in planar_groups[gi]["tri_indices"]))
+            for sid in span_map}
+        span_pseudo: Dict[int, Dict] = {
+            sid: {"tri_indices": span_tris[sid]} for sid in span_map}
+        span_dirs: Dict[int, Optional[np.ndarray]] = {
+            sid: _span_dirs_for_tris(
+                v_arr, f_arr, tri_normals, span_tris[sid], axis, p_axis)
+            for sid in span_map}
+
+        jspans = sorted({s for pair in pair_junctions for s in pair})
+        pieces: List[Tuple[List[int], List[int], bool]] = []
+        points = None
+        if len(jspans) >= 2:
+            def _proj_rh(vi):
+                rel = v_arr[int(vi)] - p_axis
+                return np.array([
+                    float(np.linalg.norm(
+                        rel - float(rel @ axis) * axis)),
+                    float(rel @ axis)])
+
+            walk = _band_walk_profile(
+                jspans, pair_junctions, span_pseudo, {}, axis,
+                _proj_rh, f_arr, node_dirs=span_dirs,
+                corner_deg=_REVOLVE_SPLIT_DEG)
+            if walk is not None:
+                points, corners, closed, order, remap = walk
+                n_pts = len(points)
+                n_ord = len(order)
+                first_pre: Dict[int, int] = {}
+                last_pre: Dict[int, int] = {}
+                for p, d_idx in enumerate(remap):
+                    first_pre.setdefault(d_idx, p)
+                    last_pre[d_idx] = p
+
+                def _spans_between(da, db):
+                    pa = first_pre[da]
+                    pb = last_pre[db]
+                    if not closed and pb >= pa:
+                        return list(order[pa:pb])
+                    steps = pb - pa if pb > pa else pb + n_ord - pa
+                    return [order[(pa + k) % n_ord]
+                            for k in range(steps)]
+
+                if closed and len(corners) <= 1:
+                    pieces.append((
+                        list(range(n_pts)), list(order), True))
+                elif closed and corners:
+                    cuts = corners + [corners[0] + n_pts]
+                    for a, b in zip(corners, cuts[1:]):
+                        idx = [k % n_pts for k in range(a, b + 1)]
+                        pieces.append((
+                            idx, _spans_between(a, b % n_pts), False))
+                else:
+                    bounds = [0] + corners + [n_pts - 1]
+                    for a, b in zip(bounds, bounds[1:]):
+                        if b > a:
+                            pieces.append((
+                                list(range(a, b + 1)),
+                                _spans_between(a, b), False))
+
+        jset = set(jspans)
+        for sid in sorted(span_map):
+            if sid in jset or len(span_tris[sid]) < 6:
+                continue
+            # Junction-free spans only revolve when the band closes —
+            # an extruded open arc unions into one span too, and its
+            # two boundary rings would pose as a cylinder profile.
+            if _azimuth_extent_deg(
+                    v_arr, f_arr, axis, p_axis,
+                    span_tris[sid]) < _REVOLVE_CLOSED_MIN_DEG:
+                continue
+            ring_pts: Dict[Tuple[float, float], int] = Counter()
+            for g, va, vb in one_sided:
+                if _sfind(g) != sid:
+                    continue
+                if _edge_tan_dot(va, vb) <= 1.0 - _REVOLVE_EDGE_TAN_DOT:
+                    continue
+                rel = v_arr[va] - p_axis
+                h_v = float(rel @ axis)
+                r_v = float(np.linalg.norm(
+                    rel - h_v * axis))
+                ring_pts[(round(r_v, 6), round(h_v, 6))] += 1
+            rings = sorted((np.array(k) for k, c in ring_pts.items()
+                            if c >= 2), key=lambda p: float(p[1]))
+            if len(rings) < 2:
+                continue
+            if points is None:
+                points = np.array(rings)
+                pieces.append((list(range(len(rings))), [sid], False))
+            else:
+                base = len(points)
+                points = np.vstack([points, np.array(rings)])
+                pieces.append((
+                    list(range(base, base + len(rings))), [sid], False))
+
+        for seg, seg_spans, piece_closed in pieces:
+            if len(seg) < 2 or not seg_spans:
+                continue
+            all_tris = sorted(set(
+                ti for sid in seg_spans for ti in span_tris[sid]))
+            if len(all_tris) < 6:
+                continue
+            entry = _revolve_piece_entry(
+                v_arr, f_arr, axis, p_axis, epsilon, comp_ids,
+                patch_idx + len(patches), points[seg], piece_closed,
+                all_tris)
+            if entry is None:
+                continue
+            patches.append(entry)
+            used_tris.update(all_tris)
+            for sid in seg_spans:
+                used_groups.update(span_map[sid])
+
+        def _piece_rank(pl):
+            return sum(
+                0 if p.get("surface_type") in ("cylinder", "cone") else 1
+                for p in pl)
+
+        # Max-coverage axis pick: a degenerate axis emits one bogus
+        # cospherical-band piece; the true axis covers more triangles.
+        # Ties (a cylinder slice is also a spherical band about a
+        # degenerate axis) go to the simpler surface model.  An axis
+        # whose pieces hug the epsilon ceiling (low confidence) is a
+        # projection artifact — an extruded ellipse circles up in the
+        # (r, h) plane of a wrong axis — and is rejected outright, as
+        # is an axis that explains only a slice of the wall (an
+        # extrusion chopped into per-ring pseudo-revolves).
+        if patches and min(
+                p.get("confidence", 1.0) for p in patches
+        ) >= _REVOLVE_AXIS_MIN_CONF and len(used_tris) >= (
+                _REVOLVE_COVER_MIN_FRAC * len(wall_tris)) and (
+                not best_patches
+                or len(used_tris) > len(best_tris)
+                or (len(used_tris) == len(best_tris)
+                    and _piece_rank(patches) < _piece_rank(best_patches))):
+            best_patches = patches
+            best_tris = used_tris
+            best_groups = used_groups
+    return best_patches, best_tris, best_groups
+
+
+def _recover_helical_bands(v_arr, f_arr, tri_normals, planar_groups,
+                           edge_faces, tri_to_group, is_small,
+                           mean_normals, consumed_groups, epsilon,
+                           comp_ids, patch_idx):
+    """Helical-pipe (spring) recovery pass over remaining small groups.
+
+    A radial-frame pipe swept along a helix of pitch q unwraps
+    EXACTLY: in the (r, v = h - q*phi_unwrapped) half-plane every vertex
+    lies on the profile circle, so q is recovered by a coarse-to-fine
+    1-D search minimizing the Kasa circle residual, and the acceptance
+    is that residual within epsilon over all cluster vertices.  The
+    azimuth is unwrapped along mesh adjacency first — a multi-turn
+    helix wraps past 2*pi and only the unwrapped frame circles.  Axis
+    candidates are canonical; the axis position uses the revolve
+    coplanarity fit (a helical pipe's normal lines all meet the axis).
+    Guards: >= 270 deg of (unwrapped) azimuthal sweep, ring geometry
+    (R > rho > 0), all vertices at r > 0.  Flat caps perpendicular to
+    the sweep tangent would break the circle residual — a known
+    limitation; springs are recovered as tube walls.
+
+    Returns ``(patches, consumed_tris, consumed_groups)`` with patch
+    indices continuing from *patch_idx*.
+    """
+    eligible = [gi for gi in range(len(planar_groups))
+                if is_small[gi] and gi not in consumed_groups
+                and mean_normals[gi] is not None]
+    if len(eligible) < 2:
+        return [], set(), set()
+    gset = set(eligible)
+
+    shared_edges: List[Tuple[Tuple[int, int], int, int]] = []
+    for edge, tris in sorted(edge_faces.items()):
+        ga = gb = None
+        for t in tris:
+            g = tri_to_group.get(t)
+            if g in gset:
+                if ga is None:
+                    ga = g
+                elif g != ga:
+                    gb = g
+                    break
+        if ga is not None and gb is not None:
+            shared_edges.append(
+                ((min(ga, gb), max(ga, gb)), int(edge[0]), int(edge[1])))
+
+    cluster_parent = {gi: gi for gi in eligible}
+
+    def _cfind(x):
+        while cluster_parent[x] != x:
+            cluster_parent[x] = cluster_parent[cluster_parent[x]]
+            x = cluster_parent[x]
+        return x
+
+    for (ga, gb), _, _ in shared_edges:
+        ra, rb = _cfind(ga), _cfind(gb)
+        if ra != rb:
+            cluster_parent[ra] = rb
+    clusters: Dict[int, List[int]] = defaultdict(list)
+    for gi in eligible:
+        clusters[_cfind(gi)].append(gi)
+
+    patches: List[Dict] = []
+    used_tris: set = set()
+    used_groups: set = set()
+
+    for root in sorted(clusters, key=lambda r: min(clusters[r])):
+        members = sorted(clusters[root])
+        if len(members) < 2:
+            continue
+        cluster_tris = sorted(set(
+            ti for gi in members
+            for ti in planar_groups[gi]["tri_indices"]))
+        if len(cluster_tris) < 24:
+            continue
+
+        for axis_i in range(3):
+            axis = _CANON_AXES[axis_i]
+            wall_groups = [gi for gi in members
+                           if mean_normals[gi] is not None]
+            if len(wall_groups) < 2:
+                continue
+            wall_tris = sorted(set(
+                ti for gi in wall_groups
+                for ti in planar_groups[gi]["tri_indices"]))
+            if len(wall_tris) < 24:
+                continue
+            ti_arr = np.asarray(wall_tris, dtype=np.int64)
+            cents = ((v_arr[f_arr[ti_arr, 0]]
+                      + v_arr[f_arr[ti_arr, 1]]
+                      + v_arr[f_arr[ti_arr, 2]]) / 3.0)
+            p_axis, coplanar_res = _fit_revolve_axis(
+                tri_normals[ti_arr], cents, axis)
+            if p_axis is None:
+                continue
+            vids = np.unique(f_arr[ti_arr].ravel())
+            rel = v_arr[vids] - p_axis
+            h_v = rel @ axis
+            perp_v = rel - np.outer(h_v, axis)
+            r_v = np.linalg.norm(perp_v, axis=1)
+            if float(np.min(r_v)) <= 1e-9:
+                continue
+            dom = int(np.argmax(np.abs(axis)))
+            c1, c2 = ((1, 2) if dom == 0
+                      else ((0, 2) if dom == 1 else (0, 1)))
+            phi_w = np.mod(np.arctan2(perp_v[:, c2], perp_v[:, c1]),
+                           2.0 * math.pi)
+
+            # Unwrap azimuth along mesh adjacency: a multi-turn helix
+            # wraps past 2*pi, and the unwrapped (r, v = h - q*phi)
+            # half-plane is the only frame in which the profile is a
+            # circle.  BFS over the wall's vertex graph, accumulating
+            # the wrapped neighbour delta — deterministic (sorted
+            # neighbour iteration).
+            vadj: Dict[int, List[int]] = defaultdict(list)
+            for tri in f_arr[ti_arr]:
+                a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+                vadj[a].extend((b, c))
+                vadj[b].extend((a, c))
+                vadj[c].extend((a, b))
+            phi_u = np.full(len(vids), np.nan, dtype=np.float64)
+            phi_u[0] = float(phi_w[0])
+            queue = [0]
+            while queue:
+                ui = queue.pop(0)
+                for vi in sorted(set(vadj.get(int(vids[ui]), ()))):
+                    vj = int(np.searchsorted(vids, vi))
+                    if vj >= len(vids) or vids[vj] != vi \
+                            or not np.isnan(phi_u[vj]):
+                        continue
+                    d = (float(phi_w[vj]) - float(phi_w[ui])
+                         + math.pi) % (2.0 * math.pi) - math.pi
+                    phi_u[vj] = phi_u[ui] + d
+                    queue.append(vj)
+            if np.isnan(phi_u).any():
+                continue
+            phi_extent = float(phi_u.max() - phi_u.min())
+            if phi_extent < _HELICAL_MIN_PHI:
+                continue
+            phi_v = phi_u
+
+            def _circle_res(q):
+                circ = _fit_profile_circle(np.column_stack(
+                    [r_v, h_v - q * phi_v]))
+                if circ is None:
+                    return float("inf"), None
+                center, radius, res = circ
+                return res, (center, radius)
+
+            h_range = float(h_v.max() - h_v.min())
+            q_hi = 2.0 * h_range / (2.0 * math.pi)
+            q_lo = 0.2 * h_range / (2.0 * math.pi)
+            if q_hi <= q_lo + 1e-12:
+                continue
+            grid = np.linspace(q_lo, q_hi, 48)
+            grid_res = [_circle_res(q)[0] for q in grid]
+            best_i = int(np.argmin(grid_res))
+            lo = grid[max(best_i - 1, 0)]
+            hi = grid[min(best_i + 1, len(grid) - 1)]
+            for _ in range(40):
+                m1 = lo + (hi - lo) / 3.0
+                m2 = hi - (hi - lo) / 3.0
+                if _circle_res(m1)[0] <= _circle_res(m2)[0]:
+                    hi = m2
+                else:
+                    lo = m1
+            q_fit = 0.5 * (lo + hi)
+            res, circ = _circle_res(q_fit)
+            if circ is None or res > epsilon:
+                continue
+            center, radius = circ
+            if not (center[0] > radius > 1e-9):
+                continue
+            dists = np.hypot(r_v - center[0], (h_v - q_fit * phi_v)
+                             - center[1])
+            if float(np.mean(np.abs(dists - radius))) > epsilon:
+                continue
+            pitch = 2.0 * math.pi * q_fit
+            turns = max(0.0, h_range - 2.0 * radius) / max(pitch, 1e-12)
+            entry = {
+                "component": comp_ids[wall_tris[0]],
+                "patch_index": patch_idx + len(patches),
+                "triangle_count": len(wall_tris),
+                "area": round(_cluster_tri_area(
+                    v_arr, f_arr, wall_tris), 6),
+                "surface_type": "helical_pipe",
+                "axis": [round(float(c), 6) for c in axis],
+                "axis_point_cm": [round(float(c), 6) for c in p_axis],
+                "helix_radius_cm": round(float(center[0]), 6),
+                "pitch_cm": round(pitch, 6),
+                "profile_radius_cm": round(radius, 6),
+                "turns": round(turns, 3),
+                "azimuth_extent_deg": round(
+                    math.degrees(phi_extent), 3),
+                "confidence": round(max(0.0, 1.0 - 0.5 * res / epsilon), 4),
+                "residual_cm": round(res, 8),
+                "recovered_via": "helical_band",
+            }
+            patches.append(entry)
+            used_tris.update(wall_tris)
+            used_groups.update(wall_groups)
+            break
+    return patches, used_tris, used_groups
+
+
 def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
                                       planar_groups, epsilon, comp_ids):
     """Recover curved patches from small planar groups (fix-e + competition).
@@ -2524,6 +3456,14 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
          sphere / cone / torus) via ``_classify_curved_patch`` on a
          compact trimesh built from the cluster's triangles.  If a
          non-freeform surface wins, emits it as a recovered curved patch.
+      3.5 Revolve-band recovery: on competition failure, walks the
+          cluster's (r, h) meridian profile (spans unioned over
+          meridian edges, chained over azimuthal edges) BEFORE the
+          sweep pass — a lathe's rows are constant-radius rings the
+          sweep would otherwise consume as individual thin cylinders.
+          Kink-split pieces emit cylinder / cone / sphere / torus /
+          ``revolve`` (profile_kind spline or circle) faces
+          (``recovered_via: "revolve_band"``).
       4. Sweep-run recovery: when the competition fails or is skipped by
          the sharp gate, detect an extrusion axis (>= 80% of cluster
          normals perpendicular to a dominant cross-product axis) and
@@ -2533,12 +3473,17 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
          (``recovered_via: "sweep"``).  Unconsumed groups (straight runs,
          leftover slivers) stay in the cluster.
       5. Cap-contamination retry: when the competition and the sweep both
-          fail to explain the cluster, falls back to a cylinder-only fit.
-          If the fit fails but produced a valid axis, splits the cluster
-          by |dot(tri_normal, axis)| < 0.15 (side=wall vs non-side=cap).
-          If both exist and the side-only fit passes, emits side tris as
-          one cylinder patch and leaves non-side groups as planar.
-      6. Extrusion-band recovery: remaining small groups chained through
+           fail to explain the cluster, falls back to a cylinder-only fit.
+           If the fit fails but produced a valid axis, splits the cluster
+           by |dot(tri_normal, axis)| < 0.15 (side=wall vs non-side=cap).
+           If both exist and the side-only fit passes, emits side tris as
+           one cylinder patch and leaves non-side groups as planar.
+      6. Helical-band recovery: leftover tube walls whose unwrapped
+         azimuth sweeps >= 270 deg and whose (r, h - q*phi) points
+         circle emit ``helical_pipe`` faces (``recovered_via:
+         "helical_band"``); runs before the prismatic band pass, which
+         would otherwise chop helical tubes into per-ring slivers.
+      7. Extrusion-band recovery: remaining small groups chained through
           shared mesh edges parallel to a canonical axis form prismatic
           bands; closed bands fitting a circle emit a 360 deg cylinder,
           and the rest emit ``extrusion`` faces whose profiles are
@@ -2651,6 +3596,26 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
             for ti in planar_groups[gi]["tri_indices"]))
 
         if len(cluster_tris) < 6:
+            continue
+
+        # --- (1.4) Revolve-band recovery (surfaces of revolution) ---
+        # Runs BEFORE competition: a lathe's tessellation rows are
+        # constant-radius rings whose chained cluster produces a
+        # low-residual bogus cylinder in the competition.  Walking the
+        # (r, h) profile over meridian/azimuthal edges and fitting each
+        # kink-free piece (cylinder / cone / sphere / torus / spline
+        # revolve) recovers the true surfaces first.
+        rev_patches, rev_tris, rev_groups = _revolve_bands_for_groups(
+            v_arr, f_arr, tri_normals, planar_groups, edge_faces,
+            tri_to_group, mean_normals, group_list, epsilon,
+            comp_ids, patch_idx)
+        if rev_patches:
+            for e in rev_patches:
+                recovered_patches.append(e)
+            patch_idx += len(rev_patches)
+            recovered_tri_indices.update(cluster_tris)
+            for gi in group_list:
+                recovered_groups.add(gi)
             continue
 
         # --- (0) Sharp-edge gate ---
@@ -2812,12 +3777,34 @@ def _recover_curved_from_small_groups(v_arr, f_arr, tri_normals,
     # consume; bands chained through axis-parallel shared edges accept
     # as whole extrusion faces (cylinder for full-circle profiles,
     # corner-pinned B-spline profiles otherwise).
+    # --- (5) Helical-band recovery: springs / helix pipes (2026-08-21) ---
+    # Unconsumed tube walls whose azimuth unwraps past 270 deg and
+    # circles in the (r, h - q*phi) frame; the pipe's twist defeats
+    # every prismatic pass, so this runs before (and instead of) the
+    # prismatic band pass, which would otherwise chop the tube into
+    # per-ring extrusion slivers.
+    helix_patches, helix_tris, helix_groups_used = _recover_helical_bands(
+        v_arr, f_arr, tri_normals, planar_groups, edge_faces,
+        tri_to_group, is_small, mean_normals, recovered_groups,
+        epsilon, comp_ids, patch_idx)
+    if helix_patches:
+        recovered_patches.extend(helix_patches)
+        patch_idx += len(helix_patches)
+        recovered_tri_indices.update(helix_tris)
+        recovered_groups.update(helix_groups_used)
+
+    # --- (6) Extrusion-band recovery: spline profiles (2026-08-20) ---
+    # Runs over small groups the per-cluster ladder above did NOT
+    # consume; bands chained through axis-parallel shared edges accept
+    # as whole extrusion faces (cylinder for full-circle profiles,
+    # corner-pinned B-spline profiles otherwise).
     band_patches, band_tris, band_groups_used = _recover_extrusion_bands(
         v_arr, f_arr, tri_normals, planar_groups, edge_faces,
         tri_to_group, is_small, mean_normals, recovered_groups,
         epsilon, comp_ids, patch_idx)
     if band_patches:
         recovered_patches.extend(band_patches)
+        patch_idx += len(band_patches)
         recovered_tri_indices.update(band_tris)
         recovered_groups.update(band_groups_used)
 
@@ -4283,6 +5270,8 @@ def decompose_mesh_faces(nodes, indices, angle_tolerance_deg=None,
             "curved_patches": [],
             "has_warnings": False,
             "error": str(e),
+            "error_type": type(e).__name__,
+            "error_traceback": traceback.format_exc(),
         }
 
 
