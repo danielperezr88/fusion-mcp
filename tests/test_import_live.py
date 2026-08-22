@@ -125,16 +125,31 @@ def _close_docs_except(pre_ids):
     return n or 0
 
 
-def fresh_import(handler, params):
-    """Drive a FusionMCP.py import handler in a fresh module inside Fusion."""
-    inner = (
+def _fresh_module_code():
+    """Shared loader: re-import FusionMCP.py fresh inside Fusion."""
+    return (
         "import importlib.util\n"
         "spec = importlib.util.spec_from_file_location('fusionmcp_dev', "
         + repr(FUSIONMCP_PATH) + ")\n"
         "mod = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(mod)\n"
         "mod.app = app\n"
+    )
+
+
+def fresh_import(handler, params):
+    """Drive a FusionMCP.py import handler in a fresh module inside Fusion."""
+    inner = _fresh_module_code() + (
         "out = mod." + handler + "(root, " + repr(params) + ")\n"
+        "result['output'] = out\n"
+    )
+    return run_code(inner)
+
+
+def fresh_root_call(handler):
+    """Drive a root-only FusionMCP.py handler (no params) in a fresh module."""
+    inner = _fresh_module_code() + (
+        "out = mod." + handler + "(root)\n"
         "result['output'] = out\n"
     )
     return run_code(inner)
@@ -153,7 +168,7 @@ def http_state():
     return {
         "bodies": len(info.get("bodies", [])),
         "sketches": len(info.get("sketches", [])),
-        "mesh_bodies": None,  # old running add-in's get_info does not list meshes
+        "mesh_bodies": len(info.get("mesh_bodies", [])),
     }
 
 
@@ -275,6 +290,16 @@ def main():
         check("mesh body exists in design",
               st.get("mesh_bodies") is not None and st["mesh_bodies"] >= 1,
               f"mesh_bodies={st.get('mesh_bodies')}")
+
+        # --- 2b. Mesh visibility: get_bodies_info lists mesh bodies ---
+        bi = (fresh_root_call("_get_bodies_info") if mode == "fresh"
+              else call("get_bodies_info"))
+        mesh_entries = [b for b in bi.get("bodies", [])
+                        if b.get("type") == "mesh"]
+        check("get_bodies_info lists mesh body (type=mesh)",
+              len(mesh_entries) >= 1
+              and mesh_entries[0].get("triangles", 0) >= 1,
+              f"mesh entries={mesh_entries}")
 
         # --- 3. SVG import: rectangle -> sketch exists ---
         call("clear_design")

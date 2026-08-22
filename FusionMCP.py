@@ -199,6 +199,15 @@ def _get_info(design, root):
     bodies = [{"index": i, "name": root.bRepBodies.item(i).name,
                "faces": root.bRepBodies.item(i).faces.count}
               for i in range(root.bRepBodies.count)]
+    mesh_bodies = []
+    for j in range(root.meshBodies.count):
+        m = root.meshBodies.item(j)
+        try:
+            triangles = m.mesh.triangleCount
+        except:
+            triangles = None
+        mesh_bodies.append({"index": j, "name": m.name,
+                            "triangles": triangles})
     params = [{"name": design.allParameters.item(i).name,
                "value": round(design.allParameters.item(i).value, 4),
                "unit": design.allParameters.item(i).unit}
@@ -215,7 +224,8 @@ def _get_info(design, root):
     return {
         "document": app.activeDocument.name,
         "components": comps, "sketches": sketches,
-        "bodies": bodies, "parameters": params,
+        "bodies": bodies, "mesh_bodies": mesh_bodies,
+        "parameters": params,
         "construction_planes": planes, "joints": joints,
     }
 
@@ -225,8 +235,29 @@ def _get_bodies_info(root):
         b = root.bRepBodies.item(i)
         bb = b.boundingBox
         bodies.append({
-            "index": i, "name": b.name, "visible": b.isVisible,
+            "index": i, "name": b.name, "type": "brep",
+            "visible": b.isVisible,
             "faces": b.faces.count, "edges": b.edges.count,
+            "size_cm": {
+                "x": round(bb.maxPoint.x - bb.minPoint.x, 4),
+                "y": round(bb.maxPoint.y - bb.minPoint.y, 4),
+                "z": round(bb.maxPoint.z - bb.minPoint.z, 4),
+            },
+        })
+    for j in range(root.meshBodies.count):
+        m = root.meshBodies.item(j)
+        bb = m.boundingBox
+        try:
+            payload = m.mesh
+            triangles = payload.triangleCount
+            vertices = payload.nodeCount
+        except:
+            triangles = None
+            vertices = None
+        bodies.append({
+            "index": j, "name": m.name, "type": "mesh",
+            "visible": m.isVisible,
+            "triangles": triangles, "vertices": vertices,
             "size_cm": {
                 "x": round(bb.maxPoint.x - bb.minPoint.x, 4),
                 "y": round(bb.maxPoint.y - bb.minPoint.y, 4),
@@ -2313,6 +2344,13 @@ def _find_mesh_body(root, ref) -> "adsk.fusion.MeshBody":
     for i in range(bodies.count):
         if bodies.item(i).name == ref:
             return bodies.item(i)
+    # A mesh imported into a child component (import_cad_file
+    # as_component=True) lives outside the root collection; name-lookup
+    # falls back to every component so those bodies stay reachable.
+    for comp in _design().allComponents:
+        for i in range(comp.meshBodies.count):
+            if comp.meshBodies.item(i).name == ref:
+                return comp.meshBodies.item(i)
     raise Exception(f"Body '{ref}' not found.")
 
 
