@@ -156,10 +156,16 @@ def fresh_root_call(handler):
 
 
 def fresh_state():
-    """Design state counts via execute_script (fresh-mode ground truth)."""
+    """Design state counts via execute_script (fresh-mode ground truth).
+
+    bodies is design-wide (sum across allComponents) because STEP
+    imports land bodies in a child component, not root.bRepBodies.
+    """
     return run_code(
-        "result['output'] = {'bodies': root.bRepBodies.count, "
-        "'sketches': root.sketches.count, 'mesh_bodies': root.meshBodies.count}"
+        "result['output'] = {"
+        "'bodies': sum(c.bRepBodies.count for c in design.allComponents), "
+        "'sketches': root.sketches.count, "
+        "'mesh_bodies': root.meshBodies.count}"
     )
 
 

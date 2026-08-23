@@ -1692,6 +1692,13 @@ def _import_cad_file(root, p: dict) -> dict:
             return {"error": f"Unsupported CAD format '{fmt}'. Supported: .step/.stp, .sat, .smt, .igs/.iges, .f3d."}
         options = getattr(app.importManager, creator)(path)
 
+        # STEP/SAT/IGES imports often wrap bodies in a new child
+        # component + root occurrence rather than placing them directly
+        # in root.bRepBodies, so the success signal must be design-wide.
+        design = _design()
+        def _design_body_count():
+            return sum(c.bRepBodies.count for c in design.allComponents)
+
         as_component = p.get("as_component", False)
         if isinstance(as_component, str):
             as_component = as_component.lower() in ("1", "true", "yes")
@@ -1701,8 +1708,9 @@ def _import_cad_file(root, p: dict) -> dict:
                 app.importManager.importToTarget(options, target)
             except Exception as exc:
                 # Some Fusion builds raise InternalValidationError after a successful
-                # import; the reliable success signal is geometry appearing in the target.
-                if target.bRepBodies.count > before_count:
+                # import; the reliable success signal is geometry appearing anywhere
+                # in the design (imports may land in a child component, not target).
+                if _design_body_count() > before_count:
                     return
                 if "save" not in str(exc).lower():
                     raise
@@ -1717,29 +1725,29 @@ def _import_cad_file(root, p: dict) -> dict:
                                    root_folder, "Imported via FusionMCP", "")
                     app.importManager.importToTarget(options, target)
                 except Exception as save_exc:
-                    if target.bRepBodies.count > before_count:
+                    if _design_body_count() > before_count:
                         return
                     raise RuntimeError(
                         f"Import failed ({exc}) and auto-save+retry also failed ({save_exc}). "
                         "Save the document manually and retry.") from exc
                 else:
-                    if target.bRepBodies.count == before_count:
+                    if _design_body_count() == before_count:
                         raise RuntimeError(f"Import of '{path}' added no bodies after save+retry.")
             else:
-                if target.bRepBodies.count == before_count:
+                if _design_body_count() == before_count:
                     raise RuntimeError(f"Import of '{path}' completed without adding any bodies.")
 
         if as_component:
             occ = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
             target = occ.component
-            _import_into(target, 0)
-            bodies_added = target.bRepBodies.count
+            pre = _design_body_count()
+            _import_into(target, pre)
+            bodies_added = _design_body_count() - pre
         else:
-            before = root.bRepBodies.count
+            before = _design_body_count()
             _import_into(root, before)
-            after = root.bRepBodies.count
-            delta = after - before
-            bodies_added = delta if delta > 0 else after
+            after = _design_body_count()
+            bodies_added = after - before
 
         return {"imported": os.path.basename(path), "format": fmt,
                 "bodies_added": bodies_added, "path": path}
